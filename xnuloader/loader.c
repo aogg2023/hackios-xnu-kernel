@@ -255,11 +255,10 @@ clean_dcache(uint64_t start, uint64_t end)
 /* Log persistence: raw write to a GPT partition (phone only)               */
 
 static efi_block_io *
-find_log_partition(void)
+find_partition_named(const char16 *want, unsigned want_len)
 {
 	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
 	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
-	static const char16 want[] = LOG_PARTITION;
 	efi_handle *handles;
 	uint64_t count;
 
@@ -274,7 +273,7 @@ find_log_partition(void)
 		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2) {
 			continue;
 		}
-		for (unsigned k = 0; k < sizeof(want) / sizeof(want[0]); k++) {
+		for (unsigned k = 0; k < want_len; k++) {
 			if (info->name[k] != want[k]) {
 				match = 0;
 				break;
@@ -285,6 +284,24 @@ find_log_partition(void)
 		}
 	}
 	return NULL;
+}
+
+static efi_block_io *
+find_log_partition(void)
+{
+	static const char16 want[] = LOG_PARTITION;
+	efi_block_io *bio;
+
+	bio = find_partition_named(want, sizeof(want) / sizeof(want[0]));
+	if (bio == NULL) {
+		/*
+		 * annibale has no logdump partition: the free boot_a slot doubles as the log area,
+		 * it holds nothing but experiments there (k90-port).
+		 */
+		static const char16 alt[] = u"boot_a";
+		bio = find_partition_named(alt, sizeof(alt) / sizeof(alt[0]));
+	}
+	return bio;
 }
 
 /*
@@ -554,12 +571,29 @@ static const struct platform platform_redwood = {
 };
 
 /*
+ * annibale (REDMI K90, SM8750 "sun"): values cross-checked against the device's own merged device
+ * tree (a vendor_boot base DT plus its dtbo overlay): GIC 16000000/16080000 (arm,gic-v3, stride
+ * 0x40000), PSCI method "smc", eight cores at MPIDR 0..500 and 10000/10100 -- six A720-class
+ * (MIDR 0x514f0014) low-capacity and two primes. fb_base stays 0: a phone build selects this
+ * platform with DIRECT_PHONE_PLAT instead of matching the framebuffer (the panel is not lit yet,
+ * see docs/analysis/annibale-uefi-build.md).
+ */
+static const struct platform platform_annibale = {
+	.name = "annibale", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x16000000, .gic_redist = 0x16080000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,
+	.small_cores = 0x3f,
+	.fb_base = 0,
+};
+
+/*
  * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
  * where each value comes from); a display that matches none is QEMU's ramfb.
  */
 static const struct platform *const platforms[] = {
 	&platform_redwood,
+	&platform_annibale,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -3944,8 +3978,14 @@ efi_main(efi_handle image, efi_system_table *st)
 		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
 			if (platforms[i]->fb_base == SCREEN.base)
 				PLAT = platforms[i];
+#ifdef DIRECT_PHONE_PLAT
+		/* built for one phone: a framebuffer none of the known ones matches is ours */
+		if (PLAT == &platform_qemu_virt)
+			PLAT = &platform_annibale;
+#else
 		if (PLAT == &platform_qemu_virt)
 			ramfb_phone_screen();
+#endif
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);

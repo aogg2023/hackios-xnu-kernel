@@ -67,6 +67,7 @@ void redwood_torch_hv_init(void);       /* boot-arg torch_secs=N: annibale's fla
 void redwood_torch_hv_quiesce(void);    /* its light off: at the run's end and on a panic's way out */
 bool redwood_torch_hv_low_on(uint32_t milliamps);   /* the camera's (task L1b): the torch lit, up to the device tree's maximum */
 void redwood_torch_hv_low_off(void);    /* ... and put out */
+void redwood_pcie_init(void);           /* boot-arg pcie=N (1..3): the Wi-Fi card on PCIe root complex 0, survey (bsd/dev/redwood_pcie.c) */
 void redwood_spmi_hv_lock(void);        /* the annibale drivers' one transfer at a time through the v7 arbiter (redwood_buttons_hv.c) */
 void redwood_spmi_hv_unlock(void);
 

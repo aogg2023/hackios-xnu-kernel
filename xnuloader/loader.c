@@ -286,6 +286,16 @@ find_partition_named(const char16 *want, unsigned want_len)
 	return NULL;
 }
 
+/* F09LW-BEGIN -- host-extracted verbatim by /tmp/task19/logwrite_harness.c */
+/*
+ * Review F09, lead's ruling b: the phone has no logdump partition, and boot_a -- where this
+ * used to fall back -- carries the boot image of the slot-boot flow. So the fallback is no
+ * longer automatic: only the explicit "oem logwrite" command, this flag set while it runs,
+ * lets the log land on boot_a. Every automatic flush with no logdump partition goes nowhere
+ * (its kernel log is echoed on the console instead) and the USB side stays pure reads.
+ */
+static int log_fallback_boot_a_allowed;
+
 static efi_block_io *
 find_log_partition(void)
 {
@@ -293,16 +303,13 @@ find_log_partition(void)
 	efi_block_io *bio;
 
 	bio = find_partition_named(want, sizeof(want) / sizeof(want[0]));
-	if (bio == NULL) {
-		/*
-		 * annibale has no logdump partition: the free boot_a slot doubles as the log area,
-		 * it holds nothing but experiments there (k90-port).
-		 */
+	if (bio == NULL && log_fallback_boot_a_allowed) {
 		static const char16 alt[] = u"boot_a";
 		bio = find_partition_named(alt, sizeof(alt) / sizeof(alt[0]));
 	}
 	return bio;
 }
+/* F09LW-END */
 
 /*
  * The "staged" buffer holds the loader log followed by the kernel log of the
@@ -352,7 +359,11 @@ write_logs(const char *klog, uint64_t klog_len)
 
 	compose_logs(klog, klog_len);
 	if (bio == NULL) {
-		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
+		/*
+		 * No log partition, and boot_a writes are the oem logwrite command's business alone
+		 * (review F09 ruling b): QEMU and the automatic phone flushes land here, echoing the
+		 * returned kernel log on the console instead. "upload" still stages the same text.
+		 */
 		if (klog != NULL) {
 			print("\n== KERNEL LOG ==\n");
 			for (uint64_t i = 0; i < klog_len; i++) {
@@ -401,10 +412,44 @@ write_logs(const char *klog, uint64_t klog_len)
 }
 
 
+/* F09-PROBE-BEGIN -- host-extracted verbatim by /tmp/task19/probe_harness.c */
+/*
+ * Storage diagnostics. Review F09: entering the USB diagnostics used to write a 4 KiB probe
+ * pattern over LBA 0 of five partitions -- misc and metadata are Android's live partitions and
+ * boot_a carries the boot image on the slot-boot path -- and nothing was saved or restored.
+ * The automatic path now only reads: inspect_one() and inspect_storage() report what BlockIo
+ * exposes without a single write. A write check survives behind the explicit "oem probe"
+ * command, and even there it saves the block first and writes it back, verifying every step.
+ * (Host simulation: logs saved under /tmp/task19/.)
+ */
+static const char *
+inspect_one(const char16 *name, unsigned len, const char *tag)
+{
+	efi_block_io *bio = find_partition_named(name, len);
+
+	print("probe %s: handle %x\n", tag, (uint64_t)(uintptr_t)bio);
+	if (bio == NULL) {
+		return NULL;
+	}
+	print("probe %s: bs=%d blocks=%x mediaid=%x\n", tag, bio->media->block_size,
+	    (uint64_t)bio->media->last_block, (uint64_t)bio->media->media_id);
+	static char blk[4096];
+
+	memset(blk, 0, sizeof(blk));
+	efi_status r = bio->read_blocks(bio, bio->media->media_id, 0, sizeof(blk), blk);
+	print("probe %s: read=%x head0=%x (read only, no write)\n", tag, r, *(uint32_t *)blk);
+	return tag;
+}
+
+/*
+ * The writable check, for one partition, non-destructively: the original first block goes into
+ * memory first, the pattern is verified by read-back, and the original goes back and is itself
+ * read back. Only the explicit "oem probe" command reaches this.
+ */
 static void
 probe_one(const char16 *name, unsigned len, const char *tag)
 {
-	static char blk[4096];
+	static char blk[4096], orig[4096];
 
 	efi_block_io *bio = find_partition_named(name, len);
 
@@ -414,6 +459,13 @@ probe_one(const char16 *name, unsigned len, const char *tag)
 	}
 	print("probe %s: bs=%d blocks=%x mediaid=%x\n", tag, bio->media->block_size,
 	    (uint64_t)bio->media->last_block, (uint64_t)bio->media->media_id);
+	memset(orig, 0, sizeof(orig));
+	memset(blk, 0, sizeof(blk));
+	efi_status r0 = bio->read_blocks(bio, bio->media->media_id, 0, sizeof(orig), orig);
+	if (EFI_ERROR(r0)) {
+		print("probe %s: save read=%x, not touching the partition\n", tag, r0);
+		return;
+	}
 	memset(blk, '.', sizeof(blk));
 	memcpy(blk, "XNUPROBE-", 9);
 	memcpy(blk + 9, tag, str_len(tag));
@@ -422,24 +474,53 @@ probe_one(const char16 *name, unsigned len, const char *tag)
 	efi_status f = bio->flush_blocks(bio);
 	memset(blk, 0, sizeof(blk));
 	efi_status r = bio->read_blocks(bio, bio->media->media_id, 0, sizeof(blk), blk);
-	print("probe %s: write=%x flush=%x read=%x head0=%x\n", tag, w, f, r, *(uint32_t *)blk);
+	int same = !EFI_ERROR(r) && memcmp(blk, "XNUPROBE-", 9) == 0;
+	memcpy(blk, orig, sizeof(blk));
+	efi_status w2 = bio->write_blocks(bio, bio->media->media_id, 0, sizeof(blk), blk);
+	efi_status f2 = bio->flush_blocks(bio);
+	memset(blk, 0, sizeof(blk));
+	efi_status r2 = bio->read_blocks(bio, bio->media->media_id, 0, sizeof(blk), blk);
+	int back = !EFI_ERROR(r2) && memcmp(blk, orig, sizeof(orig)) == 0;
+	print("probe %s: save=%x write=%x flush=%x read=%x pattern=%s restore=%x/%x restored=%s\n", tag,
+	    r0, w, f, r, same ? "seen" : "NOT seen", w2, f2, back ? "yes" : "NO -- CHECK THE PARTITION");
 }
 
+static const char16 n_boot_a[] = u"boot_a";
+static const char16 n_misc[] = u"misc";
+static const char16 n_metadata[] = u"metadata";
+static const char16 n_logfs[] = u"logfs";
+static const char16 n_sclogs[] = u"xbl_sc_logs";
+
+static const struct {
+	const char16 *name;
+	unsigned len;
+	const char *tag;
+} probe_targets[] = {
+	{ n_boot_a, sizeof(n_boot_a) / sizeof(char16), "boot_a" },
+	{ n_misc, sizeof(n_misc) / sizeof(char16), "misc" },
+	{ n_metadata, sizeof(n_metadata) / sizeof(char16), "metadata" },
+	{ n_logfs, sizeof(n_logfs) / sizeof(char16), "logfs" },
+	{ n_sclogs, sizeof(n_sclogs) / sizeof(char16), "sclogs" },
+};
+
+/* what the USB entry runs automatically: read-only, zero writes */
+static void
+inspect_storage(void)
+{
+	for (unsigned i = 0; i < sizeof(probe_targets) / sizeof(probe_targets[0]); i++) {
+		inspect_one(probe_targets[i].name, probe_targets[i].len, probe_targets[i].tag);
+	}
+}
+
+/* the explicit-write version, reached only through "oem probe" (kept under its old name) */
 static void
 probe_boot_a(void)
 {
-	static const char16 n_boot_a[] = u"boot_a";
-	static const char16 n_misc[] = u"misc";
-	static const char16 n_metadata[] = u"metadata";
-	static const char16 n_logfs[] = u"logfs";
-	static const char16 n_sclogs[] = u"xbl_sc_logs";
-
-	probe_one(n_boot_a, sizeof(n_boot_a) / sizeof(char16), "boot_a");
-	probe_one(n_misc, sizeof(n_misc) / sizeof(char16), "misc");
-	probe_one(n_metadata, sizeof(n_metadata) / sizeof(char16), "metadata");
-	probe_one(n_logfs, sizeof(n_logfs) / sizeof(char16), "logfs");
-	probe_one(n_sclogs, sizeof(n_sclogs) / sizeof(char16), "sclogs");
+	for (unsigned i = 0; i < sizeof(probe_targets) / sizeof(probe_targets[0]); i++) {
+		probe_one(probe_targets[i].name, probe_targets[i].len, probe_targets[i].tag);
+	}
 }
+/* F09-PROBE-END */
 
 static void
 flush_log(void)
@@ -2893,6 +2974,91 @@ choose_window(const struct payload_info *pi)
 	return 1;
 }
 
+/* F10-PLAN-BEGIN -- host-extracted verbatim by /tmp/task19/plan_harness.c */
+/*
+ * All of the run's memory layout, and every check that can reject it, computed in one place
+ * before a single byte is cleared, read from disk or copied (review F10: the staged rdfile was
+ * memset at its target and read in from the partition first, and only then did the window-size
+ * check print "not enough contiguous RAM" -- a window smaller than the staged system image had
+ * already been written over). Image length, addition overflow, the window the firmware gave us,
+ * and where every target region lands, including the staged image, are all decided here; the
+ * loader's own read stays behind, in rdfile_load(), reached only once this returned 1.
+ */
+struct run_layout {
+	uint64_t kern_lo, kern_hi;
+	uint64_t rd_pa, rd_size;
+	uint64_t rd1_pa, rd1_size;   /* a second ramdisk when the resident one is not the payload's */
+	uint64_t res_pa, res_size;   /* where the resident image (and with it the staged rdfile) sits */
+	uint64_t dt_pa, ba_pa, top;
+	int rd_resident;
+};
+
+static int
+plan_layout(uint64_t phys_base, uint64_t win_size, uint64_t vm_lo, uint64_t vm_hi, uint64_t ramdisk_size,
+    uint64_t resident_rd, uint64_t rdfile_size, struct run_layout *L)
+{
+	uint64_t slide = phys_base - KERNEL_VIRT_BASE; /* pa = va + slide */
+	uint64_t dt_max = 0x10000;
+
+	L->kern_lo = vm_lo + slide;
+	L->kern_hi = (vm_hi + slide + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
+	/* The ramdisk must sit inside the kernel's static mapping, i.e. below topOfKernelData. */
+	L->rd_pa = L->kern_hi;
+	L->rd_size = (ramdisk_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
+	L->rd1_pa = 0;
+	L->rd1_size = 0;
+	L->res_pa = 0;
+	L->res_size = 0;
+	L->rd_resident = 0;
+
+	/* A resident image next to a payload ramdisk: two disks (which is which is decided where the device tree is written). */
+	if (resident_rd != 0) {
+		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET;
+		uint64_t res_size = (resident_rd + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
+
+		if (res_pa < phys_base || res_pa + res_size < res_pa || res_size > win_size - RESIDENT_RD_OFFSET) {
+			print("layout: resident image escapes the window\n");
+			return 0;
+		}
+		if (L->kern_hi + L->rd_size > res_pa) {
+			print("kernel and ramdisk overlap the resident image\n");
+			return 0;
+		}
+		/* the staged system image is written whole at the resident address: it must fit the
+		 * reserved span and the claimed window, checked before the first clear or read */
+		if (rdfile_size > res_size || rdfile_size > win_size - RESIDENT_RD_OFFSET) {
+			print("rdfile: %x bytes do not fit the window (resident span %x at %x)\n", rdfile_size, res_size,
+			    res_pa - phys_base);
+			return 0;
+		}
+		L->res_pa = res_pa;
+		L->res_size = res_size;
+		if (L->rd_size == 0) {
+			L->rd_pa = res_pa;
+			L->rd_size = res_size;
+			L->rd_resident = 1;
+		} else {
+			L->rd1_pa = res_pa;
+			L->rd1_size = res_size;
+		}
+	}
+	/* everything up to topOfKernelData is the kernel's static region: it must cover both images */
+	L->dt_pa = L->rd1_size != 0 ? L->rd1_pa + L->rd1_size : L->rd_pa + L->rd_size;
+	L->ba_pa = L->dt_pa + dt_max;
+	L->top = L->ba_pa + PAGE_SIZE_MAX;
+	if (L->ba_pa < L->dt_pa || L->top < L->ba_pa || L->top - phys_base > win_size) {
+		print("not enough contiguous RAM\n");
+		return 0;
+	}
+	/* and room to spare under the window's top, as before: 64 MiB of slack */
+	if (win_size - (L->top - phys_base) < 0x4000000ULL) {
+		print("not enough contiguous RAM\n");
+		return 0;
+	}
+	return 1;
+}
+/* F10-PLAN-END */
+
 /*
  * Load and run the kernel from the payload. Returns when the kernel comes
  * back (panic, checkpoint, early exception); the combined log is staged and
@@ -2953,50 +3119,31 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	uint64_t phys_base = win_base;
 	uint64_t slide = phys_base - KERNEL_VIRT_BASE; /* pa = va + slide */
-	uint64_t kern_lo = vm_lo + slide, kern_hi = (vm_hi + slide + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
-	/* The ramdisk must sit inside the kernel's static mapping, i.e. below topOfKernelData. */
-	uint64_t rd_pa = kern_hi;
-	uint64_t rd_size = (pi.ramdisk_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
-	int rd_resident = 0;
-	/* A resident image next to a payload ramdisk: two disks (which is which is decided where the device tree is written). */
-	uint64_t rd1_pa = 0, rd1_size = 0;
 
 	if (pi.resident_rd != 0) {
 		resident_rd_size = pi.resident_rd;
 	}
-	if (resident_rd_size != 0) {
-		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET;
-		uint64_t res_size = (resident_rd_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
+	/* Every check that can reject this run happens in plan_layout(), before any memory of
+	 * the window is cleared and before the staged image is read from its partition (F10). */
+	struct run_layout L;
 
-		if (kern_hi + rd_size > res_pa) {
-			print("kernel and ramdisk overlap the resident image\n");
+	if (!plan_layout(phys_base, win_size, vm_lo, vm_hi, pi.ramdisk_size, resident_rd_size,
+	    resident_rd_size != 0 ? pi.rdfile_size : 0, &L)) {
+		return 0;
+	}
+	uint64_t kern_lo = L.kern_lo, kern_hi = L.kern_hi;
+	uint64_t rd_pa = L.rd_pa, rd_size = L.rd_size;
+	int rd_resident = L.rd_resident;
+	uint64_t rd1_pa = L.rd1_pa, rd1_size = L.rd1_size;
+	uint64_t dt_pa = L.dt_pa;
+	uint64_t ba_pa = L.ba_pa, top = L.top;
+
+	if (L.res_pa != 0 && pi.rdfile_size != 0) {
+		print("rdfile: loading %x bytes to %x\n", pi.rdfile_size, L.res_pa);
+		if (!rdfile_load(pi.rdfile_part, pi.rdfile_off, pi.rdfile_size, L.res_pa)) {
+			print("rdfile: giving up on the staged system image\n");
 			return 0;
 		}
-		if (rd_size == 0) {
-			rd_pa = res_pa;
-			rd_size = res_size;
-			rd_resident = 1;
-		} else {
-			rd1_pa = res_pa;
-			rd1_size = res_size;
-		}
-		if (pi.rdfile_size != 0) {
-			print("rdfile: loading %x bytes to %x\n", pi.rdfile_size, res_pa);
-			if (!rdfile_load(pi.rdfile_part, pi.rdfile_off, pi.rdfile_size, res_pa)) {
-				print("rdfile: giving up on the staged system image\n");
-				return 0;
-			}
-		}
-	}
-	/* everything up to topOfKernelData is the kernel's static region: it must cover both images */
-	uint64_t dt_pa = rd1_size != 0 ? rd1_pa + rd1_size : rd_pa + rd_size;
-	uint64_t dt_max = 0x10000;
-	uint64_t ba_pa = dt_pa + dt_max;
-	uint64_t top = ba_pa + PAGE_SIZE_MAX;
-
-	if (win_size < top - phys_base + 0x4000000ULL) {
-		print("not enough contiguous RAM\n");
-		return 0;
 	}
 
 	/* --- load segments -------------------------------------------------- */
@@ -3784,7 +3931,8 @@ fb_command(char *cmd)
 	{
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
-		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap"))) {
+		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap") ||
+		    starts_with(cmd, "oem probe") || starts_with(cmd, "oem logwrite"))) {
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
@@ -3931,6 +4079,19 @@ fb_command(char *cmd)
 			/* the firmware's memory map into the log (then "oem log" and fetch it) */
 			print_memory_map();
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem logwrite")) {
+			/*
+			 * The only path that lets the log land on boot_a where no logdump partition
+			 * exists (review F09, ruling b); the caller knows boot_a may hold the boot image.
+			 */
+			fb_reply("OKAY", "");
+			log_fallback_boot_a_allowed = 1;
+			flush_log();
+			log_fallback_boot_a_allowed = 0;
+		} else if (starts_with(cmd, "oem probe")) {
+			/* the only writable storage check, and it puts back what it moved (review F09) */
+			fb_reply("OKAY", "");
+			probe_boot_a();
 		} else if (starts_with(cmd, "oem log")) {
 			if (busy) {
 				compose_live_log(running_live, running_slide);
@@ -4161,7 +4322,7 @@ efi_main(efi_handle image, efi_system_table *st)
 	int have_payload = parse_payload(&pi, 0);
 	if (have_payload && pi.usb_mode && usb_start()) {
 		flush_log();
-		probe_boot_a();
+		inspect_storage(); /* read-only since review F09; the writes live behind "oem probe" */
 		usb_command_loop();
 	}
 

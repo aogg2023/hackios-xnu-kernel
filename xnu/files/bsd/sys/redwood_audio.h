@@ -67,6 +67,8 @@ void annibale_torch_init(void);         /* boot-arg torch_secs=N: annibale's fla
 void annibale_torch_quiesce(void);      /* its light off: at the run's end and on a panic's way out */
 bool annibale_torch_low_on(uint32_t milliamps);   /* the camera's (task L1b): the torch lit, up to the device tree's maximum */
 void annibale_torch_low_off(void);      /* ... and put out */
+void adreno8_init(void);                /* boot-arg adreno8=N (1..16): annibale's Adreno 830, step by step (bsd/dev/adreno8.c) */
+void adreno8_quiesce(void);             /* its GMU's processor back in reset: at the run's end and on a panic's way out */
 void mhi_pcie_init(void);               /* boot-arg pcie=N (1..3): the Wi-Fi card on PCIe root complex 0, survey (bsd/dev/mhi_pcie.c) */
 void annibale_spmi_lock(void);          /* the annibale drivers' one transfer at a time through the v7 arbiter (annibale_buttons.c) */
 void annibale_spmi_unlock(void);

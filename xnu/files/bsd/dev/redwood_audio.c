@@ -356,4 +356,5 @@ redwood_audio_init(void)
 	annibale_battery_init();
 	annibale_torch_init();
 	mhi_pcie_init();
+	adreno8_init();                   /* boot-arg adreno8=N: the Adreno 830's stepper, on this phone (bsd/dev/adreno8.c) */
 }

@@ -47,6 +47,7 @@ void loader_return(void);
 extern void redwood_adreno_quiesce(void);
 extern void redwood_adreno_stop(void);
 extern void redwood_adreno_minute(void);
+extern void adreno8_quiesce(void);      /* bsd/dev/adreno8.c: the Adreno 830's stepper on the other phone */
 extern void redwood_wifi_stop(void);
 extern void redwood_wifi_quiesce(void);
 extern void redwood_adsp_stop(void);
@@ -373,6 +374,7 @@ loader_return(void)
 #endif
 	redwood_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	redwood_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
+	adreno8_quiesce();              /* the other phone's GMU, if its stepper ran, back in reset, and its translation off */
 	redwood_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	redwood_adsp_quiesce();         /* nor the audio DSP */
 	redwood_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */

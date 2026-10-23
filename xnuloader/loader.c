@@ -4117,8 +4117,22 @@ efi_main(efi_handle image, efi_system_table *st)
 		 * the panel of this phone is not lit yet, so a missing GOP is expected here; a build
 		 * made for one phone still knows which phone it runs on (k90-port: without this the
 		 * platform stayed qemu_virt and every SoC parameter of the kernel was wrong).
+		 *
+		 * And the phone still has a screen: booted through LK (the "reboot into slot" path),
+		 * LK drove the panel and blits its splash into splash_region 0xfc800000+0x2b00000,
+		 * the very region our MemoryMapLib carves as Display_Reserved (the device's own
+		 * device tree labels it cont_splash_region, docs/analysis/annibale-hw-map.md). Hand
+		 * that to the kernel as BootArgs.video and it has a display -- QEMU's SpringBoard
+		 * milestone draws into nothing but BootArgs.video, so this is the whole graphics
+		 * handover. Blits into it before LK ran (the "fastboot boot" path) are harmless:
+		 * the region is RAM either way, just no panel shows them yet.
 		 */
 		PLAT = &platform_annibale;
+		SCREEN.base = platform_annibale.fb_base;
+		SCREEN.width = 1440;              /* the panel's native mode, as LK drives it */
+		SCREEN.height = 3200;
+		SCREEN.stride = 1440 * 4;
+		print("display assumed at %x: LK splash region\n", SCREEN.base);
 #endif
 	} else {
 		SCREEN.base = GOP->mode->fb_base;

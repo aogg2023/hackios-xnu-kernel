@@ -85,7 +85,7 @@ static uint32_t touch_steps = 5;  /* touch_hv_steps=1..5: database, GPIO, suppli
 
 #define NO_STRAP                1000u     /* a GPIO number no phone has, so that a read of a strap reads none */
 
-static uint64_t tlmm_phys, tlmm_size;        /* redwood 0x0f100000/0x100000, annibale 0x0f000000/0x202000 */
+static uint64_t tlmm_phys, tlmm_size;        /* GPIO window starts at 0x0f100000 on both boards. */
 #define TLMM_PHYS               tlmm_phys
 #define TLMM_SIZE               tlmm_size
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
@@ -139,20 +139,21 @@ static uint64_t cmd_db_phys, cmd_db_size;
 #define CMD_DB_SIZE             cmd_db_size
 #define RSC_PHYS                rsc_phys              /* the application processor's "DRV 2", whose slot layout is the same on both */
 static uint64_t rsc_phys;
+static unsigned rsc_version;
 #define RSC_SIZE                0x10000UL
 #define TCS(reg)                (rsc + 0xd00 + (reg))           /* command slot set 0, an "active" one */
 #define TCS_IRQ_ENABLE          0x00
 #define TCS_IRQ_STATUS          0x04
 #define TCS_IRQ_CLEAR           0x08
-#define TCS_WAIT_FOR_COMPLETION 0x10
-#define TCS_CONTROL             0x14
+#define TCS_WAIT_FOR_COMPLETION (rsc_version >= 3 ? 0x20 : 0x10)
+#define TCS_CONTROL             (rsc_version >= 3 ? 0x24 : 0x14)
 #define TCS_CONTROL_ENABLE      (1u << 16)
 #define TCS_CONTROL_TRIGGER     (1u << 24)
-#define TCS_STATUS              0x18            /* 0 while busy */
-#define TCS_CMD_ENABLE          0x1c
-#define TCS_CMD_MSGID(n)        (0x30 + 20 * (n))
-#define TCS_CMD_ADDR(n)         (0x34 + 20 * (n))
-#define TCS_CMD_DATA(n)         (0x38 + 20 * (n))
+#define TCS_STATUS              (rsc_version >= 3 ? 0x28 : 0x18) /* 0 while busy */
+#define TCS_CMD_ENABLE          (rsc_version >= 3 ? 0x2c : 0x1c)
+#define TCS_CMD_MSGID(n)         (rsc_version >= 3 ? 0x34 + 24 * (n) : 0x30 + 20 * (n))
+#define TCS_CMD_ADDR(n)          (TCS_CMD_MSGID(n) + 4)
+#define TCS_CMD_DATA(n)          (TCS_CMD_MSGID(n) + 8)
 #define MSGID_WRITE_4_BYTES     0x10008
 #define MSGID_RESPONSE          0x100
 
@@ -347,6 +348,7 @@ static bool
 clocks_on_annibale(void)
 {
 	se_source_hz = rcg_rate(annibale_parent, rd(A_QSPI_REF_CFG), rd(A_QSPI_REF_M), rd(A_QSPI_REF_N));
+	se_source_hz /= (rd(A_S2_CLK_SRC_DIV) & 0xf) + 1;
 	if (se_source_hz == 0) {
 		printf("goodix: engine clock source %#x reads as no rate at all\n", rd(A_QSPI_REF_CFG));
 		return false;
@@ -1511,7 +1513,7 @@ board_setup(uint32_t which)
 	vote_qup_bus = 1u << 18 | 1u << 19 | 1u << 20 | 1u << 21;   /* both phones: core 2x, core, m_ahb, s_ahb */
 	if (which == 2) {
 		board_annibale = 1;
-		tlmm_phys = 0x0f000000UL;  tlmm_size = 0x202000UL;   /* the SM8750's 216 pins */
+		tlmm_phys = 0x0f100000UL;  tlmm_size = 0x102000UL;   /* vendor TLMM base + 0x100000, as in sm8750.dtsi */
 		se_phys = 0x00a88000UL;                             /* serial engine 6: "qup1_se2", the touch chip's SPI */
 		rsc_phys = 0x16520000UL;                            /* apps_rsc "drv-2"; its slots too start at 0xd00 */
 		cmd_db_phys = 0x81c60000UL;  cmd_db_size = 0x20000UL;  /* aop_cmd_db_region, qcom,cmd-db */
@@ -1549,6 +1551,7 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
 	se = ml_io_map(SE_PHYS, SE_SIZE);
 	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	rsc_version = (rd(rsc) >> 16) & 0xff;
 	printf("goodix: command database at %#llx (%#llx bytes)\n", CMD_DB_PHYS, CMD_DB_SIZE);
 	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
 	printf("goodix: command database resource %s = %#x\n", supply_name, rpmh_address(supply_name));

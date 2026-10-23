@@ -708,80 +708,7 @@ dt_end(struct dt_writer *w)
 /* ------------------------------------------------------------------------ */
 /* Platform description                                                     */
 
-struct platform {
-	const char *name;
-	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
-	uint64_t gic_dist, gic_redist;   /* GICv3 */
-	uint64_t gic_redist_size, gic_redist_stride; /* 0 keeps the 1 MiB / 128 KiB defaults */
-	uint64_t uart;                   /* PL011, 0 if none */
-	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
-	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
-	int cores;                       /* at most this many processor cores, numbered from 0 ... */
-	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
-	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
-	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
-	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
-};
-
-static const struct platform platform_qemu_virt = {
-	.name = "qemu-virt", .io_base = 0x08000000, .io_size = 0x08000000,
-	.gic_dist = 0x08000000, .gic_redist = 0x080A0000, .uart = 0x09000000, .psci_hvc = 1,
-	.cores = 8, .core_shift = 0,
-	/*
-	 * QEMU's emulated cores stop each other all the time (every flush of a page from all the
-	 * TLBs is a rendezvous of all its CPU threads), and the kernel's patience with a spin lock
-	 * is that of real hardware: an eighth of a second by a 24 MHz clock, a twentieth here.
-	 */
-	.timeout_scale = 20,
-};
-
-static const struct platform platform_redwood = {
-	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
-	.name = "redwood", .io_base = 0x00400000, .io_size = 0x3FC00000,
-	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
-	.cores = 8, .core_shift = 8,
-	/*
-	 * Cores 0-3 are Cortex-A55s (1.8 GHz at most), 4-7 Cortex-A78s (2.4 GHz): a big one is about
-	 * 2.5 times as fast. The kernel uses the small ones only when the big ones are all busy
-	 * (XNU's machine_routines.c, ml_choose_slow_core_partners()).
-	 */
-	.small_cores = 0x0f,
-	.fb_base = 0xE1000000,
-};
-
-/*
- * annibale (REDMI K90, SM8750): the merged device tree supplies the GIC ranges and
- * 0x40000 redistributor stride, PSCI method "smc", and splash region at 0xFC800000.
- * MPIDRs are 0..500 and 10000/10100; the linear core enumeration below reaches the first six.
- * DIRECT_PHONE_PLAT selects this platform even without GOP. See docs/analysis/annibale-hw-map.md
- * in the parent workspace for the device-tree measurements.
- */
-static const struct platform platform_annibale = {
-	.name = "annibale", .io_base = 0x00400000, .io_size = 0x3FC00000,
-	.gic_dist = 0x16000000, .gic_redist = 0x16080000,
-	.gic_redist_size = 0x200000, .gic_redist_stride = 0x40000,
-	/*
-	 * uart stays 0 on purpose: the console of this device is the GENI uart at 0xa9c000
-	 * (115200n8, docs/analysis/annibale-hw-map.md), but its QUP clock is gated until a
-	 * driver enables it, so writing the register blind risks hanging the kernel's early
-	 * console; and with uart==0 the loader's cmdline omits serial= entirely, which is
-	 * what a device without a probe wire wants. Flip when the pad is instrumented.
-	 */
-	.uart = 0, .log_other_cpu = 1,
-	.cores = 8, .core_shift = 8,
-	.small_cores = 0x3f,
-	.fb_base = 0xFC800000,
-};
-
-/*
- * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
- * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
- * where each value comes from); a display that matches none is QEMU's ramfb.
- */
-static const struct platform *const platforms[] = {
-	&platform_redwood,
-	&platform_annibale,
-};
+#include "platform_private.h"
 
 /* ------------------------------------------------------------------------ */
 
@@ -980,6 +907,7 @@ jump_to_kernel(uint64_t entry, uint64_t boot_args_pa)
 #define PSCI_CPU_OFF       0x84000002u
 #define PSCI_CPU_ON        0xC4000003u
 #define PSCI_AFFINITY_INFO 0xC4000004u      /* (MPIDR, 0): 0 = that core is on, 1 = off, 2 = being started */
+#define PSCI_SYSTEM_RESET 0x84000009u
 #define PSCI_NOT_SUPPORTED (-1)
 
 /* each alone in a cache line: one core reads them with its caches off */
@@ -2873,7 +2801,10 @@ static void
 set_result(const char *what, uint64_t a, uint64_t b)
 {
 	uint32_t saved = log_len;
-	uint32_t start = log_len;
+	char saved_tail[64];
+	uint32_t start = sizeof(log_buf) - sizeof(saved_tail);
+	memcpy(saved_tail, log_buf + start, sizeof(saved_tail));
+	log_len = start;
 	print("%s %d %x", what, a, b);
 	uint32_t n = log_len - start;
 	if (n > sizeof(last_result) - 1) {
@@ -2881,6 +2812,7 @@ set_result(const char *what, uint64_t a, uint64_t b)
 	}
 	memcpy(last_result, log_buf + start, n);
 	last_result[n] = 0;
+	memcpy(log_buf + start, saved_tail, sizeof(saved_tail));
 	log_len = saved;
 }
 
@@ -3183,7 +3115,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	block_write_part = -1;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
-			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
+			kernel_mpidr = PLAT->core_mpidr[c[8] - '0'];
 		}
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
@@ -3501,18 +3433,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * this loader stays on while it watches is not the kernel's, nor any the firmware runs.
 	 */
 	uint64_t cpu_mpidr[8] = { kernel_mpidr };
-	int cpu_count = 1, boot_core = (int)(kernel_mpidr >> plat->core_shift);
+	int cpu_count = 1, boot_core = platform_core_index(plat, kernel_mpidr);
 
 	if (more_cores) {
 		for (int distance = 1; distance < plat->cores; distance++) {
 			for (int side = 0; side < 2; side++) {
 				int core = side == 0 ? boot_core + distance : boot_core - distance;
-				uint64_t mpidr = (uint64_t)core << plat->core_shift;
+				uint64_t mpidr;
 				int64_t state;
 
-				if (core < 0 || core >= plat->cores || mpidr == this_mpidr) {
+				if (core < 0 || core >= plat->cores) {
 					continue;
 				}
+				mpidr = plat->core_mpidr[core];
+				if (mpidr == this_mpidr) { continue; }
 				state = psci_call(PSCI_AFFINITY_INFO, mpidr, 0, 0);
 				if (state == 1 || state == PSCI_NOT_SUPPORTED) {
 					cpu_mpidr[cpu_count++] = mpidr;
@@ -3543,7 +3477,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_prop_u64(&w, "bus-frequency", 100000000ULL);
 		dt_prop_u64(&w, "memory-frequency", 100000000ULL);
 		dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
-		if (plat->small_cores & (1u << ((cpu_mpidr[i] >> plat->core_shift) & 31))) {
+		if (plat->small_cores & (1u << platform_core_index(plat, cpu_mpidr[i]))) {
 			dt_prop_u32(&w, "small-core", 1);
 		}
 		dt_end(&w);
@@ -4107,8 +4041,16 @@ fb_command(char *cmd)
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
 			fb_reply("OKAY", "");
-			BS->stall(200000);
-			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+			if (PLAT == &platform_annibale) {
+				/* Match ArmPsciResetSystemLib without invoking UEFI reset callbacks. */
+				int64_t status = psci_call(PSCI_SYSTEM_RESET, 0, 0, 0);
+				print("PSCI SYSTEM_RESET returned %d; USB command loop retained\n", (uint64_t)status);
+				set_result("reset-failed", (uint64_t)status, 0);
+				compose_logs(NULL, 0);
+			} else {
+				BS->stall(200000);
+				ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+			}
 		} else {
 			fb_reply("FAIL", "unknown command");
 		}

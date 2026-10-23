@@ -1,5 +1,5 @@
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index e5336e5a1cce..a54e35035cde 100644
+index e5336e5a1cce..63b2dcb7ca4a 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -126,6 +126,27 @@ LEXT(LowResetVectorBase)
@@ -38,18 +38,21 @@ index e5336e5a1cce..a54e35035cde 100644
  
  
  
-@@ -143,7 +165,9 @@ LEXT(reset_vector)
+@@ -143,8 +165,11 @@ LEXT(reset_vector)
  	adrp	x19, EXT(ResetHandlerData)@page			// Get address of the reset handler data
  	add		x19, x19, EXT(ResetHandlerData)@pageoff
  	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
 -#if HAS_CLUSTER
-+#if HAS_CLUSTER || defined(GENERIC_PSCI_SMP)
-+	// (generic boards: some number their cores in Affinity1 and leave Affinity0 at zero;
-+	// a cpu data's phys id is both fields, as the device tree's "reg" has them)
- 	and		x0, x15, #0xFFFF					// CPU number in Affinity0, cluster ID in Affinity1
+-	and		x0, x15, #0xFFFF					// CPU number in Affinity0, cluster ID in Affinity1
++#if defined(GENERIC_PSCI_SMP)
++	// Generic CPU identifiers retain Aff0, Aff1 and Aff2 from the device tree.
++	and		x0, x15, #0xFFFFFF
++#elif HAS_CLUSTER
++	and		x0, x15, #0xFFFF
  #else
  	and		x0, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
-@@ -233,40 +257,175 @@ LEXT(_start)
+ #endif
+@@ -233,40 +258,175 @@ LEXT(_start)
  	.global	EXT(LowExceptionVectorBase)
  LEXT(LowExceptionVectorBase)
  	/* EL1 SP 0 */
@@ -241,7 +244,7 @@ index e5336e5a1cce..a54e35035cde 100644
  	.align 12, 0
  
  #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
-@@ -452,22 +611,51 @@ start_cpu:
+@@ -452,22 +612,51 @@ start_cpu:
   * Cold boot init routine.  Called from __start
   *   x0 - Boot args
   */
@@ -296,7 +299,7 @@ index e5336e5a1cce..a54e35035cde 100644
  
  	// Get the kernel memory parameters from the boot args
  	ldr		x22, [x20, BA_VIRT_BASE]			// Get the kernel virt base
-@@ -612,6 +800,7 @@ Lkernelcache_base_found:
+@@ -612,6 +801,7 @@ Lkernelcache_base_found:
  	/* Ensure TTEs are visible */
  	dsb		ish
  
@@ -304,7 +307,7 @@ index e5336e5a1cce..a54e35035cde 100644
  
  	b		common_start
  
-@@ -686,7 +875,10 @@ common_start:
+@@ -686,7 +876,10 @@ common_start:
  	dsb		ish
  
  
@@ -316,7 +319,7 @@ index e5336e5a1cce..a54e35035cde 100644
  	// Setup timer interrupt routing; must be done before MMU is enabled
  	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
  	and		x15, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
-@@ -740,10 +932,17 @@ common_start:
+@@ -740,10 +933,17 @@ common_start:
  	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
  #endif /* HAS_APPLE_PAC */
  

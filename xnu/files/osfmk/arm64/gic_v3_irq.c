@@ -147,14 +147,14 @@ gic_mask(uint32_t intid)
  * A software-generated interrupt for the processor with that MPIDR (its two
  * low affinity fields, as in the device tree's "reg").
  * ICC_SGI1R_EL1: Aff1 in [23:16], the interrupt in [27:24], and in [15:0] a
- * bit for every Aff0 addressed -- which is why Aff0 has to be below 16.
+ * bit for every Aff0 addressed. Aff2 occupies [39:32]; this ABI supplies the low three affinity fields.
  */
 static void
 gic_send_sgi(uint32_t phys_id, uint32_t sgi)
 {
 	uint64_t aff0 = phys_id & 0xff, aff1 = (phys_id >> 8) & 0xff;
 
-	__builtin_arm_wsr64("ICC_SGI1R_EL1", ((uint64_t)sgi << 24) | (aff1 << 16) | (1ULL << (aff0 & 15)));
+	__builtin_arm_wsr64("ICC_SGI1R_EL1", ((uint64_t)(phys_id >> 16) << 32) | ((uint64_t)sgi << 24) | (aff1 << 16) | (1ULL << (aff0 & 15)));
 	__builtin_arm_isb(ISB_SY);
 }
 

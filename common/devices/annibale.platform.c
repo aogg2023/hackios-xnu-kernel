@@ -8,9 +8,7 @@ static const struct platform platform_annibale = {
 	.gic_dist = 0x16000000, .gic_redist = 0x16080000,
 	.uart = 0,                                      /* phones: no PL011 */
 	.log_other_cpu = 1,
-	.cores = 8, .core_shift = 8,                 /* MPIDR: 0x0..0x500 (six perf), 0x10000/0x10100 (two prime);
-	                                              * new-device.sh read shift 0 because the CPU nodes carry
-	                                              * phandle labels ("CPU0: cpu@0") its regex does not match */
+	.cores = 8, .core_mpidr = {0, 0x100, 0x200, 0x300, 0x400, 0x500, 0x10000, 0x10100},
 	.small_cores = 0x3f,                           /* the six MIDR 0x514f0014 cores: lower capacity cluster */
 	.fb_base = 0x0,                                 /* TODO: the framebuffer base the UEFI prints ("display ... at") */
 };

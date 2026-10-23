@@ -1,7 +1,4 @@
-/*
- * adreno8_cx.c -- what feeds the GPU from outside (fuses, RPMh, the clock controller), the CX half's power, the RSCC, the clocks: steps 1 to 5
- * The ladder, the boot-args and what is not settled: see adreno8.c; the shared world: adreno8_private.h.
- */
+/* SM8750 GPU power, clocks, CMD DB and SCM initialization. */
 #include "adreno8_private.h"
 
 #define printf adreno8_say
@@ -108,27 +105,14 @@ adreno8_show_rpmh_resource(const char *name)
 	printf("adreno8: %u: RPMh has \"%s\" at %#x; levels:%s\n", adreno8_step, name, address, levels);
 }
 
-/*
- * dt: qfprom@221c8000, gpu_speed_bin@138: two bytes, ten bits from bit 0. The device tree's two
- * speed tables hang off the bins (qcom,sku-codes): bin 0 is the fast table (fifteen speeds, top
- * 1150 MHz), bins 2 and 3 the capped one (twelve speeds, top 900 MHz). Nothing else is known.
- */
-
 static struct adreno8_block adreno8_qfprom = { "qfprom", 0x221c8000, 0x1000 };
 
-/* The 3D core's speeds, Hz and the supply-rail level the vendor's device tree pairs with each. */
-
-static const struct adreno8_gpu_level adreno8_speeds_capped[] = {   /* dt: pwrlevels-0 (sku 2, 3): the 900 MHz table */
-	{  125000000, 0x32 }, {  222000000, 0x34 }, {  342000000, 0x38 }, {  390000000, 0x3c },
-	{  440000000, 0x40 }, {  525000000, 0x50 }, {  610000000, 0x80 }, {  660000000, 0x90 },
-	{  735000000, 0xc0 }, {  780000000, 0xe0 }, {  832500000, 0x100 }, {  900000000, 0x140 },
-};
-
-static const struct adreno8_gpu_level adreno8_speeds_fast[] = {     /* dt: pwrlevels-1 (sku 0): the 1150 MHz table */
-	{  125000000, 0x32 }, {  222000000, 0x34 }, {  342000000, 0x38 }, {  390000000, 0x3c },
-	{  440000000, 0x40 }, {  525000000, 0x50 }, {  610000000, 0x80 }, {  660000000, 0x90 },
-	{  735000000, 0xc0 }, {  780000000, 0xe0 }, {  832500000, 0x100 }, {  900000000, 0x140 },
-	{  970000000, 0x1a0 }, { 1050000000, 0x1c0 }, { 1150000000, 0x1c4 },
+/*
+ * KGSL selects qcom,sku-codes from socinfo feature_code/pcode, separately from speed_bin.
+ * Until socinfo is available, expose only the 125 MHz / 0x32 point shared by both K90 DT tables.
+ */
+static const struct adreno8_gpu_level adreno8_boot_speeds[] = {
+	{ 125000000, 0x32 },
 };
 
 uint32_t adreno8_speed_bin;
@@ -152,20 +136,18 @@ const uint32_t adreno8_gmu_hz[3] = { 0, 500000000, 650000000 };
 
 const uint32_t adreno8_gmu_level[3] = { 0, 0x40, 0x80 };
 
-/*
- * The bandwidth levels the message's rows are made for, KB per second. Linux derives them from
- * the operating points of the memory paths; the vendor's driver keeps a static list and so, for
- * this first ladder, do we. (TODO: check against this machine's icc clocks.)
- */
+/* K90 DT qcom,bus-table-ddr, in KB/s. */
+const uint32_t adreno8_bw_kb[BW_COUNT] = {
+	0, 781250, 2136718, 5285156, 6074218, 6671875,
+	8171875, 10687500, 12449218, 14398437, 16500000, 18597656,
+};
 
-const uint32_t adreno8_bw_kb[9] = { 0, 1350000, 2700000, 4050000, 5400000, 6750000, 8100000, 10687500, 13500000 };
+/* SM8750 BCM resources; gen8.0.0 HFI performance mode starts at 2736 MHz DDR. */
 
-/* The three bus monitors of gen80200 (catalog a6xx_gen8_02_00_perfcounters): what RPMh calls them. */
-
-const struct adreno8_bcm adreno8_bcms[] = {             /* catalog: gen80200 bcms */
+const struct adreno8_bcm adreno8_bcms[] = {
 	{ "SH0", 16, false, 0, 0 },
 	{ "MC0",  4, false, 0, 0 },
-	{ "ACV",  0, true,  1u << 2, 10687500 }, /* votes "perfmode" from this bandwidth up; on a8xx on every voted one */
+	{ "ACV",  0, true,  1u << 2, 10687500 }, /* adreno_gen8_rpmh.c: 2736 * 4 * 1000000 / 1024 KB/s */
 };
 
 void
@@ -182,7 +164,7 @@ adreno8_show_rpmh_bcm(const char *name)
 	}
 	if (length >= sizeof(one)) {
 		memcpy(&one, data, sizeof(one));   /* little endian both sides */
-		printf("adreno8: %u: RPMh has \"%s\" at %#x; monitor: width %u, version %u, unit %u\n", adreno8_step, name, address,
+		printf("adreno8: %u: RPMh has \"%s\" at %#x; monitor: width %u, vcd %u, unit %u\n", adreno8_step, name, address,
 		    one.width, one.vcd, one.unit);
 		return;
 	}
@@ -281,21 +263,13 @@ adreno8_step_outside(void)
 {
 	uint32_t bin;
 
-	adreno8_announce("read the GPU's speed bin in the fuses (qfprom 0x221c8000 + 0x138, ten of its bits), which of the phone's two speed tables this phone is");
-	bin = adreno8_get8(&adreno8_qfprom, "speed bin, low", QFPROM_GPU_SPEED_BIN);
-	bin |= adreno8_get8(&adreno8_qfprom, "speed bin, high", QFPROM_GPU_SPEED_BIN + 1) << 8;
-	adreno8_speed_bin = bin &= 0x3ff;
-	if (bin == 0) {
-		adreno8_speeds = adreno8_speeds_fast;
-		adreno8_speeds_count = sizeof(adreno8_speeds_fast) / sizeof(adreno8_speeds_fast[0]);
-	} else {
-		if (bin != 2 && bin != 3) {
-			printf("adreno8: %u: no speed table is labelled for bin %u: taking the capped one (dt: qcom,sku-codes 2 and 3)\n",
-			    adreno8_step, bin);
-		}
-		adreno8_speeds = adreno8_speeds_capped;
-		adreno8_speeds_count = sizeof(adreno8_speeds_capped) / sizeof(adreno8_speeds_capped[0]);
-	}
+	adreno8_announce("read the GPU speed bin at qfprom 0x221c8138, bits 8:0");
+	/* SM8450 and later require word-aligned 32-bit QFPROM reads; see Linux qfprom.c. */
+	bin = adreno8_get(&adreno8_qfprom, "speed bin", QFPROM_GPU_SPEED_BIN);
+	adreno8_speed_bin = bin &= 0x1ff;
+	adreno8_speeds = adreno8_boot_speeds;
+	adreno8_speeds_count = sizeof(adreno8_boot_speeds) / sizeof(adreno8_boot_speeds[0]);
+	printf("adreno8: %u: speed bin %u; SKU unavailable, limiting GX to the common 125 MHz point\n", adreno8_step, bin);
 	adreno8_gx_count = 1;
 	adreno8_gx_hz[0] = 0;
 	adreno8_gx_level[0] = 0;                        /* the idling speed the message tables start with (Linux prepends the 0 Hz operating point) */
@@ -394,7 +368,8 @@ adreno8_step_gpucc(void)
 
 /* ---- steps 3 and 5's helpers --------------------------------------------------------------------------- */
 
-bool adreno8_cx_was_on;                          /* found switched on, or switched on here (what to leave at the end) */
+bool adreno8_cx_changed;
+uint32_t adreno8_cx_saved_gdscr;
 
 bool
 adreno8_clock_on(struct adreno8_block *b, const char *name, uint32_t cbcr, bool must)
@@ -475,7 +450,6 @@ adreno8_step_cx_power(void)
 	gdscr = adreno8_get(&adreno8_gpucc, "cx gdscr", GPUCC_CX_GDSCR);
 	hw = adreno8_get(&adreno8_gpucc, "cx hw control", GPUCC_CX_HW_CTRL);
 	if ((gdscr | hw) & GDSC_POWER_ON) {
-		adreno8_cx_was_on = true;
 		printf("adreno8: %u: THE CX HALF IS UP ALREADY: the boot loader (or an earlier step in this session) switched it on and the AOP keeps it: leaving it and going on (unlike redwood: on this phone the vendor's preemption logic wants CX up)\n", adreno8_step);
 		if (adreno8_speeds == NULL) {
 			printf("adreno8: %u: (speed bin not read this session: step 1 alone asks the fuses)\n", adreno8_step);
@@ -487,6 +461,9 @@ adreno8_step_cx_power(void)
 		return false;
 	}
 	adreno8_announce("ask the CX half up (gpucc cx_gdscr bit 0: collapse off) and time how long it takes: half a second at most");
+	/* Restore the full configuration even if the power-on poll fails. */
+	adreno8_cx_saved_gdscr = gdscr;
+	adreno8_cx_changed = true;
 	adreno8_put(&adreno8_gpucc, "cx gdscr", GPUCC_CX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
 	start = mach_absolute_time();
 	for (int i = 0; i < 5000 && !adreno8_cx_is_on(); i++) {
@@ -506,12 +483,8 @@ adreno8_step_cx_power(void)
 /* ---- step 4: that it is awake ---------------------------------------------------------------------------- */
 
 /*
- * dt: cx_misc@3d9e000 (the vendor's second gmu-adjacent window) and rscc@3d50000. Linux reads
- * the slice count out of cx_misc (a8xx_gpu.c: cx_misc + CX_MISC_SLICE_ENABLE_FINAL: bits 2:0 one
- * per 3D slice) and the warm/cold tell out of TCM_RET_CNTL (a6xx_gmu.c: retention on = the GMU's
- * memories kept). rscc registers are dword-indexed in the vendor's name for them (RSCC(index) =
- * 4*index), the "RSC is asleep" bit of its status among them. The gmu node's second window
- * (0x3d40000, "gmu_ao_blk_dec0") is read here for the record only: what lives there is unknown.
+ * dt: cx_misc@3d9e000 and rscc@3d50000. TCM_RET_CNTL reports retained GMU memory.
+ * RSCC registers use dword indices; the status register reports whether the RSC is asleep.
  */
 
 struct adreno8_block adreno8_cx_misc = { "cx_misc", 0x03d9e000, 0x2000 };
@@ -520,51 +493,32 @@ struct adreno8_block adreno8_rscc = { "rscc", 0x03d50000, 0x10000 };
 
 static struct adreno8_block adreno8_gbif = { "gbif", 0x03d0f000, 0x1000 };
 
-uint32_t adreno8_slice_count;
-
 bool adreno8_rsc_asleep_at_first;
 
 bool
 adreno8_step_cx_awake(void)
 {
-	uint32_t tcm, slices, status;
+	uint32_t tcm, status;
 
 	if (!adreno8_cx_ready()) {
 		return false;
 	}
-	adreno8_announce("read the CX half's own windows: whether the GMU's memories were kept, how many 3D slices the fuses enabled, its feature fuses, the bus interface's halt state");
+	adreno8_announce("read CX memory retention, feature fuses and bus halt state");
 	tcm = adreno8_get(&adreno8_cx_misc, "tcm retention", CX_MISC_TCM_RET);
 	printf("adreno8: %u: the GMU's memories were %s: a %s start\n", adreno8_step, tcm == 1 ? "kept" : "not kept",
 	    tcm == 1 ? "warm" : "cold");
-	slices = adreno8_get(&adreno8_cx_misc, "slice enable final", CX_MISC_SLICE_ENABLE) & 7;
-	adreno8_slice_count = (slices & 1) + (slices >> 1 & 1) + (slices >> 2 & 1);
 	adreno8_get(&adreno8_cx_misc, "sw fuse", CX_MISC_SW_FUSE);
 	adreno8_get(&adreno8_gbif, "halt", GBIF_HALT);
 	adreno8_get(&adreno8_gbif, "halt ack", GBIF_HALT_ACK);
-	printf("adreno8: %u: THE CX HALF ANSWERS; THE 3D CORE HAS %u SLICE(S) (dt chipid 0x44050000, the catalog's gen80200 is 0x44050a01 with the slice count in the middle)\n", adreno8_step, adreno8_slice_count);
-	if (adreno8_slice_count == 0 || adreno8_slice_count > 3) {
-		printf("adreno8: %u: %u slices is not what this GPU is built with (catalog: 3): going on and believing the reads\n", adreno8_step,
-		    adreno8_slice_count);
-	}
+	printf("adreno8: %u: CX registers answer\n", adreno8_step);
 
-	adreno8_announce("read the GMU's channel to RPMh (rscc 0x3d50000) as left: is the sleep controller itself awake, is a sequence running, what do its slots hold");
+	adreno8_announce("read RSCC sleep and sequence status");
 	adreno8_get(&adreno8_rscc, "drv ctrl", RSCC_DRV_CTRL);
 	status = adreno8_get(&adreno8_rscc, "rsc status", RSCC_RSC_STATUS);
 	adreno8_rsc_asleep_at_first = (status & RSCC_ASLEEP) != 0;
 	adreno8_get(&adreno8_rscc, "seq busy drv0", RSCC_SEQ_BUSY);
-	for (unsigned slot = 0; slot < 4; slot++) {
-		uint32_t ctrl = adreno8_rscc.base != 0 ? adreno8_rd(adreno8_rscc.base + RSCC_SLOT0 + 0x2a0 * slot) : 0;
-
-		if (ctrl & 0x38) {
-			printf("adreno8: %u: rscc slot %u holds the GPU's wake (%#x)\n", adreno8_step, slot, ctrl);
-		}
-	}
 	printf("adreno8: %u: the RSC itself is %s\n", adreno8_step, adreno8_rsc_asleep_at_first ? "asleep: step 11 wakes it first" : "awake");
 
-	adreno8_announce("read the head of the gmu node's second window (0x3d40000, named gmu_ao_blk_dec0): what lives there is not known; recorded, not judged");
-	for (unsigned i = 0; i < 8; i++) {
-		adreno8_get(&adreno8_gmu_ao_diag, "word", 4 * i);
-	}
 	return true;
 }
 
@@ -586,7 +540,7 @@ adreno8_step_clocks(void)
 	}
 
 	adreno8_announce("in the GPU's clock controller: the GMU's clock source to the crystal (parent 0; adreno8_gmuclk=1 would ask PLL0_OUT_EVEN, parent 2, whose PLL offsets are unverified: see the header)");
-	if (!adreno8_clock_source("gmu_clk_src", GPUCC_GMU_RCGR, adreno8_gmu_from_pll ? 2 : 0)) {
+	if (!adreno8_clock_source("gmu_clk_src", GPUCC_GMU_RCGR, adreno8_gmu_from_pll ? (2u << 8) | 1u : 0)) {
 		return false;
 	}
 	if (adreno8_gmu_from_pll) {
@@ -598,7 +552,6 @@ adreno8_step_clocks(void)
 	adreno8_announce("in the GPU's clock controller: the clocks of the GMU and of the way in on; the hub's source is left as the loader set it (its parents are unverified); the ones whose halt report lies are tolerated");
 	if (!adreno8_clock_on(&adreno8_gpucc, "cxo", GPUCC_CX_CBCR, true) ||
 	    !adreno8_clock_on(&adreno8_gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, true) ||
-	    !adreno8_clock_on(&adreno8_gpucc, "gpu_cc_gmu", GPUCC_GMU_BCR, true) ||
 	    !adreno8_clock_on(&adreno8_gpucc, "ahb", GPUCC_AHB_CBCR, false) ||
 	    !adreno8_clock_on(&adreno8_gpucc, "gx_gmu", GPUCC_GX_GMU_CBCR, false) ||
 	    !adreno8_clock_on(&adreno8_gpucc, "gx_accu_shift", GPUCC_GX_ACCU_CBCR, false) ||
@@ -618,4 +571,54 @@ adreno8_step_clocks(void)
 	adreno8_get(&adreno8_gpucc, "gpu_cc_gmu bcr", GPUCC_GMU_BCR);
 	adreno8_get(&adreno8_gpucc, "ahb", GPUCC_AHB_CBCR);
 	return true;
+}
+
+/* Qualcomm standard SMC64 with the A6 interrupted-call continuation convention. */
+int32_t
+adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
+    uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *answer)
+{
+	uint64_t session = 0;
+
+	adreno8_announce("SCM call %#llx arguments %#llx %#llx %#llx", function, argument0, argument1, argument2);
+	for (unsigned attempt = 0; attempt < 100; attempt++) {
+		register uint64_t x0 __asm__("x0") = attempt == 0 ? function : 1;
+		register uint64_t x1 __asm__("x1") = arginfo;
+		register uint64_t x2 __asm__("x2") = argument0;
+		register uint64_t x3 __asm__("x3") = argument1;
+		register uint64_t x4 __asm__("x4") = argument2;
+		register uint64_t x5 __asm__("x5") = argument3;
+		register uint64_t x6 __asm__("x6") = session;
+		register uint64_t x7 __asm__("x7") = 0;
+
+		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5),
+		    "+r" (x6), "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+		session = x6;
+		if (x0 != 1) {
+			*answer = x1;
+			printf("adreno8: %u: SCM %#llx returned %d, answer %#llx\n", adreno8_step, function, (int32_t)x0, x1);
+			return (int32_t)x0;
+		}
+	}
+	printf("adreno8: %u: SCM continuation limit reached\n", adreno8_step);
+	return -1;
+}
+
+bool
+adreno8_scm_gpu_init(void)
+{
+	uint64_t answer = 0;
+	int32_t status = adreno8_scm_call(0x42000601, 1, 0x02002801, 0, 0, 0, &answer);
+
+	/* qcom_scm_kgsl_init_regs permits EOPNOTSUPP; all other errors stop this probe. */
+	if (status == -4 || (status == 0 && answer == 0)) {
+		printf("adreno8: %u: SCM GPU register initialization unavailable\n", adreno8_step);
+		return true;
+	}
+	if (status != 0 || answer != 1) {
+		return false;
+	}
+	/* kgsl_util.h: mandatory register access and TSENSE IDs; BCL and CLX are disabled. */
+	status = adreno8_scm_call(0x42002801, 1, 0x9, 0, 0, 0, &answer);
+	return status == 0 || status == -4;
 }

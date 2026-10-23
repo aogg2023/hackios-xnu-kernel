@@ -62,7 +62,7 @@ void redwood_torch_quiesce(void);       /* the light off: at the run's end and o
 void redwood_camera_init(void);         /* boot-arg cam=N: the phone's cameras (bsd/dev/redwood_camera.c) */
 void redwood_camera_quiesce(void);      /* whatever of them was switched on, off: at the run's end and on a panic's way out */
 void annibale_buttons_init(void);       /* boot-arg buttons=1: annibale's keys, the PMIC's (bsd/dev/annibale_buttons.c) */
-void annibale_battery_init(void);       /* boot-arg battery=1: annibale's battery, the gauge in the PMIC (bsd/dev/annibale_battery.c) */
+void annibale_battery_init(void);       /* boot-arg battery=1: annibale's BQ27Z561 battery gauge (bsd/dev/annibale_battery.c) */
 void annibale_torch_init(void);         /* boot-arg torch_secs=N: annibale's flashlight, the PMIC's flash module (bsd/dev/annibale_torch.c) */
 void annibale_torch_quiesce(void);      /* its light off: at the run's end and on a panic's way out */
 bool annibale_torch_low_on(uint32_t milliamps);   /* the camera's (task L1b): the torch lit, up to the device tree's maximum */

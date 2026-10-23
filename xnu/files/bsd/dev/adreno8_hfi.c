@@ -1,128 +1,214 @@
-/*
- * adreno8_hfi.c -- the messages: the queues, the performance and bandwidth tables, the 3D core's firmware start and power: steps 12 to 16
- * The ladder, the boot-args and what is not settled: see adreno8.c; the shared world: adreno8_private.h.
- */
+/* SM8750 GMU HFI queues, resource tables and GX diagnostics. */
 #include "adreno8_private.h"
+#include "adreno8_hwsched_private.h"
 
 #define printf adreno8_say
 
-/* ---- the messages ----------------------------------------------------------------------------------------- */
-
-/*
- * The two queues of the table made in step 9, talked to exactly as Linux's a6xx_hfi.c talks to
- * them: a message is a header dword -- id, size in dwords, and a 12-bit number that the answer
- * must carry back -- then its words; it goes into the command queue's ring (padded to four, the
- * padding 0xfafafafa so the firmware's own walks notice it), the doorbell word is rung, and the
- * response queue is read until the number matches. An error message for something else is printed
- * and skipped, as Linux skips it: it was not an answer to us.
- */
-
 static unsigned adreno8_hfi_seq;
+bool adreno8_hfi_tables_sent;
 
-static uint32_t *
-adreno8_queue_header(unsigned response)
+static vm_offset_t
+adreno8_queue_header(unsigned queue)
 {
-	return (uint32_t *)(adreno8_gmu_hfi.memory + (response ? 72u : 24u) * 4);
+	return adreno8_hfi_view_table + ADRENO8_HFI_HEADER(queue) * 4;
+}
+
+static bool
+adreno8_queue_indices(vm_offset_t header, uint32_t *read, uint32_t *write)
+{
+	*read = adreno8_rd(header + 40);
+	*write = adreno8_rd(header + 44);
+	return adreno8_rd(header) == 1 &&
+	       adreno8_rd(header + 12) == ADRENO8_HFI_QUEUE_DWORDS &&
+	       *read < ADRENO8_HFI_QUEUE_DWORDS && *write < ADRENO8_HFI_QUEUE_DWORDS &&
+	       ((*read | *write) & 3) == 0;
 }
 
 static bool
 adreno8_queue_write(const uint32_t *msg, uint32_t dwords)
 {
-	uint32_t *h = adreno8_queue_header(0), *data = (uint32_t *)(adreno8_gmu_hfi.memory + PAGE_SIZE);
-	uint32_t size = h[3], index = h[11], space;
+	vm_offset_t header = adreno8_queue_header(0);
+	uint32_t read, write, space, aligned = (dwords + 3) & ~3u;
 
-	space = index >= h[10] ? size - (index - h[10]) : h[10] - index;
-	if (space < dwords) {
-		h[5]++;
-		adreno8_to_memory(adreno8_gmu_hfi.memory, PAGE_SIZE);
-		printf("adreno8: %u: only %u of the command queue's %u words are free: dropped, the count says %u now\n", adreno8_step,
-		    space, size, h[5]);
+	if (dwords == 0 || dwords > ADRENO8_HFI_MAX_DWORDS ||
+	    !adreno8_queue_indices(header, &read, &write)) {
 		return false;
 	}
-	for (uint32_t i = 0; i < dwords; i++) {
-		data[index] = msg[i];
-		index = (index + 1) % size;
+	space = (read + ADRENO8_HFI_QUEUE_DWORDS - write - 1) % ADRENO8_HFI_QUEUE_DWORDS;
+	if (space < aligned) {
+		printf("adreno8: %u: command queue has %u free words; needs %u\n", adreno8_step, space, aligned);
+		return false;
 	}
-	for (; index % 4; index = (index + 1) % size) {
-		data[index] = 0xfafafafa;
+	/* The unused slot distinguishes full from empty; padding is part of the allocation. */
+	for (uint32_t i = 0; i < aligned; i++) {
+		adreno8_wr(adreno8_hfi_view_cmd + 4 * write, i < dwords ? msg[i] : 0xfafafafa);
+		write = (write + 1) % ADRENO8_HFI_QUEUE_DWORDS;
 	}
-	h[11] = index;
-	adreno8_to_memory(adreno8_gmu_hfi.memory, 2 * PAGE_SIZE);
+	adreno8_settle();
+	adreno8_wr(header + 44, write);
+	adreno8_settle();
 	adreno8_wr(adreno8_gmu.base + GMU_HOST2GMU_SET, 1);
 	return true;
+}
+
+/* Return the actual message length, zero for an empty queue, or -1 for a corrupt queue. */
+static int
+adreno8_queue_read(unsigned queue, uint32_t *msg)
+{
+	vm_offset_t header = adreno8_queue_header(queue);
+	vm_offset_t data = queue == 1 ? adreno8_hfi_view_resp : adreno8_hfi_view_debug;
+	uint32_t read, write, dwords, aligned, used;
+
+	if (!adreno8_queue_indices(header, &read, &write)) {
+		return -1;
+	}
+	if (read == write) {
+		return 0;
+	}
+	/* Read the producer index before reading its message data through the uncached alias. */
+	adreno8_settle();
+	msg[0] = adreno8_rd(data + 4 * read);
+	dwords = (msg[0] >> 8) & 0xff;
+	aligned = (dwords + 3) & ~3u;
+	used = (write + ADRENO8_HFI_QUEUE_DWORDS - read) % ADRENO8_HFI_QUEUE_DWORDS;
+	if (dwords == 0 || aligned > used) {
+		return -1;
+	}
+	for (uint32_t i = 1; i < dwords; i++) {
+		msg[i] = adreno8_rd(data + 4 * ((read + i) % ADRENO8_HFI_QUEUE_DWORDS));
+	}
+	adreno8_settle();
+	adreno8_wr(header + 40, (read + aligned) % ADRENO8_HFI_QUEUE_DWORDS);
+	adreno8_settle();
+	return (int)dwords;
+}
+
+static bool
+adreno8_hfi_reply(uint32_t id, const uint32_t *payload, uint32_t count)
+{
+	uint32_t msg[11];
+
+	if (count == 0 || count > 10) {
+		return false;
+	}
+	adreno8_hfi_seq = (adreno8_hfi_seq + 1) & 0xfff;
+	msg[0] = (adreno8_hfi_seq << 20) | (1u << 16) | ((count + 1) << 8) | id;
+	memcpy(msg + 1, payload, count * sizeof(*payload));
+	return adreno8_queue_write(msg, count + 1);
 }
 
 bool
 adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, const char *what)
 {
-	uint32_t msg[176], resp[11], *h, size, index, hdr;
+	uint32_t msg[ADRENO8_HFI_MAX_DWORDS], resp[ADRENO8_HFI_MAX_DWORDS];
+	uint64_t start, elapsed = 0;
+	unsigned notices = 0;
 
-	if (count + 1 > sizeof(msg) / sizeof(msg[0])) {
-		printf("adreno8: %u: %u is too many words for this stepper's one message\n", adreno8_step, count + 1);
+	if (id > 0xff || count >= ADRENO8_HFI_MAX_DWORDS || (count != 0 && payload == NULL)) {
 		return false;
 	}
-	adreno8_hfi_seq = (adreno8_hfi_seq + 1) % 0xfff;
-	msg[0] = ((uint32_t)adreno8_hfi_seq << 20) | ((count + 1) << 8) | id;
+	adreno8_hfi_seq = (adreno8_hfi_seq + 1) & 0xfff;
+	msg[0] = (adreno8_hfi_seq << 20) | ((count + 1) << 8) | id;
 	for (uint32_t i = 0; i < count; i++) {
 		msg[i + 1] = payload[i];
 	}
+	start = mach_absolute_time();
 	if (!adreno8_queue_write(msg, count + 1)) {
-		printf("adreno8: %u: the message %u (%s) could not be put into the queue\n", adreno8_step, id, what);
+		printf("adreno8: %u: could not queue HFI %u (%s)\n", adreno8_step, id, what);
 		return false;
 	}
 	for (;;) {
-		if (!adreno8_wait_for(&adreno8_gmu, GMU_GMU2HOST_INFO, 1, 1, 1000)) {
-			printf("adreno8: %u: message %u (%s) number %u got no answer in a second\n", adreno8_step, id, what, adreno8_hfi_seq);
-			adreno8_gmu_post_mortem();
-			return false;
+		uint32_t irq = adreno8_rd(adreno8_gmu.base + GMU_GMU2HOST_INFO);
+		uint32_t init = adreno8_rd(adreno8_gmu.base + GMU_FW_INIT_RESULT);
+		bool ack = false;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);
+		/* START includes synchronous memory mapping work; its total budget is five seconds. */
+		if (elapsed >= (id == 10 ? 5000000000ULL : 1000000000ULL)) {
+			printf("adreno8: %u: HFI %u (%s) sequence %u timed out\n", adreno8_step, id, what, msg[0] >> 20);
+			break;
 		}
-		adreno8_wr(adreno8_gmu.base + GMU_GMU2HOST_CLR, 1);           /* "I have read it" */
-		for (;;) {
-			h = adreno8_queue_header(1);
-			size = h[3];
-			if (h[10] == h[11]) {
-				break;                          /* empty: maybe an answer to an older message is still coming */
-			}
-			hdr = adreno8_rd(adreno8_hfi_view_resp + 4 * (h[10] % size));
-			for (uint32_t i = 0; i < 11; i++) {
-				resp[i] = adreno8_rd(adreno8_hfi_view_resp + 4 * ((h[10] + i) % size));
-			}
-			index = (hdr >> 8 & 0xff) + h[10];
-			h[10] = ((index + 3) & ~3u) % size;   /* Linux aligns the read index too */
-			adreno8_to_memory(adreno8_gmu_hfi.memory, PAGE_SIZE);
-			if ((hdr & 0xff) == 100) {
-				printf("adreno8: %u: the GMU's firmware complains on its own: error %u\n", adreno8_step, resp[1]);
+		/* Poll both queues even if a notification was cleared before its index became visible. */
+		adreno8_wr(adreno8_gmu.base + GMU_GMU2HOST_CLR, irq & 5u);
+		for (unsigned queue = 2; queue != 0; queue--) {
+			int words = adreno8_queue_read(queue, resp);
+			uint32_t type, received_id;
+
+			if (words == 0) {
 				continue;
 			}
-			if ((resp[1] >> 20 & 0xfff) != adreno8_hfi_seq) {
-				printf("adreno8: %u: an answer to message number %u came by; we are waiting for %u: reading on\n", adreno8_step,
-				    resp[1] >> 20 & 0xfff, adreno8_hfi_seq);
-				continue;
+			if (words < 0) {
+				printf("adreno8: %u: HFI queue %u has invalid indices or message length\n", adreno8_step, queue);
+				goto failed;
 			}
-			if (resp[2] != 0) {
-				printf("adreno8: %u: message %u (%s) came back refusing: error %u\n", adreno8_step, id, what, resp[2]);
-				return false;
+			type = (resp[0] >> 16) & 0xf;
+			received_id = resp[0] & 0xff;
+			if (type == 1) {
+				if (words < 3) {
+					printf("adreno8: %u: short HFI ACK (%d words)\n", adreno8_step, words);
+					goto failed;
+				}
+				/* Gen8 echoes the complete request header; bit 19 may differ after warmboot recording. */
+				if (queue != 1 || (resp[1] & ~(1u << 19)) != msg[0]) {
+					if (notices++ < 8) {
+						printf("adreno8: %u: unrelated HFI ACK %#x; waiting for %#x\n", adreno8_step, resp[1], msg[0]);
+					}
+					continue;
+				}
+				/* HWSCHED START/RAW use UINT32_MAX as failure; generic requests use errno-style zero success. */
+				if ((id == 10 || id == 131) ? resp[2] == 0xffffffffu : resp[2] != 0) {
+					printf("adreno8: %u: HFI %u (%s) failed: %#x\n", adreno8_step, id, what, resp[2]);
+					return false;
+				}
+				ack = true;
+			} else if (type == 0 && received_id == 100) {
+				printf("adreno8: %u: GMU HFI error %#x (%d words)\n", adreno8_step, words >= 2 ? resp[1] : 0, words);
+				goto failed;
+			} else if (type == 0 && received_id == 101 && words >= 4) {
+				if (notices++ < 8) {
+					printf("adreno8: %u: GMU debug type %u timestamp %u data %#x\n", adreno8_step, resp[1], resp[2], resp[3]);
+				}
+			} else {
+				if (type == 0 && (received_id == 20 || received_id == 110)) {
+					uint32_t reply[10], reply_words = 0;
+
+					if (id != 10 || queue != 1 ||
+					    !adreno8_hwsched_request(resp, (uint32_t)words, reply, &reply_words) ||
+					    !adreno8_hfi_reply(received_id, reply, reply_words)) {
+						printf("adreno8: START resource request %u failed (%d words)\n", received_id, words);
+						goto failed;
+					}
+					continue;
+				}
+				if (id == 10 && queue == 1) {
+					printf("adreno8: unexpected START response %#x (%d words)\n", resp[0], words);
+					goto failed;
+				}
+				if (notices++ < 8) {
+					printf("adreno8: %u: unhandled HFI header %#x (%d words)\n", adreno8_step, resp[0], words);
+				}
 			}
+		}
+		if ((irq & (1u << 15)) || (init & GMU_FW_FAILED)) {
+			printf("adreno8: %u: GMU fault during HFI: interrupt %#x init %#x\n", adreno8_step, irq, init);
+			break;
+		}
+		if (ack) {
 			return true;
 		}
+		adreno8_sleep_us(100);
 	}
+failed:
+	adreno8_gmu_post_mortem();
+	return false;
 }
-
-/* ---- step 11: the firmware's processor out of reset -------------------------------------------------------- */
-
-/*
- * The order of words Linux writes before it lets the processor go (a6xx_gmu_fw_start's a8xx
- * branch plus the gbif writes of its power up), then a6xx_gmu_start itself. The chip word is the
- * catalog's for gen80200; the log word is the log block's address with the page count minus one
- * in its low byte; the fence range 0 is Linux's own value for a8xx. After the last write, the
- * firmware's result word must show its started mark within a second (Linux gives it ten).
- */
 
 /* ---- step 12: the queues ----------------------------------------------------------------------------------- */
 
 bool
 adreno8_step_queues(void)
 {
+	adreno8_hfi_tables_sent = false;
 	if (!adreno8_cx_ready()) {
 		return false;
 	}
@@ -130,14 +216,18 @@ adreno8_step_queues(void)
 		printf("adreno8: %u: no firmware running to talk to: step 11\n", adreno8_step);
 		return false;
 	}
-	adreno8_announce("ring for the queues to come up, and wait for the status word's bit (Linux: a6xx_hfi_ctrl_init, 500 ms like the vendor's)");
+	adreno8_announce("initialize the gen8 HFI queues and poll status for 500 ms");
+	if (adreno8_hfi_view_table == 0 || adreno8_hfi_view_cmd == 0 ||
+	    adreno8_hfi_view_resp == 0 || adreno8_hfi_view_debug == 0) {
+		printf("adreno8: %u: HFI queue mappings are incomplete\n", adreno8_step);
+		return false;
+	}
 	printf("adreno8: %u: what the queues' table says now, read without cache: version %#x; command queue status %u index %u/%u, response queue status %u index %u/%u\n",
-	    adreno8_step, adreno8_rd(adreno8_hfi_view_table), adreno8_rd(adreno8_hfi_view_table + 24 * 4), adreno8_rd(adreno8_hfi_view_table + (24 + 10) * 4),
-	    adreno8_rd(adreno8_hfi_view_table + (24 + 11) * 4), adreno8_rd(adreno8_hfi_view_table + 72 * 4), adreno8_rd(adreno8_hfi_view_table + (72 + 10) * 4),
-	    adreno8_rd(adreno8_hfi_view_table + (72 + 11) * 4));
+	    adreno8_step, adreno8_rd(adreno8_hfi_view_table), adreno8_rd(adreno8_hfi_view_table + ADRENO8_HFI_HEADER(0) * 4), adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(0) + 10) * 4),
+	    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(0) + 11) * 4), adreno8_rd(adreno8_hfi_view_table + ADRENO8_HFI_HEADER(1) * 4), adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(1) + 10) * 4),
+	    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(1) + 11) * 4));
 	adreno8_put(&adreno8_gmu, "gmu2host clr", GMU_GMU2HOST_CLR, ~0u);
-	adreno8_put(&adreno8_gmu, "gmu2host mask: quiet about messages (we poll them), loud about the firmware faulting", GMU_GMU2HOST_MASK,
-	    ~(1u << 23));
+	adreno8_put(&adreno8_gmu, "gmu2host mask: poll messages and faults", GMU_GMU2HOST_MASK, ~0u);
 	adreno8_put(&adreno8_gmu, "hfi ctrl init", GMU_HFI_CTRL_INIT, 1);
 	if (!adreno8_wait_for(&adreno8_gmu, GMU_HFI_CTRL_STATUS, 1, 1, 500)) {
 		printf("adreno8: %u: half a second and the queues' status word is still %#x\n", adreno8_step,
@@ -145,7 +235,15 @@ adreno8_step_queues(void)
 		adreno8_gmu_post_mortem();
 		return false;
 	}
-	adreno8_get(&adreno8_gmu, "hfi version", GMU_HFI_VERSION_INFO);
+	{
+		uint32_t version = adreno8_get(&adreno8_gmu, "DTCM HFI version", GMU_DTCM_VERSIONS + 16);
+
+		/* Gen8 switched the performance table to message 15 in HFI 2.6.1. */
+		if ((version >> 28) != 2 || version < 0x20060001) {
+			printf("adreno8: %u: unsupported HFI version %#x; requires v2.6.1 or later v2\n", adreno8_step, version);
+			return false;
+		}
+	}
 	adreno8_gmu_talks = true;
 	printf("adreno8: %u: THE GMU'S MESSAGE QUEUES ARE UP\n", adreno8_step);
 	return true;
@@ -184,7 +282,7 @@ adreno8_fill_votes(void)
 	return true;
 }
 
-/* The bandwidth rows (Linux: a6xx_gmu_rpmh_bw_votes_init, calculations "loosely copied from bcm_aggregate and tcs_cmd_gen"). */
+/* Bandwidth votes follow gen8 build_bw_table and adreno_rpmh.c tcs_cmd_data. */
 
 static bool
 adreno8_fill_bw_votes(void)
@@ -200,6 +298,10 @@ adreno8_fill_bw_votes(void)
 			return false;
 		}
 		aux[i] = (const struct adreno8_bcm_db *)data;   /* little endian both sides */
+		if (!adreno8_bcms[i].fixed && (aux[i]->unit == 0 || aux[i]->width == 0 || adreno8_bcms[i].buswidth == 0)) {
+			printf("adreno8: %u: invalid BCM unit or bus width for %s\n", adreno8_step, adreno8_bcms[i].name);
+			return false;
+		}
 		bcm_count++;
 	}
 	for (unsigned bw_index = 0; bw_index < BW_COUNT; bw_index++) {
@@ -216,15 +318,16 @@ adreno8_fill_bw_votes(void)
 				continue;
 			}
 			if (adreno8_bcms[i].fixed) {
-				/* a8xx votes perfmode on every voted bandwidth (Linux's a7xx condition) */
-				adreno8_bw_votes[bw_index][i] = BCM_TCS_CMD(commit, true, 0, adreno8_bcms[i].perfmode);
+				vote = bw >= adreno8_bcms[i].perfmode_bw ? adreno8_bcms[i].perfmode : 0;
+				adreno8_bw_votes[bw_index][i] = BCM_TCS_CMD(commit, true, 0, vote);
 				continue;
 			}
 			peak = (uint64_t)bw * aux[i]->width / adreno8_bcms[i].buswidth;
 			peak *= 1000;
 			peak /= aux[i]->unit;
 			vote = peak < 1 ? 1 : peak > 0x3fff ? 0x3fff : (uint32_t)peak;
-			adreno8_bw_votes[bw_index][i] = BCM_TCS_CMD(commit, true, vote, vote);    /* a8xx votes both amounts */
+			/* AB stays zero until GMU_AB_VOTE support is queried and the table is rebuilt. */
+			adreno8_bw_votes[bw_index][i] = BCM_TCS_CMD(commit, true, 0, vote);
 		}
 	}
 	printf("adreno8: %u: %u bandwidth rows for %u monitors: %u KB/s votes %#x %#x %#x ... %u KB/s votes %#x %#x %#x\n",
@@ -239,6 +342,7 @@ adreno8_step_tables(void)
 	uint32_t tbl[128], bw[159], at, n;
 	uint32_t ddr_addr[BCM_COUNT];
 
+	adreno8_hfi_tables_sent = false;
 	if (!adreno8_cx_ready()) {
 		return false;
 	}
@@ -247,6 +351,10 @@ adreno8_step_tables(void)
 		return false;
 	}
 	adreno8_announce("work out every supply vote from the RPMh layout of step 1, and hand the firmware the table of them (Linux: a8xx_hfi_send_perf_table: three words per 3D-core speed, two per GMU speed)");
+	if (adreno8_gx_count < 2 || adreno8_gx_count > 17 || BW_COUNT > 16 || BCM_COUNT > 8) {
+		printf("adreno8: %u: invalid HFI power table dimensions\n", adreno8_step);
+		return false;
+	}
 	if (!adreno8_fill_votes()) {
 		return false;
 	}
@@ -318,109 +426,38 @@ adreno8_step_tables(void)
 		printf("adreno8: %u: the bandwidth table is in\n", adreno8_step);
 	}
 	printf("adreno8: %u: THE FIRMWARE HAS ITS ORDERS: %u speeds, %u bandwidth levels\n", adreno8_step, adreno8_gx_count, BW_COUNT);
+	adreno8_hfi_tables_sent = true;
 	return true;
 }
 
-/* ---- step 14: the core's own firmware ------------------------------------------------------------------------ */
+/* ---- step 15: minimum DCVS request --------------------------------------------------------------- */
 
-bool
-adreno8_step_core_fw(void)
-{
-	uint32_t feat[3], power;
-
-	if (!adreno8_cx_ready()) {
-		return false;
-	}
-	if (!adreno8_gmu_talks) {
-		printf("adreno8: %u: the queues do not answer: step 12\n", adreno8_step);
-		return false;
-	}
-	adreno8_announce("ask for the dozing-between-jobs power saving (Linux: a6xx_hfi_enable_ifpc: feature 9, long hysteresis 6000 ms). Where the firmware says no, we go on: it decides whether the core dozes, not whether it runs");
-	feat[0] = 9;
-	feat[1] = 1;
-	feat[2] = 0x1680;
-	if (!adreno8_hfi_send(11, feat, 3, "let the core doze between jobs")) {
-		printf("adreno8: %u: (the firmware said no to dozing; going on)\n", adreno8_step);
-	}
-	adreno8_announce("and the message that starts the 3D core's own firmware (Linux: a6xx_hfi_send_core_fw_start: a header and nothing else)");
-	if (!adreno8_hfi_send(14, NULL, 0, "start the core's firmware")) {
-		return false;
-	}
-	power = adreno8_get(&adreno8_gmu, "power clock status (a look, no judgement: the core's firmware has only just learned this chip)",
-	    GMU_PWR_CLK_STATUS);
-	printf("adreno8: %u: the core's power as the GMU sees it at this moment: %s\n", adreno8_step, GMU_PWR_GX_UP(power) ? "up" : "off");
-	adreno8_announce("and the word that starts its ordinary work (Linux sends it here; the vendor's driver sends it from its hw_init)");
-	if (!adreno8_hfi_send(10, NULL, 0, "start working")) {
-		return false;
-	}
-	printf("adreno8: %u: THE 3D CORE'S OWN FIRMWARE RUNS ALONGSIDE\n", adreno8_step);
-	return true;
-}
-
-/* ---- step 15: the 3D core, fed and running ------------------------------------------------------------------- */
-
-/*
- * The message that asks the GMU for a speed (Linux: a6xx_gmu_set_freq -> a6xx_hfi_set_freq:
- * blocking acknowledge, a speed index and a bandwidth index). The GMU owns the core's power on
- * this SoC -- gpucc has no HLOS switch for it -- so this message is the switch. Then two things
- * that only work with the core powered and clocked: the command processor's slice aperture, and
- * the counter that runs whenever the core has power and never stops while it has.
- */
-
+/* HWSCHED sets default votes after START and before GPU MMU/OOB.
+ * gen8_0_0 maps 125 MHz to DDR index 2. This probe does not access GX registers. */
 bool
 adreno8_step_gx_power(void)
 {
-	uint32_t freq_index, msg[3], power, ap, hi1, lo1, hi2, lo2;
-	uint64_t start, waited = 0;
+	uint32_t msg[3] = {1, 1, 2}; /* Blocking ACK, 125 MHz, DDR index 2; AB=0. */
+	uint32_t power;
 
-	if (!adreno8_cx_ready()) {
+	if (!adreno8_cx_ready() || !adreno8_gmu_talks || !adreno8_hwsched_ready()) {
 		return false;
 	}
-	if (!adreno8_gmu_talks) {
-		printf("adreno8: %u: the queues do not answer: step 12\n", adreno8_step);
+	if (!adreno8_gpu8_keep || adreno8_gpu8_return || adreno8_gx_count != 2 ||
+	    adreno8_gx_hz[1] != 125000000 || adreno8_speed_asked > 1) {
+		printf("adreno8: %u: DCVS probe requires keep=1, return=0 and the 125 MHz table; finish with host cold reset\n", adreno8_step);
 		return false;
 	}
-	freq_index = adreno8_speed_asked != 0 && adreno8_speed_asked < adreno8_gx_count ? adreno8_speed_asked : adreno8_gx_count - 1;
-	adreno8_announce("ask the GMU for power and a speed for the 3D core (blocking), and watch its power word: on this SoC this message is the core's power switch");
-	printf("adreno8: %u: speed %u of %u: %llu Hz%s\n", adreno8_step, freq_index, adreno8_gx_count - 1, (uint64_t)adreno8_gx_hz[freq_index],
-	    adreno8_speed_asked == 0 ? " (the top one: adreno8_speed=N asks for another)" : "");
-	msg[0] = 1;                   /* ack_type: blocking */
-	msg[1] = freq_index;
-	msg[2] = BW_COUNT - 1;        /* the top bandwidth, so no vote has to climb afterwards */
-	if (!adreno8_hfi_send(30, msg, 3, "give the core power and a speed")) {
+	adreno8_announce("request 125 MHz and bandwidth index 2; retain resources until host cold reset");
+	/* A missing ACK cannot prove that the firmware left its power votes unchanged. */
+	adreno8_reset_required = true;
+	if (!adreno8_hfi_send(30, msg, 3, "minimum DCVS vote")) {
 		return false;
 	}
-	start = mach_absolute_time();
-	for (int i = 0; i < 20000 && !GMU_PWR_GX_UP(adreno8_rd(adreno8_gmu.base + GMU_PWR_CLK_STATUS)); i++) {
-		adreno8_sleep_us(100);
-	}
-	absolutetime_to_nanoseconds(mach_absolute_time() - start, &waited);
-	power = adreno8_get(&adreno8_gmu, "power clock status", GMU_PWR_CLK_STATUS);
-	if (!GMU_PWR_GX_UP(power)) {
-		printf("adreno8: %u: two seconds and the word still says %#x: supply %s, clock %s\n", adreno8_step, power,
-		    power & 1 ? "off" : "on", power & 2 ? "off" : "on");
-		adreno8_gmu_post_mortem();
-		return false;
-	}
-	printf("adreno8: %u: THE 3D CORE HAS POWER AND A CLOCK: %llu us after the message the GMU had it up\n", adreno8_step,
-	    waited / 1000);
-
-	adreno8_announce("two things only the powered core can do: the command processor's aperture, told to use the slice ids and read back, and its always-on counter, read twice");
-	ap = adreno8_get(&adreno8_gpu, "cp aperture, host", GPU_CP_APERTURE_HOST);
-	adreno8_set(&adreno8_gpu, "cp aperture, host: bit 23 says use the slice ids", GPU_CP_APERTURE_HOST, ap | 1u << 23);
-	adreno8_put(&adreno8_gpu, "cp aperture, host: back as it was", GPU_CP_APERTURE_HOST, ap);
-	hi1 = adreno8_rd(adreno8_gpu.base + GPU_CP_ALWAYS_ON_HI);
-	lo1 = adreno8_rd(adreno8_gpu.base + GPU_CP_ALWAYS_ON_LO);
-	adreno8_sleep_ms(10);
-	hi2 = adreno8_rd(adreno8_gpu.base + GPU_CP_ALWAYS_ON_HI);
-	lo2 = adreno8_rd(adreno8_gpu.base + GPU_CP_ALWAYS_ON_LO);
-	if (hi1 == hi2 && lo1 == lo2) {
-		printf("adreno8: %u: NOTE: the core's counter stands still (%#x:%#x): powered, but no clock through the accumulator? the vendor's accumulator shift clocks were only tolerated back in step 5\n",
-		    adreno8_step, hi2, lo2);
-	} else {
-		printf("adreno8: %u: the core's own counter moved: %#x:%#x to %#x:%#x in 10 ms\n", adreno8_step, hi1, lo1, hi2, lo2);
-	}
-	printf("adreno8: %u: THE 3D CORE IS FED: power, clock, and a counter that counts\n", adreno8_step);
+	power = adreno8_get(&adreno8_gmu, "power clock status after DCVS", GMU_PWR_CLK_STATUS);
+	adreno8_get(&adreno8_gmu, "RPMh power state after DCVS", GMU_RPMH_POWER_STATE);
+	printf("adreno8: %u: DCVS acknowledged; GX status %#x (%s); GPU execution remains pending\n",
+	    adreno8_step, power, GMU_PWR_GX_UP(power) ? "power and clock on" : "power or clock off");
 	return true;
 }
 
@@ -429,9 +466,9 @@ adreno8_step_gx_power(void)
 bool
 adreno8_step_last_look(void)
 {
-	uint32_t ao, fence, slices, power;
+	uint32_t ao, fence, power;
 
-	adreno8_announce("the last look around before handing off: the GMU's translation, its interrupts and fence, the slices, both counters, and the queue indices");
+	adreno8_announce("read GMU fault, interrupt, power, counter and queue status");
 	if (adreno8_space_faulted(&adreno8_gmu_space)) {
 		printf("adreno8: %u: NOTE: something was refused translation since we turned it on; the steps above had their answers anyway\n", adreno8_step);
 	}
@@ -444,21 +481,16 @@ adreno8_step_last_look(void)
 	if (fence != 0) {
 		printf("adreno8: %u: NOTE: the fence has someone caught: %#x\n", adreno8_step, fence);
 	}
-	slices = adreno8_get(&adreno8_cx_misc, "slice enable final", CX_MISC_SLICE_ENABLE) & 7;
-	slices = (slices & 1) + (slices >> 1 & 1) + (slices >> 2 & 1);
-	if (slices != adreno8_slice_count) {
-		printf("adreno8: %u: NOTE: the slices readable now (%u) are not what the fuses said in step 4 (%u)\n", adreno8_step, slices,
-		    adreno8_slice_count);
-	}
 	power = adreno8_get(&adreno8_gmu, "power clock status", GMU_PWR_CLK_STATUS);
 	adreno8_get(&adreno8_gmu, "always on counter, high", GMU_ALWAYS_ON_HI);
 	adreno8_get(&adreno8_gmu, "always on counter, low", GMU_ALWAYS_ON_LO);
 	if (adreno8_hfi_view_table != 0) {
-		printf("adreno8: %u: the queues at the end: command %u/%u, response %u/%u, dropped %u\n", adreno8_step,
-		    adreno8_rd(adreno8_hfi_view_table + (24 + 10) * 4), adreno8_rd(adreno8_hfi_view_table + (24 + 11) * 4),
-		    adreno8_rd(adreno8_hfi_view_table + (72 + 10) * 4), adreno8_rd(adreno8_hfi_view_table + (72 + 11) * 4), adreno8_rd(adreno8_hfi_view_table + (24 + 5) * 4));
+		printf("adreno8: %u: the queues at the end: command %u/%u, response %u/%u, debug %u/%u\n", adreno8_step,
+		    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(0) + 10) * 4), adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(0) + 11) * 4),
+		    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(1) + 10) * 4), adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(1) + 11) * 4), adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(2) + 10) * 4),
+		    adreno8_rd(adreno8_hfi_view_table + (ADRENO8_HFI_HEADER(2) + 11) * 4));
 	}
-	printf("adreno8: %u: ALL OF IT: the CX half awake, the GMU's firmware running (its log at %#x), the queues answering, the speed and bandwidth tables accepted, the 3D core powered, clocked, and counting with %u slice(s); the power word says %#x\n",
-	    adreno8_step, adreno8_gmu_log.address, slices, power);
+	printf("adreno8: %u: GMU diagnostics complete; log %#x, GX power/clock status %#x\n",
+	    adreno8_step, adreno8_gmu_log.address, power);
 	return true;
 }

@@ -53,6 +53,8 @@ void redwood_audio_init(void);
 void redwood_virtio_sound_init(void);   /* boot-arg virtio_sound=1: QEMU's virtio sound device */
 void redwood_speaker_init(void);        /* boot-arg speaker_probe=N: a look at the phone's speaker amplifiers */
 void redwood_haptic_init(void);         /* boot-arg haptic=N: the phone's vibration motor (bsd/dev/redwood_haptic.c) */
+void redwood_haptic_hv_init(void);      /* boot-arg hv_haptic=N: annibale's vibration motor, the PMIC's haptics block (bsd/dev/redwood_haptic_hv.c) */
+void redwood_haptic_hv_quiesce(void);   /* its driver module disabled: at the run's end and on a panic's way out */
 void redwood_haptic_quiesce(void);      /* its chip back into reset: at the run's end and on a panic's way out */
 void redwood_haptic_pretend(uint32_t peak); /* a test's stand-in for iOS's waveform: as if a write of this loudness came */
 void redwood_torch_init(void);          /* boot-arg torch=N: the phone's flashlight (bsd/dev/redwood_torch.c) */

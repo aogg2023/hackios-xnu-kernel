@@ -447,6 +447,56 @@ flush_log(void)
 	write_logs(NULL, 0);
 }
 
+/*
+ * Load a staged disk image off a real GPT partition into the resident root address, which is
+ * where QEMU's host leaves it in guest RAM (docs/analysis/rootfs-strategy.md route D): the
+ * 2.4 GB iOS system volume therefore needs neither the boot image nor a kernel storage driver.
+ * EDK2 BlockIO reads work on this phone (writes do not, which this path never needs).
+ */
+static int
+rdfile_load(const char *part, uint64_t off, uint64_t size, uint64_t dst)
+{
+	static uint8_t bounce[1048576];
+	char16 wname[40];
+	unsigned n;
+
+	for (n = 0; part[n] != 0 && n < sizeof(wname) / sizeof(wname[0]) - 1; n++) {
+		wname[n] = part[n];
+	}
+	wname[n] = 0;
+	efi_block_io *bio = find_partition_named(wname, n + 1);
+
+	if (bio == NULL) {
+		print("rdfile: partition %s not found\n", part);
+		return 0;
+	}
+	uint64_t bs = bio->media->block_size;
+	uint64_t total = (bio->media->last_block + 1) * bs;
+	uint64_t start = off == ~0ull ? total - size : off;
+
+	print("rdfile: %s bs=%d total=%x start=%x size=%x\n", part, (uint64_t)bs, total, start, size);
+	if (size == 0 || (start % bs) != 0 || start + size > total) {
+		print("rdfile: bad range\n");
+		return 0;
+	}
+	memset((void *)dst, 0, size); /* image holes must read as zeroes, as QEMU's sparse file gives */
+	for (uint64_t done = 0; done < size; ) {
+		uint64_t chunk = size - done < sizeof(bounce) ? size - done : sizeof(bounce);
+
+		efi_status s = bio->read_blocks(bio, bio->media->media_id, (start + done) / bs, chunk, bounce);
+		if (EFI_ERROR(s)) {
+			print("rdfile: read status %x at %x\n", s, done);
+			return 0;
+		}
+		memcpy((void *)(dst + done), bounce, (size_t)chunk);
+		done += chunk;
+		if ((done >> 20) % 256 == 0) {
+			print("rdfile: %x / %x\n", done, size);
+		}
+	}
+	return 1;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Apple device tree writer                                                 */
 /*                                                                          */
@@ -2594,6 +2644,9 @@ struct payload_info {
 	uint64_t checkpoint;
 	uint64_t forced_base;
 	uint64_t resident_rd;           /* size of a root image the host put at the resident address */
+	char rdfile_part[40];           /* a staged system image to read from a real GPT partition (k90-port) */
+	uint64_t rdfile_size;
+	uint64_t rdfile_off;            /* from the partition start; ~0 means aligned to its end */
 	int usb_mode;
 };
 
@@ -2645,6 +2698,30 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->resident_rd = parse_number(text, 16); /* e.g. loaded there by QEMU; see RESIDENT_RD_OFFSET */
 		} else if (str_eq(e->name, "checkpoint")) {
 			pi->checkpoint = parse_number(text, 10);  /* where the kernel should stop and come back */
+		} else if (str_eq(e->name, "rdfile")) {
+			/*
+			 * "<partition>:<bytes>[:<offset>|tail]": the resident root disk is staged on a
+			 * real GPT partition instead of being left in RAM by the host (k90-port; the
+			 * QEMU milestone preloads it into guest RAM, docs/analysis/rootfs-strategy.md).
+			 */
+			const char *q = text;
+			unsigned n = 0;
+
+			while (*q && *q != ':' && n < sizeof(pi->rdfile_part) - 1) {
+				pi->rdfile_part[n++] = *q++;
+			}
+			pi->rdfile_part[n] = 0;
+			if (*q == ':') {
+				pi->rdfile_size = parse_number(++q, 10);
+				while (*q && *q != ':') {
+					q++;
+				}
+				pi->rdfile_off = ~0ull;
+				if (*q == ':' && !str_eq(++q, "tail")) {
+					pi->rdfile_off = parse_number(q, 10);
+				}
+				pi->resident_rd = pi->rdfile_size;    /* same delivery path as QEMU's rdres */
+			}
 		} else if (str_eq(e->name, "usb")) {
 			pi->usb_mode = 1;                         /* stay in the loader and take commands over USB */
 		}
@@ -2902,6 +2979,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		} else {
 			rd1_pa = res_pa;
 			rd1_size = res_size;
+		}
+		if (pi.rdfile_size != 0) {
+			print("rdfile: loading %x bytes to %x\n", pi.rdfile_size, res_pa);
+			if (!rdfile_load(pi.rdfile_part, pi.rdfile_off, pi.rdfile_size, res_pa)) {
+				print("rdfile: giving up on the staged system image\n");
+				return 0;
+			}
 		}
 	}
 	/* everything up to topOfKernelData is the kernel's static region: it must cover both images */

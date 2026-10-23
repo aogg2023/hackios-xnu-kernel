@@ -6,6 +6,13 @@
 # 前置：设备在 Android（slot b），KernelSU 已授权 adb shell su。
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
+# 持久化门（2026-10-23 评审+用户指示）：这是对 userdata 的唯一写入，事先不校验
+# 目标块是否被 f2fs 占用，且备份不含 userdata。默认拒跑，确认过才放行。
+if [ "${1:-}" != "--yes" ]; then
+  echo "⚠ 将向 userdata 尾部写 ~2.4G（唯一持久化点，未校验块占用，备份不含 userdata）。"
+  echo "  当前策略=调试限 RAM。确认要写请带 --yes 重跑。" >&2
+  exit 1
+fi
 SZ=$(stat -c %s userland/system.apfs 2>/dev/null || stat -f %z userland/system.apfs)
 TOTAL=247904317440   # userdata，annibale GPT（annibale-backup/20261022-2355/partitions.txt）；HyperOS 更新后先 diff
 START=$(( TOTAL - SZ ))                    # size 是 4096 对齐的，无需再取整

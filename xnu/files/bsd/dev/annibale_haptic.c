@@ -778,7 +778,7 @@ done:
 }
 
 void
-redwood_haptic_hv_init(void)
+annibale_haptic_init(void)
 {
 	thread_t thread;
 
@@ -799,7 +799,7 @@ redwood_haptic_hv_init(void)
 
 /* At the run's end and on a panic's way out: the driver module disabled, the motor silent. */
 void
-redwood_haptic_hv_quiesce(void)
+annibale_haptic_quiesce(void)
 {
 	if (configured) {
 		static const uint8_t stop_play = HAP_SRC_DIRECT, module_off = 0;

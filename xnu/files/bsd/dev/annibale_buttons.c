@@ -20,7 +20,7 @@
  *                peripheral at reg + (pin-1)*0x100 (pinctrl-spmi-gpio.c, pmic_gpio_probe), so
  *                pad 6 lives at 0x8d00 of slave 1: ppid 0x18d.
  * The route to both chips is the SoC's PMIC arbiter, whose version 7 layout Linux reads in
- * drivers/spmi/spmi-pmic-arb.c and which bsd/dev/redwood_haptic_hv.c first spoke to from here;
+ * drivers/spmi/spmi-pmic-arb.c and which bsd/dev/annibale_haptic.c first spoke to from here;
  * the windows and the channel arithmetic below are that file's.
  *
  * THIS DRIVER ONLY READS. Nothing is written to either chip, neither a register of a PMIC nor the
@@ -111,7 +111,7 @@ wr(vm_offset_t address, uint32_t value)
 	*(volatile uint32_t *)address = value;
 }
 
-/* ---- the PMIC arbiter, version 7 (the windows and arithmetic of redwood_haptic_hv.c) -------------- */
+/* ---- the PMIC arbiter, version 7 (the windows and arithmetic of annibale_haptic.c) -------------- */
 
 /* the windows of the first controller, the device tree's spmi@c42d000 (reg names as they are there) */
 #define ARB_CORE_PHYS           0x0c400000UL    /* "core": the version, and which peripheral each channel is */
@@ -151,23 +151,23 @@ static vm_offset_t arb_core, arb_cnfg, arb_chnls, arb_obsrvr;
 
 /*
  * One transfer at a time through the arbiter for this system, whoever asks: the battery reader
- * (bsd/dev/redwood_battery_hv.c) and the flashlight (bsd/dev/redwood_torch_hv.c) take it as
+ * (bsd/dev/annibale_battery.c) and the flashlight (bsd/dev/annibale_torch.c) take it as
  * well, since like the buttons they each have their own channels and Linux holds one lock for
  * the whole bus (two at once and the arbiter drops one, as redwood_buttons.c learnt). Started as
  * "redwood-spmi" for redwood's v5 arbiter in that file; the annibale drivers share this one, and
- * redwood_haptic_hv.c with its private lock should join it once the three are proven on hardware.
+ * annibale_haptic.c with its private lock should join it once the three are proven on hardware.
  */
 static LCK_GRP_DECLARE(spmi_hv_lck_grp, "redwood-spmi-hv");
 static LCK_SPIN_DECLARE(spmi_hv_lock, &spmi_hv_lck_grp);
 
 void
-redwood_spmi_hv_lock(void)
+annibale_spmi_lock(void)
 {
 	lck_spin_lock(&spmi_hv_lock);
 }
 
 void
-redwood_spmi_hv_unlock(void)
+annibale_spmi_unlock(void)
 {
 	lck_spin_unlock(&spmi_hv_lock);
 }
@@ -202,7 +202,7 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
 	const char *problem = NULL;
 
 	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
-	redwood_spmi_hv_lock();
+	annibale_spmi_lock();
 	wr(channel + CH_CMD, CMD_OPC(count > 4 ? OPC_EXT_READL : OPC_EXT_READ) | CMD_REG(reg) | (count - 1));
 	do {
 		status = rd(channel + CH_STATUS);
@@ -212,7 +212,7 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
 		data[0] = rd(channel + CH_RDATA0);
 		data[1] = count > 4 ? rd(channel + CH_RDATA1) : 0;
 	}
-	redwood_spmi_hv_unlock();
+	annibale_spmi_unlock();
 
 	if (!(status & STATUS_DONE)) {
 		problem = "no answer from the arbiter";
@@ -244,7 +244,7 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
  * Which channel is that peripheral's. Several can be: one per system that may write to it. As
  * Linux chooses: the first, unless a later one is ours to write through. The table's [19:8] is
  * the slave and the function together, and the device tree gives us both -- but the table's
- * slave byte is trusted only as far as it agrees: bsd/dev/redwood_haptic_hv.c first wrote its
+ * slave byte is trusted only as far as it agrees: bsd/dev/annibale_haptic.c first wrote its
  * haptics ppids as 0xf0 without the slave byte the vendor's decode gives (the chip sits at
  * slave 7: 0x7f0, the device tree's line 41612; since corrected), and a table that disagreed
  * on some other peripheral would strand a driver that matched the full ppid exactly -- so an
@@ -588,7 +588,7 @@ out:
 }
 
 void
-redwood_buttons_hv_init(void)
+annibale_buttons_init(void)
 {
 	uint32_t enabled = 0, steps = 5;
 	thread_t thread;

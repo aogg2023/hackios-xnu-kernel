@@ -176,7 +176,7 @@ kernel (driver replacements) or by a library the kernel injects with `DYLD_INSER
 | `common/` | `setup.sh` (workspace), `build.sh` / `run.sh` (per device), `new-device.sh`, `devices/*.conf`, `ugit` |
 | `xl` | drives the phone over USB: loader, kernel runs, logs, screenshots, screen and sound recording |
 | `xnuloader/` | the loader: `loader.c` (UEFI application), `mkpayload.py` (kernel + images + arguments container) |
-| `xnu/` | our XNU changes: patch, new files, `apply.sh` / `export.sh` |
+| `xnu/` | our XNU changes: per-file patch series (`patches/` + `series`), new files, `apply.sh` / `export.sh` |
 | `xnu-deps/` | everything for building XNU on Linux: `setup.sh`, tool wrappers, stubs |
 | `xnu-build.sh`, `xnu-env.sh` | kernel build |
 | `uefi/`, `mkxnuimg.py` | the UEFI port and packing the boot image for `fastboot boot` |

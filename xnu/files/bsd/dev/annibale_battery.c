@@ -8,8 +8,8 @@
  * reads a state block xnuloader filled from Qualcomm's UEFI; on this phone xnuloader gives us
  * nothing (it prints so itself when battery=1 starts it here as well, and steps aside). The
  * gauge is a peripheral of the PMIH010X power management chip, reached over SPMI through the
- * version 7 arbiter, the way bsd/dev/redwood_buttons_hv.c reads the buttons and
- * bsd/dev/redwood_haptic_hv.c the motor.
+ * version 7 arbiter, the way bsd/dev/annibale_buttons.c reads the buttons and
+ * bsd/dev/annibale_haptic.c the motor.
  *
  * The device tree does not name the gauge. Xiaomi's annibale tree describes the chip
  * (qcom,pmih010x@7, line 20140 of the merged decompile) and its PMIC-GLINK charger node (line
@@ -105,7 +105,7 @@ wr(vm_offset_t address, uint32_t value)
 	*(volatile uint32_t *)address = value;
 }
 
-/* ---- the PMIC arbiter, version 7 (the windows and arithmetic of redwood_haptic_hv.c) -------------- */
+/* ---- the PMIC arbiter, version 7 (the windows and arithmetic of annibale_haptic.c) -------------- */
 
 #define ARB_CORE_PHYS           0x0c400000UL
 #define ARB_CORE_SIZE           0x003000UL
@@ -179,7 +179,7 @@ spmi_read(uint16_t ppid, uint8_t reg, uint8_t *bytes, uint32_t count)
 	}
 	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
 	channel = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * c->apid;
-	redwood_spmi_hv_lock();          /* the buttons' file owns the lock the annibale drivers share */
+	annibale_spmi_lock();          /* the buttons' file owns the lock the annibale drivers share */
 	wr(channel + CH_CMD, CMD_OPC(count > 4 ? OPC_EXT_READL : OPC_EXT_READ) | CMD_REG(reg) | (count - 1));
 	do {
 		status = rd(channel + CH_STATUS);
@@ -189,7 +189,7 @@ spmi_read(uint16_t ppid, uint8_t reg, uint8_t *bytes, uint32_t count)
 		data[0] = rd(channel + CH_RDATA0);
 		data[1] = count > 4 ? rd(channel + CH_RDATA1) : 0;
 	}
-	redwood_spmi_hv_unlock();
+	annibale_spmi_unlock();
 
 	if (!(status & STATUS_DONE)) {
 		problem = "no answer from the arbiter";
@@ -617,7 +617,7 @@ out:
 }
 
 void
-redwood_battery_hv_init(void)
+annibale_battery_init(void)
 {
 	uint32_t enabled = 0, steps = 5;
 	thread_t thread;

@@ -585,7 +585,7 @@ out:
 }
 
 void
-redwood_pcie_init(void)
+mhi_pcie_init(void)
 {
 	uint32_t steps;
 	thread_t thread;

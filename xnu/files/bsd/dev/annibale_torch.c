@@ -29,7 +29,7 @@
  * no write semantics in the vendor driver (it clears them by regmap through 0x18, whose effect
  * on latched status is implied and undocumented here), so this driver does not guess -- TODO
  * after the first look at a real one. Transfers go one at a time through the arbiter with the
- * buttons' and battery's readers (redwood_spmi_hv_lock()).
+ * buttons' and battery's readers (annibale_spmi_lock()).
  *
  * Nothing here is done unless a boot-arg asks for it:
  *
@@ -41,12 +41,12 @@
  *                  torch0 max-current-ma, line 20946).
  *
  * Two primitives are kept for the camera (task L1b: the dylib's FigFlashlight, which on redwood
- * is served through /dev/redwood-torch at level 0 to 1000): redwood_torch_hv_low_on(mA) lights
- * channel 0 at up to the torch maximum and redwood_torch_hv_low_off() puts it out; both fail
+ * is served through /dev/redwood-torch at level 0 to 1000): annibale_torch_low_on(mA) lights
+ * channel 0 at up to the torch maximum and annibale_torch_low_off() puts it out; both fail
  * quietly once the module has said anything surprising. At the run's end (and on a panic's way
  * out) the light goes off.
  *
- * Register layouts: Linux drivers/spmi/spmi-pmic-arb.c (arbiter version 7: redwood_haptic_hv.c's
+ * Register layouts: Linux drivers/spmi/spmi-pmic-arb.c (arbiter version 7: annibale_haptic.c's
  * windows), qcom's leds-qti-flash.c of this platform, and redwood_torch.c's verification of the
  * same module one phone older.
  */
@@ -70,8 +70,8 @@ static bool configured, lit, broken, leaving, timer_cleared;
 static uint8_t timer_original;                  /* channel 0's safety timer as found, restored on the way out */
 
 /*
- * The arbiter v7 frontend: redwood_haptic_hv.c's windows and arithmetic, with the lock the
- * annibale drivers share (redwood_buttons_hv.c owns it) in place of its private one.
+ * The arbiter v7 frontend: annibale_haptic.c's windows and arithmetic, with the lock the
+ * annibale drivers share (annibale_buttons.c owns it) in place of its private one.
  */
 #define ARB_CORE_PHYS           0x0c400000UL
 #define ARB_CORE_SIZE           0x003000UL
@@ -192,7 +192,7 @@ spmi_read16(uint16_t addr, uint8_t *bytes, uint32_t count)
 	}
 	nanoseconds_to_absolutetime(TRANSACT_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
 	channel = arb_obsrvr + 0x8000UL * ARB_SYSTEM + 0x20UL * flash.apid;
-	redwood_spmi_hv_lock();
+	annibale_spmi_lock();
 	wr(channel + CH_CMD, CMD_OPC(count > 4 ? OPC_EXT_READL : OPC_EXT_READ) | CMD_REG(addr) | (count - 1));
 	do {
 		status = rd(channel + CH_STATUS);
@@ -202,7 +202,7 @@ spmi_read16(uint16_t addr, uint8_t *bytes, uint32_t count)
 		data[0] = rd(channel + CH_RDATA0);
 		data[1] = count > 4 ? rd(channel + CH_RDATA1) : 0;
 	}
-	redwood_spmi_hv_unlock();
+	annibale_spmi_unlock();
 
 	if (!(status & STATUS_DONE)) {
 		problem = "no answer from the arbiter";
@@ -236,14 +236,14 @@ spmi_write16(uint16_t addr, uint8_t value)
 	}
 	nanoseconds_to_absolutetime(TRANSACT_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
 	channel = arb_chnls + 0x1000UL * flash.apid;
-	redwood_spmi_hv_lock();
+	annibale_spmi_lock();
 	wr(channel + CH_WDATA0, value);
 	wr(channel + CH_CMD, CMD_OPC(OPC_EXT_WRITE) | CMD_REG(addr) | (1 - 1));
 	do {
 		status = rd(channel + CH_STATUS);
 		now = mach_absolute_time();
 	} while (!(status & STATUS_DONE) && now - start < interval);
-	redwood_spmi_hv_unlock();
+	annibale_spmi_unlock();
 
 	if (!(status & STATUS_DONE)) {
 		problem = "no answer from the arbiter";
@@ -616,7 +616,7 @@ done:
 }
 
 void
-redwood_torch_hv_init(void)
+annibale_torch_init(void)
 {
 	thread_t thread;
 
@@ -638,7 +638,7 @@ redwood_torch_hv_init(void)
 /* ---- what the camera will ask ---------------------------------------------------------------------------- */
 
 bool
-redwood_torch_hv_low_on(uint32_t milliamps_wanted)
+annibale_torch_low_on(uint32_t milliamps_wanted)
 {
 	bool done;
 
@@ -649,7 +649,7 @@ redwood_torch_hv_low_on(uint32_t milliamps_wanted)
 }
 
 void
-redwood_torch_hv_low_off(void)
+annibale_torch_low_off(void)
 {
 	lck_mtx_lock(&torch_hv_lck);
 	dark_locked();
@@ -663,7 +663,7 @@ redwood_torch_hv_low_off(void)
  * the same). The channel states are said one last time for the log's end.
  */
 void
-redwood_torch_hv_quiesce(void)
+annibale_torch_quiesce(void)
 {
 	bool was = lit;
 

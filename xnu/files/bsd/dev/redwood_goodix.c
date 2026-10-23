@@ -1,8 +1,8 @@
 /*
  * The touch screen of the POCO X5 Pro (redwood): either a Goodix GT9916 ("Berlin-D") or a
  * FocalTech FT3680 on the SPI bus of the SoC's serial engine 13, as a source of touches for
- * /dev/redwood-touch (sys/redwood_input.h). Only with boot-arg touchscreen=1: every address
- * below belongs to this phone.
+ * /dev/redwood-touch (sys/redwood_input.h). Only with the boot-arg touchscreen=1 for this phone,
+ * or touchscreen=2 for the REDMI K90 (annibale), whose numbers are all in the table near the end.
  *
  * There is no clock, pin, regulator or SPI framework in this kernel, so the driver does all of
  * it itself, in the order the vendor's Linux drivers do:
@@ -70,23 +70,42 @@ sleep_ms(uint32_t ms)
 
 /* ---- pins (TLMM) ------------------------------------------------------------------------------- */
 
-#define TLMM_PHYS               0x0f100000UL
-#define TLMM_SIZE               0x100000UL
+/*
+ * Two phones speak through this driver, chosen by the boot-arg's value: touchscreen=1 is the
+ * POCO X5 Pro (redwood, an SM7375), touchscreen=2 the REDMI K90 (annibale, an SM8750 "sun",
+ * k90-port). Everything phone-shaped below is a variable set once from a table at startup:
+ * pins, bases, the clock controller's model (a rate-selectable RCG there, a plain vote and a
+ * fixed divider here), and the supply's name in the RPMh command database — whose address
+ * annibale learns by scanning SMEM for the database's magic. Values cross-checked against the
+ * phone's own device tree and mainline gcc-sm8750.c / pinctrl-sm8750.c (docs/analysis/annibale-hw-map.md).
+ */
+
+static int board_annibale;
+
+#define NO_STRAP                1000u     /* a GPIO number no phone has, so that a read of a strap reads none */
+
+static uint64_t tlmm_phys, tlmm_size;        /* redwood 0x0f100000/0x100000, annibale 0x0f000000/0x202000 */
+#define TLMM_PHYS               tlmm_phys
+#define TLMM_SIZE               tlmm_size
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
 #define PULL_NONE               0
 #define PULL_UP                 3
 
-#define PIN_MISO                52
-#define PIN_MOSI                53
-#define PIN_CLK                 54
-#define PIN_CS                  55
-#define PIN_INT                 81      /* low = the chip has a report */
-#define PIN_RESET               105     /* low = in reset */
-#define PIN_AVDD                107     /* high = analog supply on */
-#define PIN_FOCALTECH_ID        68      /* FocalTech if this reads 0 ... */
-#define PIN_GOODIX_ID           96      /* ... and this reads 1 (sm8350-kernel-OKX convention) */
-#define PIN_FUNCTION_SPI        1       /* "qup15" */
+/* the pins of this phone, from its device tree; the strap pins of a phone that has none */
+static unsigned pin_miso, pin_mosi, pin_clk, pin_cs, pin_int, pin_reset, pin_avdd;
+static unsigned pin_ft_id = NO_STRAP, pin_gx_id = NO_STRAP;
+#define PIN_MISO                pin_miso
+#define PIN_MOSI                pin_mosi
+#define PIN_CLK                 pin_clk
+#define PIN_CS                  pin_cs
+#define PIN_INT                 pin_int   /* low = the chip has a report */
+#define PIN_RESET               pin_reset /* low = in reset */
+#define PIN_AVDD                pin_avdd  /* high = analog supply on */
+#define PIN_FOCALTECH_ID        pin_ft_id /* FocalTech if this reads 0 ... */
+#define PIN_GOODIX_ID           pin_gx_id /* ... and this reads 1 (sm8350-kernel-OKX convention) */
+#define PIN_FUNCTION_SPI        1         /* "qup15"/"qup1_se2": the first non-GPIO function of these pins */
+#define NO_STRAP                1000u     /* a GPIO number no phone has, so that a read of a strap reads none */
 
 static void
 gpio_configure(unsigned pin, unsigned function, unsigned pull, unsigned ma, bool output)
@@ -115,9 +134,14 @@ gpio_output(unsigned pin, bool high, unsigned pull, unsigned ma)
 
 /* ---- the I/O supply (RPMh) ----------------------------------------------------------------------- */
 
-#define CMD_DB_PHYS             0x80860000UL
-#define CMD_DB_SIZE             0x20000UL
-#define RSC_PHYS                0x18220000UL    /* the application processor's "DRV 2" */
+/* the command database the boot loader left: redwood at an address written into its device tree,
+ * annibale somewhere inside SMEM, which the driver learns by looking for the magic */
+static uint64_t cmd_db_phys, cmd_db_size;
+static int cmd_db_scan;
+#define CMD_DB_PHYS             cmd_db_phys
+#define CMD_DB_SIZE             cmd_db_size
+#define RSC_PHYS                rsc_phys              /* the application processor's "DRV 2", whose slot layout is the same on both */
+static uint64_t rsc_phys;
 #define RSC_SIZE                0x10000UL
 #define TCS(reg)                (rsc + 0xd00 + (reg))           /* command slot set 0, an "active" one */
 #define TCS_IRQ_ENABLE          0x00
@@ -238,20 +262,27 @@ rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
 	return done;
 }
 
-/* The chip's I/O supply: 1.8 V from LDO2 of the PM8350C ("ldoc2"). Nothing else is connected to it. */
+/* The chip's I/O supply, by its name in this phone's command database: redwood takes 1.8 V from
+ * LDO2 of the PM8350C ("ldoc2"), annibale from L12B of its PMIC ("ldob12", the goodix vdd-supply). */
+static const char *supply_name = "ldoc2";
+
 static bool
 io_supply_on(void)
 {
-	uint32_t base = rpmh_address("ldoc2");
+	uint32_t base = rpmh_address(supply_name);
 	uint32_t address[3] = { base + VRM_VOLTAGE, base + VRM_ENABLE, base + VRM_MODE };
 	uint32_t data[3] = { 1800, 1, VRM_MODE_LDO_HPM };
 
-	/* addresses of regulators ("VRM") have 4 in bits 19:16; anything else is not what we are looking for */
-	if (base == 0 || (base >> 16 & 0xf) != 4) {
-		printf("goodix: RPMh: no regulator \"ldoc2\" (address %#x)\n", base);
+	/* addresses of regulators ("VRM") have 4 in bits 19:16; a newer phone may encode them differently,
+	 * so that this is only worth complaining about, not refusing over */
+	if (base == 0) {
+		printf("goodix: RPMh: no regulator \"%s\"\n", supply_name);
 		return false;
 	}
-	printf("goodix: RPMh: ldoc2 is at %#x; slot status %#x, control %#x, irq enable %#x status %#x\n", base,
+	if ((base >> 16 & 0xf) != 4) {
+		printf("goodix: RPMh: \"%s\" address %#x is not tagged as a regulator, trying it anyway\n", supply_name, base);
+	}
+	printf("goodix: RPMh: %s is at %#x; slot status %#x, control %#x, irq enable %#x status %#x\n", supply_name, base,
 	    rd(TCS(TCS_STATUS)), rd(TCS(TCS_CONTROL)), rd(TCS(TCS_IRQ_ENABLE)), rd(TCS(TCS_IRQ_STATUS)));
 	if (!rpmh_write(address, data, 3)) {
 		return false;
@@ -264,12 +295,8 @@ io_supply_on(void)
 
 #define GCC_PHYS                0x00100000UL
 #define GCC_SIZE                0x60000UL
-#define GCC_VOTE                (gcc + 0x52008)         /* the application processor's votes */
-#define VOTE_QUP1_CORE_2X       (1u << 18)
-#define VOTE_QUP1_CORE          (1u << 19)
-#define VOTE_QUP1_M_AHB         (1u << 20)
-#define VOTE_QUP1_S_AHB         (1u << 21)
-#define VOTE_QUP1_SE5           (1u << 27)             /* serial engine 13 is the 6th of the second group */
+#define GCC_VOTE                (gcc + 0x52008)         /* the application processor's votes: the same register on both */
+static uint32_t vote_qup_bus, vote_se;                  /* the bits of this phone: the four bus clocks, then the engine */
 #define GCC_QUP1_M_AHB_CBCR     (gcc + 0x18004)         /* bit 31: the clock is off */
 #define GCC_QUP1_S_AHB_CBCR     (gcc + 0x18008)
 #define GCC_QUP1_SE5_CBCR       (gcc + 0x185fc)
@@ -282,12 +309,19 @@ io_supply_on(void)
 #define CLOCK_OFF               (1u << 31)
 #define XO_HZ                   19200000
 
+/* annibale: its engine (serial engine 6, the second of the second group) hangs off a fixed divider,
+ * which hangs off a rate-selectable source; the names are mainline gcc-sm8750.c's */
+#define A_SE2_HALT              (gcc + 0x1827c)         /* bit 0: the engine's clock is off */
+#define A_S2_CLK_SRC_DIV        (gcc + 0x1828c)         /* [3:0]: plus one, the divider of the source below */
+#define A_QSPI_REF_CFG          (gcc + 0x188c4)         /* [4:0] 2*divider-1, [10:8] source, [13:12] m/n */
+#define A_QSPI_REF_M            (gcc + 0x188cc)
+#define A_QSPI_REF_N            (gcc + 0x188d0)
+
 static uint32_t se_source_hz, se_clock_select;
 
 static uint32_t
-rcg_rate(uint32_t cfg, uint32_t m, uint32_t not_n_minus_m)
+rcg_rate(const uint32_t *parent, uint32_t cfg, uint32_t m, uint32_t not_n_minus_m)
 {
-	static const uint32_t parent[8] = { XO_HZ, 600000000, 0, 0, 0, 0, 300000000, 0 };
 	uint64_t hz = parent[cfg >> 8 & 7];
 	uint32_t divider = cfg & 0x1f, mode = cfg >> 12 & 3;
 
@@ -304,14 +338,47 @@ rcg_rate(uint32_t cfg, uint32_t m, uint32_t not_n_minus_m)
 	return (uint32_t)hz;
 }
 
+/* redwood's own parent set, for the rate-selectable clock of its serial engine 5 */
+static const uint32_t redwood_parent[8] = { XO_HZ, 600000000, 0, 0, 0, 0, 300000000, 0 };
+/* annibale's, for the source of the fixed divider above its engine (mainline gcc_qupv3_wrap1_qspi_ref_clk_src) */
+static const uint32_t annibale_parent[8] = { XO_HZ, 600000000, 500000000, 0, 0, 0, 300000000, 0 };
+
+/* annibale: no rate selection at all — vote the branch on and take the rate the divider says.
+ * Reading rather than writing the divider is deliberate: the boot loader or a started touch
+ * daemon already left a working one, and nothing here needs a particular rate but a working clock. */
+static bool
+clocks_on_annibale(void)
+{
+	se_source_hz = rcg_rate(annibale_parent, rd(A_QSPI_REF_CFG), rd(A_QSPI_REF_M), rd(A_QSPI_REF_N));
+	if (se_source_hz == 0) {
+		printf("goodix: engine clock source %#x reads as no rate at all\n", rd(A_QSPI_REF_CFG));
+		return false;
+	}
+	se_clock_select = 0;
+	wr(GCC_VOTE, rd(GCC_VOTE) | vote_se);
+	for (int i = 0; i < 1000; i++) {
+		if (!(rd(A_SE2_HALT) & 1)) {
+			printf("goodix: engine clock %u Hz (source %#x, divider %#x)\n", se_source_hz, rd(A_QSPI_REF_CFG),
+			    rd(A_S2_CLK_SRC_DIV));
+			return true;
+		}
+		sleep_us(10);
+	}
+	printf("goodix: engine clock stays halted (%#x)\n", rd(A_SE2_HALT));
+	return false;
+}
+
 static bool
 clocks_on(void)
 {
-	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP1_CORE_2X | VOTE_QUP1_CORE | VOTE_QUP1_M_AHB | VOTE_QUP1_S_AHB);
+	wr(GCC_VOTE, rd(GCC_VOTE) | vote_qup_bus);
+	if (board_annibale) {
+		return clocks_on_annibale();
+	}
 	if (rd(GCC_QUP1_SE5_DFSR) & 1) {
 		/* preset rates: the lowest that is at least 4 MHz */
 		for (uint32_t level = 0; level < 8; level++) {
-			uint32_t hz = rcg_rate(rd(GCC_QUP1_SE5_PERF_CFG(level)), rd(GCC_QUP1_SE5_PERF_M(level)),
+			uint32_t hz = rcg_rate(redwood_parent, rd(GCC_QUP1_SE5_PERF_CFG(level)), rd(GCC_QUP1_SE5_PERF_M(level)),
 			    rd(GCC_QUP1_SE5_PERF_N(level)));
 
 			if (hz >= 4000000 && (se_source_hz == 0 || hz < se_source_hz)) {
@@ -337,7 +404,7 @@ clocks_on(void)
 		se_source_hz = XO_HZ;
 		se_clock_select = 0;
 	}
-	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP1_SE5);
+	wr(GCC_VOTE, rd(GCC_VOTE) | vote_se);
 	for (int i = 0; i < 1000; i++) {
 		if (!((rd(GCC_QUP1_M_AHB_CBCR) | rd(GCC_QUP1_S_AHB_CBCR) | rd(GCC_QUP1_SE5_CBCR)) & CLOCK_OFF)) {
 			return true;
@@ -351,7 +418,8 @@ clocks_on(void)
 
 /* ---- SPI through the serial engine (GENI) ---------------------------------------------------------- */
 
-#define SE_PHYS                 0x00a94000UL
+#define SE_PHYS                 se_phys               /* redwood 0x00a94000, annibale 0x00a88000 */
+static uint64_t se_phys;
 #define SE_SIZE                 0x4000UL
 #define GENI_FORCE_DEFAULT      (se + 0x020)
 #define GENI_OUTPUT_CTRL        (se + 0x024)
@@ -557,7 +625,7 @@ geni_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 
 /* ---- SPI by hand, on the same pins ----------------------------------------------------------------- */
 
-static unsigned bitbang_in = PIN_MISO, bitbang_out = PIN_MOSI;
+static unsigned bitbang_in, bitbang_out;        /* set before every use, from the pins of this phone */
 
 static void
 bitbang_init(void)
@@ -1303,6 +1371,9 @@ static enum touch_chip touch_chip;
 static enum touch_chip
 touch_chip_detect(void)
 {
+	if (pin_ft_id == NO_STRAP || pin_gx_id == NO_STRAP) {
+		return TOUCH_GOODIX;   /* this phone has one touch chip and no way to tell: annibale's is a Goodix */
+	}
 	gpio_configure(PIN_FOCALTECH_ID, 0, PULL_NONE, 2, false);
 	gpio_configure(PIN_GOODIX_ID, 0, PULL_NONE, 2, false);
 	if (gpio_get(PIN_GOODIX_ID) && !gpio_get(PIN_FOCALTECH_ID)) {
@@ -1341,7 +1412,7 @@ show_state(const char *when)
 	    rd(GCC_QUP1_S_AHB_CBCR), rd(GCC_QUP1_SE5_CBCR), rd(GCC_QUP1_SE5_CFG), rd(GCC_QUP1_SE5_DFSR), rd(GPIO_CFG(PIN_CS)),
 	    rd(GPIO_CFG(PIN_CLK)), rd(GPIO_CFG(PIN_MOSI)), rd(GPIO_CFG(PIN_MISO)), rd(GPIO_CFG(PIN_RESET)),
 	    rd(GPIO_IO(PIN_RESET)), rd(GPIO_CFG(PIN_INT)), rd(GPIO_IO(PIN_INT)), rd(GPIO_CFG(PIN_AVDD)), rd(GPIO_IO(PIN_AVDD)),
-	    gpio_get(68), gpio_get(96));
+	    pin_ft_id == NO_STRAP ? 0 : gpio_get(PIN_FOCALTECH_ID), pin_gx_id == NO_STRAP ? 0 : gpio_get(PIN_GOODIX_ID));
 }
 
 /* Power the chip up from nothing, in the vendor driver's order. */
@@ -1431,6 +1502,35 @@ micros_now(void)
 	return ns / 1000;
 }
 
+/* Which phone this is, from the boot-arg's value: 1 is redwood, the shape of every constant
+ * above; 2 is annibale, whose every number comes from its own device tree or mainline gcc-sm8750.c. */
+static void
+board_setup(uint32_t which)
+{
+	vote_qup_bus = 1u << 18 | 1u << 19 | 1u << 20 | 1u << 21;   /* both phones: core 2x, core, m_ahb, s_ahb */
+	if (which == 2) {
+		board_annibale = 1;
+		tlmm_phys = 0x0f000000UL;  tlmm_size = 0x202000UL;   /* the SM8750's 216 pins */
+		se_phys = 0x00a88000UL;                             /* serial engine 6: "qup1_se2", the touch chip's SPI */
+		rsc_phys = 0x16520000UL;                            /* apps_rsc "drv-2"; its slots too start at 0xd00 */
+		cmd_db_phys = 0x81d00000UL;  cmd_db_size = 0x200000UL;  /* SMEM, whose database must be looked for */
+		cmd_db_scan = 1;
+		supply_name = "ldob12";                             /* L12B, the goodix vdd-supply of the device tree */
+		pin_miso = 40;  pin_mosi = 41;  pin_clk = 42;  pin_cs = 43;   /* mux 1 each: "qup1_se2" */
+		pin_int = 162;  pin_reset = 161;  pin_avdd = 114;   /* the interrupt, reset, and avdd-switch of that tree */
+		vote_se = 1u << 24;                                 /* gcc_qupv3_wrap1_s2_clk: the engine's branch */
+	} else {
+		tlmm_phys = 0x0f100000UL;  tlmm_size = 0x100000UL;
+		se_phys = 0x00a94000UL;
+		rsc_phys = 0x18220000UL;
+		cmd_db_phys = 0x80860000UL;  cmd_db_size = 0x20000UL;
+		pin_miso = 52;  pin_mosi = 53;  pin_clk = 54;  pin_cs = 55;
+		pin_int = 81;  pin_reset = 105;  pin_avdd = 107;
+		pin_ft_id = 68;  pin_gx_id = 96;
+		vote_se = 1u << 27;
+	}
+}
+
 static void
 goodix_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -1450,6 +1550,25 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 	se = ml_io_map(SE_PHYS, SE_SIZE);
 	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
 	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
+	if (cmd_db_scan) {
+		/* the boot loader hands over SMEM, not the database inside it: look for the magic, which
+		 * the boot loader's own allocator only ever puts at page starts */
+		uint64_t off = 0;
+
+		for (; off + sizeof(struct cmd_db_header) <= CMD_DB_SIZE; off += 0x1000) {
+			const uint8_t *p = (const uint8_t *)(uintptr_t)(cmd_db + off);
+
+			if (p[4] == 0xdb && p[5] == 0x30 && p[6] == 0x03 && p[7] == 0x0c) {
+				break;
+			}
+		}
+		if (off + sizeof(struct cmd_db_header) > CMD_DB_SIZE) {
+			printf("goodix: no command database anywhere in SMEM\n");
+		} else {
+			printf("goodix: command database at +%u of SMEM\n", (unsigned)off);
+			cmd_db += off;
+		}
+	}
 
 	if (!bring_up()) {
 		printf("goodix: no %s touch screen\n", chip_name());
@@ -1508,6 +1627,7 @@ redwood_goodix_init(void)
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
+	board_setup(enabled);
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
 	if (kernel_thread_start(goodix_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

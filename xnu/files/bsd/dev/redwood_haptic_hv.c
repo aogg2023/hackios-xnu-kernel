@@ -15,8 +15,9 @@
  *              peripheral each channel is, from 0x2000), cnfg@c42d000 (who owns each channel),
  *              chnls@c500000 (write channels, 0x1000 each), obsrvr@c440000 (read channels: ours, the
  *              application processor's, system 0, at 0x8000 + 0x20 per channel). The haptics block
- *              answers as three SPMI peripherals: 0xf0 the driver (HAP), 0xf1 its pattern engine,
- *              0xf2 its boost regulator -- the device tree's reg <0xf000 0xf100 0xf200>.
+ *              answers as three SPMI peripherals of the PMIH010X at slave 7: 0x7f0 the driver
+ *              (HAP), 0x7f1 its pattern engine, 0x7f2 its boost regulator -- the device tree's
+ *              qcom,hv-haptics@f000, under qcom,pmih010x@7, with reg <0xf000 0xf100 0xf200>.
  *   the motor  5714 us as the device tree says (lra-period-us 0x1652: its period, open-loop written
  *              to the driver in steps of 5 us); 1300 mV (vmax-mv) in steps of 50 mV; the brake
  *              pattern ff 3f 1f over eight steps (qcom,brake-pattern), closed-loop brake mode 1,
@@ -162,12 +163,17 @@ wait_ms(uint32_t ms)
 #define OPC_EXT_READ            13                      /* ... read */
 #define TRANSACT_TIMEOUT_US     2000
 
-#define HAP_DRIVER              0x0f0                   /* the driver: registers 0xf0xx */
-#define HAP_PATTERN             0x0f1                   /* its pattern engine: 0xf1xx */
-#define HAP_BOOST               0x0f2                   /* its boost regulator: 0xf2xx (only looked at) */
+/*
+ * The three peripherals' ppids, slave and function as the arbiter's table holds them: the block
+ * sits on the PMIH010X at slave 7 -- the device tree's /soc/qcom,spmi@c42d000/qcom,pmih010x@7/
+ * qcom,hv-haptics@f000, line 41612 of the merged decompile -- so 7 << 8 | 0xf0 and kin.
+ */
+#define HAP_DRIVER              0x7f0                   /* the driver: registers 0xf0xx */
+#define HAP_PATTERN             0x7f1                   /* its pattern engine: 0xf1xx */
+#define HAP_BOOST               0x7f2                   /* its boost regulator: 0xf2xx (only looked at) */
 
 static struct {
-	uint16_t        ppid;                             /* slave << 8 | function: 0x0f0, 0x0f1, 0x0f2 */
+	uint16_t        ppid;                             /* slave << 8 | function: 0x7f0, 0x7f1, 0x7f2 -- slave 7 (PMIH010X #7), function 0xf0..0xf2 */
 	uint16_t        apid;                             /* the channel it is reached through */
 	bool            found, ours;                      /* and whether the system that may write is ours */
 } pbuf[3] = { { HAP_DRIVER }, { HAP_PATTERN }, { HAP_BOOST } };

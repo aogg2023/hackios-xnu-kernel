@@ -61,6 +61,14 @@ void redwood_torch_init(void);          /* boot-arg torch=N: the phone's flashli
 void redwood_torch_quiesce(void);       /* the light off: at the run's end and on a panic's way out */
 void redwood_camera_init(void);         /* boot-arg cam=N: the phone's cameras (bsd/dev/redwood_camera.c) */
 void redwood_camera_quiesce(void);      /* whatever of them was switched on, off: at the run's end and on a panic's way out */
+void redwood_buttons_hv_init(void);     /* boot-arg buttons=1: annibale's keys, the PMIC's (bsd/dev/redwood_buttons_hv.c) */
+void redwood_battery_hv_init(void);     /* boot-arg battery=1: annibale's battery, the gauge in the PMIC (bsd/dev/redwood_battery_hv.c) */
+void redwood_torch_hv_init(void);       /* boot-arg torch_secs=N: annibale's flashlight, the PMIC's flash module (bsd/dev/redwood_torch_hv.c) */
+void redwood_torch_hv_quiesce(void);    /* its light off: at the run's end and on a panic's way out */
+bool redwood_torch_hv_low_on(uint32_t milliamps);   /* the camera's (task L1b): the torch lit, up to the device tree's maximum */
+void redwood_torch_hv_low_off(void);    /* ... and put out */
+void redwood_spmi_hv_lock(void);        /* the annibale drivers' one transfer at a time through the v7 arbiter (redwood_buttons_hv.c) */
+void redwood_spmi_hv_unlock(void);
 
 /*
  * The phone's speakers (bsd/dev/redwood_speaker.c): its two Awinic amplifiers, set up as

@@ -55,6 +55,7 @@ extern void redwood_ddr_quiesce(void);
 extern void redwood_haptic_quiesce(void);
 extern void redwood_haptic_hv_quiesce(void);
 extern void redwood_torch_quiesce(void);
+extern void redwood_torch_hv_quiesce(void);
 extern void redwood_camera_quiesce(void);
 extern void redwood_mic_quiesce(void);
 extern void redwood_ufs_quiesce(void);
@@ -378,6 +379,7 @@ loader_return(void)
 	redwood_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
 	redwood_haptic_hv_quiesce();    /* or the PMIC's haptics block of the other phone, if it was configured */
 	redwood_torch_quiesce();        /* the flashlight off, if it was lit */
+	redwood_torch_hv_quiesce();     /* or the other phone's, lit on its PMIC's flash module */
 	redwood_camera_quiesce();       /* the camera powered down, if it was powered up */
 	redwood_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
 	/*

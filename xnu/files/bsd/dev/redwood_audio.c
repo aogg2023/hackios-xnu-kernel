@@ -352,4 +352,7 @@ redwood_audio_init(void)
 	redwood_haptic_hv_init();
 	redwood_torch_init();
 	redwood_camera_init();
+	redwood_buttons_hv_init();
+	redwood_battery_hv_init();
+	redwood_torch_hv_init();
 }

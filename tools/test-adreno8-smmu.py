@@ -438,7 +438,23 @@ int main(void) {
     reset(&space, false);
     regs[SMMU_SMR(5) / 4] = 0x80000004;
     regs[SMMU_S2CR(5) / 4] = 0x20004u;
+    /* An exact entry that does not match stream 2 and does not route to
+     * context 3 is fine; the pass needs both halves. */
     assert(adreno8_secure_preflight() && writes == 0);
+    /* Stream 2 active on the candidate slot but routed to context 4: the
+     * candidate slot is taken, so the preflight rejects. */
+    reset(&space, false);
+    regs[SMMU_SMR(2) / 4] = 0x80000002;
+    regs[SMMU_S2CR(2) / 4] = 0x10004u;
+    assert(!adreno8_secure_preflight() && writes == 0);
+    assert(reads[SMMU_S2CR(2) / 4] == 1);
+    /* A range match whose mask covers stream 2 rejects even when it routes
+     * to another context. */
+    reset(&space, false);
+    regs[SMMU_SMR(5) / 4] = 0x80020000;
+    regs[SMMU_S2CR(5) / 4] = 0x10004u;
+    assert(!adreno8_secure_preflight() && writes == 0);
+    assert(reads[SMMU_SMR(5) / 4] == 1 && reads[SMMU_S2CR(5) / 4] == 1);
     /* Candidate slot beyond the SMR count: rejected with no MMIO read at all. */
     reset(&space, false);
     regs[SMMU_IDR0 / 4] = 0x4c017e02;

@@ -5,6 +5,7 @@
 #include <kern/locks.h>
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
+#include <mach/mach_types.h>
 #include <miscfs/devfs/devfs.h>
 #include <sys/conf.h>
 #include <sys/errno.h>
@@ -54,6 +55,34 @@ latency_lines(void)
 		touch_lat = PE_parse_boot_argn("touch_lat", &on, sizeof(on)) && on != 0;
 	}
 	return touch_lat != 0;
+}
+
+#define TCSR_PHYS       0x01fc0000ul    /* "syscon@1fc0000" of both phones' own device trees: its first word numbers the SoC */
+#define SM8750_SOC_NUMBER       0x26au  /* 618: the K90's SM8750 ("sun"), whose tree says qcom,msm-id = <0x26a 0x10000> */
+
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+/*
+ * The fuse of the redwood era, from silicon and once: TCSR0 carries the SoC's number in its low
+ * half, as Linux reads it too (drivers/soc/qcom/socinfo-tcsr.c, TCSR_ID_MASK), and the K90 answers
+ * 618. The loader's own telling cannot separate the two phones -- its arm-io ranges begin at
+ * 0x00400000 for both (xnuloader/loader.c, platform_redwood and platform_annibale) -- so every
+ * pe_arm_get_soc_base_phys() check passes on the K90 and a boot-arg alone lets the old drivers
+ * write the redwood's registers into this phone's clock controllers. QEMU's board backs nothing at
+ * that address and reads whatever an empty window says, never 618, so its runs and the redwood's
+ * stay as they were; a board where the page will not map is taken for not-K90, as it was before.
+ */
+bool
+redwood_soc_is_sm8750(void)
+{
+	static uint32_t number = 0xffffffffu;           /* the low half of TCSR0, looked up once */
+
+	if (number == 0xffffffffu) {
+		vm_offset_t tcsr = ml_io_map(TCSR_PHYS, 0x1000);
+
+		number = tcsr != 0 ? *(volatile uint32_t *)tcsr & 0xffffu : 0u;
+	}
+	return number == SM8750_SOC_NUMBER;
 }
 
 static LCK_GRP_DECLARE(touch_lck_grp, "redwood-touch");

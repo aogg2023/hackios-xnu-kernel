@@ -732,6 +732,10 @@ redwood_torch_init(void)
 		return;
 	}
 	level = level > 3 ? 3 : level;
+	if (redwood_soc_is_sm8750()) {
+		printf("torch: torch=1..3 are for the redwood's torch driver, and this is the K90 (TCSR0 numbers its SoC 618)\n");
+		return;
+	}
 	if (kernel_thread_start(torch_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}

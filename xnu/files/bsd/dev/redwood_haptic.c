@@ -985,6 +985,10 @@ redwood_haptic_init(void)
 	if (level > 5) {
 		level = 5;
 	}
+	if (redwood_soc_is_sm8750()) {
+		printf("haptic: haptic=1..5 are for the redwood's haptic driver, and this is the K90 (TCSR0 numbers its SoC 618)\n");
+		return;
+	}
 	if (kernel_thread_start(haptic_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}

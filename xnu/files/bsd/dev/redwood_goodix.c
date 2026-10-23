@@ -1627,6 +1627,11 @@ redwood_goodix_init(void)
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
+	if (enabled != 2 && redwood_soc_is_sm8750()) {
+		printf("goodix: touchscreen=1 talks to the redwood's panel with the redwood's QUP and TLMM numbers, and this "
+		    "is the K90 (TCSR0 numbers its SoC 618): touchscreen=2 is this board's, and keeps its way through\n");
+		return;
+	}
 	board_setup(enabled);
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
 	if (kernel_thread_start(goodix_thread, NULL, &thread) == KERN_SUCCESS) {

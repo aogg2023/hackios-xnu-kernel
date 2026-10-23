@@ -13,6 +13,7 @@
 #ifndef _SYS_REDWOOD_INPUT_H_
 #define _SYS_REDWOOD_INPUT_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #define REDWOOD_TOUCH_DEVICE    "/dev/redwood-touch"
@@ -38,6 +39,10 @@ struct redwood_touch {
 #ifdef KERNEL
 /* For drivers; not from interrupt context. */
 void redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
+
+/* The fuse of the redwood era, read from silicon: true when the phone's own TCSR0 numbers its
+ * SoC 618, the K90's SM8750. redwood_input.c says what it reads, and why these drivers stop there. */
+bool redwood_soc_is_sm8750(void);
 void redwood_input_init(void);
 void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */

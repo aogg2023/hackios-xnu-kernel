@@ -456,7 +456,7 @@ flush_log(void)
 static int
 rdfile_load(const char *part, uint64_t off, uint64_t size, uint64_t dst)
 {
-	static uint8_t bounce[1048576];
+	static uint8_t bounce[262144];   /* some UFS BlockIO drivers cap single transfers; 256 KiB is safe */
 	char16 wname[40];
 	unsigned n;
 

@@ -343,6 +343,7 @@ static int hc_list_is_uefis(void);
 static int hc_log_skips;                /* logs not written this run (said twice at most) */
 static void hc_print_state(const char *when);
 static void hc_take_back(const char *when);
+static int skip_ufs_arbitration;        /* annibale: the kernel never shares the UFS controller, set at platform selection */
 
 static void
 write_logs(const char *klog, uint64_t klog_len)
@@ -366,8 +367,13 @@ write_logs(const char *klog, uint64_t klog_len)
 	efi_status ws, rs = 0;
 	int same = 0;
 
-	/* only through UEFI's own transfer list (see hc_take_back) */
-	if (!hc_list_is_uefis()) {
+	/*
+	 * Only through UEFI's own transfer list (see hc_take_back) -- that is the dance redwood needs
+	 * because its kernel takes the UFS controller over. annibale's kernel boots from a ramdisk and
+	 * never touches the UFS controller, and while the loader waits on USB no kernel runs at all, so
+	 * UEFI's BlockIo owns the storage outright: write straight through it on annibale (k90-port).
+	 */
+	if (!hc_list_is_uefis() && !skip_ufs_arbitration) {
 		if (hc_log_skips++ < 2) {
 			hc_print_state("log not written");
 			print("log: NOT WRITTEN to logdump: UEFI's transfer list is not the one in the controller\n");
@@ -392,6 +398,47 @@ write_logs(const char *klog, uint64_t klog_len)
 	print("log: %d bytes written to logdump (%x), read back %s (%x)\n", len, ws,
 	    EFI_ERROR(ws) ? "not tried" : same ? "the same" : "DIFFERENT", rs);
 	compose_logs(klog, klog_len);
+}
+
+
+static void
+probe_one(const char16 *name, unsigned len, const char *tag)
+{
+	static char blk[4096];
+
+	efi_block_io *bio = find_partition_named(name, len);
+
+	print("probe %s: handle %x\n", tag, (uint64_t)(uintptr_t)bio);
+	if (bio == NULL) {
+		return;
+	}
+	print("probe %s: bs=%d blocks=%x mediaid=%x\n", tag, bio->media->block_size,
+	    (uint64_t)bio->media->last_block, (uint64_t)bio->media->media_id);
+	memset(blk, '.', sizeof(blk));
+	memcpy(blk, "XNUPROBE-", 9);
+	memcpy(blk + 9, tag, str_len(tag));
+	memcpy(blk + 9 + str_len(tag), "-001\n", 5);
+	efi_status w = bio->write_blocks(bio, bio->media->media_id, 0, sizeof(blk), blk);
+	efi_status f = bio->flush_blocks(bio);
+	memset(blk, 0, sizeof(blk));
+	efi_status r = bio->read_blocks(bio, bio->media->media_id, 0, sizeof(blk), blk);
+	print("probe %s: write=%x flush=%x read=%x head0=%x\n", tag, w, f, r, *(uint32_t *)blk);
+}
+
+static void
+probe_boot_a(void)
+{
+	static const char16 n_boot_a[] = u"boot_a";
+	static const char16 n_misc[] = u"misc";
+	static const char16 n_metadata[] = u"metadata";
+	static const char16 n_logfs[] = u"logfs";
+	static const char16 n_sclogs[] = u"xbl_sc_logs";
+
+	probe_one(n_boot_a, sizeof(n_boot_a) / sizeof(char16), "boot_a");
+	probe_one(n_misc, sizeof(n_misc) / sizeof(char16), "misc");
+	probe_one(n_metadata, sizeof(n_metadata) / sizeof(char16), "metadata");
+	probe_one(n_logfs, sizeof(n_logfs) / sizeof(char16), "logfs");
+	probe_one(n_sclogs, sizeof(n_sclogs) / sizeof(char16), "sclogs");
 }
 
 static void
@@ -574,16 +621,19 @@ static const struct platform platform_redwood = {
  * annibale (REDMI K90, SM8750 "sun"): values cross-checked against the device's own merged device
  * tree (a vendor_boot base DT plus its dtbo overlay): GIC 16000000/16080000 (arm,gic-v3, stride
  * 0x40000), PSCI method "smc", eight cores at MPIDR 0..500 and 10000/10100 -- six A720-class
- * (MIDR 0x514f0014) low-capacity and two primes. fb_base stays 0: a phone build selects this
- * platform with DIRECT_PHONE_PLAT instead of matching the framebuffer (the panel is not lit yet,
- * see docs/analysis/annibale-uefi-build.md).
+ * (MIDR 0x514f0014) low-capacity and two primes. fb_base is the region our own firmware's
+ * MemoryMapLib hands to GOP ("Display_Reserved" = 0xFC800000, docs/analysis/annibale-hw-map.md
+ * notes the device's own DT reserves 0xF2400000 for display: the XBL carveout, kept separate
+ * from what the panel DMA of our EDK2 build is told to use); a phone build selects this
+ * platform with DIRECT_PHONE_PLAT even before that (the panel is not lit yet, so GOP may be
+ * missing altogether, see docs/analysis/annibale-uefi-build.md).
  */
 static const struct platform platform_annibale = {
 	.name = "annibale", .io_base = 0x00400000, .io_size = 0x3FC00000,
 	.gic_dist = 0x16000000, .gic_redist = 0x16080000, .uart = 0, .log_other_cpu = 1,
 	.cores = 8, .core_shift = 8,
 	.small_cores = 0x3f,
-	.fb_base = 0,
+	.fb_base = 0xFC800000,
 };
 
 /*
@@ -3970,6 +4020,14 @@ efi_main(efi_handle image, efi_system_table *st)
 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
 		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
+#ifdef DIRECT_PHONE_PLAT
+		/*
+		 * the panel of this phone is not lit yet, so a missing GOP is expected here; a build
+		 * made for one phone still knows which phone it runs on (k90-port: without this the
+		 * platform stayed qemu_virt and every SoC parameter of the kernel was wrong).
+		 */
+		PLAT = &platform_annibale;
+#endif
 	} else {
 		SCREEN.base = GOP->mode->fb_base;
 		SCREEN.width = GOP->mode->info->width;
@@ -3989,6 +4047,7 @@ efi_main(efi_handle image, efi_system_table *st)
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
+	skip_ufs_arbitration = (PLAT == &platform_annibale); /* ramdisk kernel, no UFS handover (k90-port) */
 
 	install_exception_hook();
 	wdt_arm();
@@ -3996,6 +4055,7 @@ efi_main(efi_handle image, efi_system_table *st)
 	int have_payload = parse_payload(&pi, 0);
 	if (have_payload && pi.usb_mode && usb_start()) {
 		flush_log();
+		probe_boot_a();
 		usb_command_loop();
 	}
 

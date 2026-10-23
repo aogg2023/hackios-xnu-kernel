@@ -217,7 +217,7 @@ struct adreno8_gpu_space {
 #define GMU_STREAM              5
 #define GMU_MATCH               1
 #define GMU_CONTEXT             2              /* vendor reserves contexts 0 and 1 for GPU SID 0/1 */
-#define SECURE_CONTEXT          3              /* candidate for the gfx3d_secure SID; occupancy is verified by adreno8_space_on */
+#define SECURE_CONTEXT          3              /* candidate for the gfx3d_secure SID 2 (vendor sun-gpu.dtsi); stream-match index and conflict-free occupancy are confirmed by the boot scan and adreno8_space_available; secure-world reservations of a context bank stay invisible to HLOS */
 #define BCM_TCS_CMD(commit, valid, vote_x, vote_y) \
 	(((commit) ? 1u << 30 : 0u) | ((valid) ? 1u << 29 : 0u) | (((vote_x) & 0x3fffu) << 14) | ((vote_y) & 0x3fffu))
 #define BCM_COUNT               3                   /* the rows in adreno8_bcms: SH0, MC0, ACV */

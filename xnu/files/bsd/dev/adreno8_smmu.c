@@ -67,8 +67,12 @@ adreno8_step_smmu_read(void)
 		adreno8_get(&adreno8_smmu, "cbar", adreno8_smmu_page + SMMU_CBAR(i));
 	}
 
-	adreno8_announce("read GPU context 0, LPAC context 1 and GMU context %u", GMU_CONTEXT);
-	for (uint32_t cb = 0; cb <= GMU_CONTEXT; cb++) {
+	/* Context 3 is the secure candidate: vendor sun-gpu.dtsi routes the
+	 * gfx3d_secure stream as SID 2 through this SMMU. Reading its reset
+	 * state is observation for the secure bring-up and issues no writes. */
+	adreno8_announce("read GPU context 0, LPAC context 1, GMU context %u and secure candidate context %u",
+	    GMU_CONTEXT, SECURE_CONTEXT);
+	for (uint32_t cb = 0; cb <= SECURE_CONTEXT && cb < adreno8_smmu_contexts; cb++) {
 		uint32_t base = (adreno8_smmu_pages + cb) * adreno8_smmu_page;
 
 		adreno8_get(&adreno8_smmu, "cb sctlr", base + SMMU_CB_SCTLR);
@@ -387,8 +391,23 @@ adreno8_space_verify(struct adreno8_gpu_space *space, bool atos)
 static bool
 adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32_t match)
 {
+	/*
+	 * Occupancy pre-check: reads only; the SMR/S2CR/context-bank registers
+	 * carry no read side effects (vendor arm-smmu.c:239,688 read context
+	 * bank SCTLR the same plain way). SCTLR==0 proves HLOS sees the context
+	 * disabled; a secure-world reservation of the same context bank is not
+	 * readable here and stays unconfirmed until a device run. TTBR and
+	 * stream routing are written later by adreno8_space_on, never here.
+	 */
+	uint32_t sctlr = adreno8_get(&adreno8_smmu, "cb free",
+	    (adreno8_smmu_pages + space->context) * adreno8_smmu_page + SMMU_CB_SCTLR);
+
 	if (space->context >= adreno8_smmu_contexts || match >= adreno8_smmu_matches || stream > 0x7fff ||
 	    (adreno8_smmu_pages + space->context + 1) * adreno8_smmu_page > adreno8_smmu.size) {
+		return false;
+	}
+	if (sctlr != 0) {
+		printf("adreno8: %u: context %u already enabled: sctlr %#x\n", adreno8_step, space->context, sctlr);
 		return false;
 	}
 	for (unsigned i = 0; i < adreno8_smmu_matches; i++) {
@@ -399,15 +418,14 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
 			continue;
 		}
 		s2cr = adreno8_get(&adreno8_smmu, "s2cr ownership", SMMU_S2CR(i));
-		/* Reuse a blocked stream only with the same match and a disabled context. */
+		/* Reuse a blocked stream only with the same match. */
 		if (i == match && smr == (SMR_VALID | SMR_MASK << 16 | stream) &&
-		    (s2cr & 0x30000) == SMMU_S2CR_FAULT &&
-		    adreno8_get(&adreno8_smmu, "cb ownership", (adreno8_smmu_pages + space->context) * adreno8_smmu_page + SMMU_CB_SCTLR) == 0) {
+		    (s2cr & 0x30000) == SMMU_S2CR_FAULT) {
 			continue;
 		}
 		mask = (smr >> 16 & 0x7fff) | SMR_MASK;
 		if (i == match || ((smr ^ stream) & 0x7fff & ~mask) == 0 ||
-		    ((s2cr & 0x30000) == 0 && (s2cr & 0xff) == space->context)) {
+		    (s2cr & 0xff) == space->context) {
 			printf("adreno8: %u: stream match %u conflicts with requested context %u\n", adreno8_step, i, space->context);
 			return false;
 		}

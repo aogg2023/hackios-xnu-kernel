@@ -49,7 +49,10 @@ adreno8_secure_lost(void)
 }
 
 /* One physically contiguous, zeroed argument page; kvtophys is verified across
- * the whole page like the zap metadata buffer. */
+ * the whole page like the zap metadata buffer. A page that fails verification
+ * here is freed and retried on the next call instead of marking `lost`: the
+ * argument page is a plain HLOS page never handed to the secure world, so its
+ * ownership is never in doubt. */
 static bool
 adreno8_assign_open(void)
 {
@@ -152,7 +155,19 @@ adreno8_secure_data(const struct adreno8_memory *buffer)
 		uint64_t phys = kvtophys(buffer->memory + at), run = PAGE_SIZE;
 
 		if (phys == 0 || (phys & PAGE_MASK)) {
+			/*
+			 * A page whose physical start cannot be proven closes the secure path for
+			 * the whole boot, whether or not an earlier batch already ran. Before the
+			 * first MP_ASSIGN the pages are still HLOS-owned and the cost is only a
+			 * closed secure path; after one, the driver cannot learn which regions TZ
+			 * accepted, so every page of this buffer stays reserved until cold reset.
+			 * The check never runs against a page TZ may own, so no CPU read probes a
+			 * transferred page for recovery; a cold reset recovering a first handover
+			 * is itself unconfirmed and needs device-side confirmation.
+			 */
 			printf("adreno8: secure page %#llx unusable for MP_ASSIGN\n", phys);
+			adreno8_assign.lost = true;
+			printf("adreno8: secure pages retained until cold reset\n");
 			return false;
 		}
 		while (at + run < bytes && kvtophys(buffer->memory + at + run) == phys + run) {
@@ -190,6 +205,10 @@ adreno8_secure_page_tables(struct adreno8_gpu_space *space)
 	}
 	for (unsigned i = space->secure_tables; i < space->table_count; i++) {
 		if (space->tables[i].table == 0 || space->tables[i].phys == 0) {
+			/* Same conservative rule as adreno8_secure_data: an unproven page ends
+			 * the secure path for the boot and every table page stays reserved. */
+			adreno8_assign.lost = true;
+			printf("adreno8: secure pages retained until cold reset\n");
 			return false;
 		}
 		/* The walker only consumes the first 4 KiB; the whole kernel page is ours. */

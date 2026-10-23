@@ -10,21 +10,15 @@ ROOT = Path(__file__).resolve().parents[1]
 fixture = runpy.run_path(str(ROOT / "tools/test-adreno8-smmu.py"))
 stub = fixture["stub"].replace("assert(size == 4096);", "assert(size != 0);")
 stub = stub.replace("static int adreno8_say", r'''
-static bool adreno8_secure_fail;
-static unsigned secure_pt_calls, secure_data_calls;
-struct adreno8_memory;
-bool adreno8_secure_lost(void) { return false; }
-bool adreno8_secure_page_tables(struct adreno8_gpu_space *space) {
-    secure_pt_calls++;
-    if (adreno8_secure_fail) return false;
-    space->secure_tables = space->table_count;
-    return true;
+static unsigned scm_calls, scm_sleeps, scm_fail_at = 999999u;
+int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
+    uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *answer) {
+    assert(function == 0x42000c16ull && arginfo == 0x1117ull);
+    scm_calls++;
+    *answer = scm_calls == scm_fail_at ? 5 : 0;
+    return scm_calls == scm_fail_at ? -5 : 0;
 }
-bool adreno8_secure_data(const struct adreno8_memory *buffer) {
-    (void)buffer;
-    secure_data_calls++;
-    return !adreno8_secure_fail;
-}
+void adreno8_sleep_ms(uint32_t ms) { scm_sleeps++; (void)ms; }
 static int adreno8_say''', 1)
 driver = (ROOT / "xnu/files/bsd/dev/adreno8_memory.c").read_text()
 driver, replaced = re.subn(
@@ -42,8 +36,6 @@ static void reset_memory(void) {
     memset(&adreno8_secure_space, 0, sizeof(adreno8_secure_space));
     adreno8_secure_space.name = "secure";
     adreno8_secure_space.context = SECURE_CONTEXT;
-    adreno8_secure_fail = false;
-    secure_pt_calls = secure_data_calls = 0;
     memset(adreno8_memory_entries, 0, sizeof(adreno8_memory_entries));
     adreno8_memory_count = 0;
     adreno8_memory_bytes = 0;
@@ -52,7 +44,7 @@ static void reset_memory(void) {
     map_one(&adreno8_gmu_space);
     assert(adreno8_space_on(&adreno8_gmu_space, 5, 1));
 }
-int main(void) {
+int main(int argc, char **argv) {
     struct adreno8_hfi_mem_result result, again;
     struct adreno8_hfi_mem_request request = {
         .flags = ADRENO8_HFI_MEM_GFX | ADRENO8_HFI_MEM_GFX_PRIV | ADRENO8_HFI_MEM_GFX_WRITE |
@@ -60,6 +52,27 @@ int main(void) {
         .kind = 1, .handle = 42, .size = 8193, .align = (12 << 8) | 16,
     };
     reset_memory();
+    if (argc > 1 && strcmp(argv[1], "secure-fail") == 0) {
+        /* Real MP_ASSIGN path failing on the last data batch after earlier
+         * batches succeeded: ownership is unclear, every page is retained, and
+         * the memory subsystem refuses later requests of any kind. */
+        request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 7,
+            .size = 0x138000, .align = (12 << 8) | 16};
+        scm_fail_at = 1 + (request.size + PAGE_SIZE * ASSIGN_SECTIONS - 1) /
+            (PAGE_SIZE * ASSIGN_SECTIONS);
+        assert(!adreno8_hwsched_alloc(&request, &result));
+        assert(scm_calls == scm_fail_at && adreno8_secure_lost());
+        assert(adreno8_memory_failed && adreno8_memory_retained());
+        assert(!adreno8_memory_entries[0].complete);
+        unsigned calls_before = scm_calls;
+        request.handle = 8;
+        assert(!adreno8_hwsched_alloc(&request, &result));
+        request.kind = 4;
+        assert(!adreno8_hwsched_alloc(&request, &result));
+        assert(scm_calls == calls_before);
+        puts("MP_ASSIGN batch failure retained through the memory path: PASS");
+        return 0;
+    }
     assert(!adreno8_memory_retained() && !adreno8_gpu_memory_ready());
     struct adreno8_memory *sqe = adreno8_gpu_alloc("sqe", 111472, 4096,
         ADRENO8_MEM_READ | ADRENO8_MEM_EXEC);
@@ -108,7 +121,11 @@ int main(void) {
     assert(adreno8_hwsched_alloc(&request, &result));
     assert(result.secure && result.gpu_address != 0 && result.gmu_address == 0);
     assert(result.size == 0x138000);
-    assert(secure_pt_calls == 1 && secure_data_calls == 1);
+    /* Production MP_ASSIGN: one page-table batch plus ceil(pages / 32) data
+     * batches; the fixture never hands out neighbor physical pages. */
+    unsigned data_batches = (result.size + PAGE_SIZE * ASSIGN_SECTIONS - 1) /
+        (PAGE_SIZE * ASSIGN_SECTIONS);
+    assert(scm_calls == 1 + data_batches && !adreno8_secure_lost());
     assert(!adreno8_secure_space.is_on &&
            adreno8_secure_space.secure_tables == adreno8_secure_space.table_count);
     struct adreno8_memory *secure = &adreno8_memory_entries[0].buffer;
@@ -123,7 +140,7 @@ int main(void) {
     assert(!adreno8_memory_acquire(secure, 0, 4096));
     assert(adreno8_hwsched_alloc(&request, &again));
     assert(again.secure && again.gpu_address == result.gpu_address);
-    assert(secure_data_calls == 1 && allocation_count > 0);
+    assert(scm_calls == 1 + data_batches && allocation_count > 0);
     request.handle = 10;
     request.flags = 0x007;
     assert(!adreno8_hwsched_alloc(&request, &again));
@@ -135,16 +152,6 @@ int main(void) {
     request.flags = 0x007;
     assert(adreno8_hwsched_alloc(&request, &again));
     assert(!again.secure);
-
-    reset_memory();
-    adreno8_secure_fail = true;
-    request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 7,
-        .size = 8192, .align = 12};
-    assert(!adreno8_hwsched_alloc(&request, &result));
-    assert(adreno8_memory_failed && adreno8_memory_retained());
-    assert(!adreno8_memory_entries[0].complete);
-    request = (struct adreno8_hfi_mem_request){.flags = ADRENO8_HFI_MEM_GMU, .size = 4096};
-    assert(!adreno8_hwsched_alloc(&request, &result));
 
     reset_memory();
     request = (struct adreno8_hfi_mem_request){.flags = ADRENO8_HFI_MEM_GMU |
@@ -224,12 +231,14 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
         (target / name).write_text((ROOT / "xnu/files/bsd/dev" / name).read_text())
     (target / "adreno8_smmu.c").write_text(fixture["driver"])
     (target / "adreno8_memory.c").write_text(driver)
+    (target / "adreno8_secure.c").write_text((ROOT / "xnu/files/bsd/dev/adreno8_secure.c").read_text())
     (target / "check.c").write_text('static unsigned invalidations;\n#include "adreno8_smmu.c"\n'
-        '#include "adreno8_memory.c"\n' + setup + tests)
+        '#include "adreno8_secure.c"\n#undef printf\n#include "adreno8_memory.c"\n' + setup + tests)
     for page_size in (4096, 16384):
         binary = target / f"check-{page_size}"
         subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}",
                         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                         str(target / "check.c"), "-o", str(binary)], check=True)
-        subprocess.run([str(binary)], check=True)
+        for mode in ((), ("secure-fail",)):
+            subprocess.run([str(binary), *mode], check=True)
         print(f"XNU PAGE_SIZE={page_size}: PASS")

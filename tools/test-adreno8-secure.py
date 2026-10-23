@@ -8,6 +8,11 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 fixture = runpy.run_path(str(ROOT / "tools/test-adreno8-smmu.py"))
 stub = fixture["stub"].replace("assert(size == 4096);", "assert(size != 0);")
+poison_hook = """static vm_offset_t poison_va; /* when set, kvtophys fails for that page */
+static uint64_t kvtophys(vm_offset_t va) {
+    if (poison_va && va >= poison_va && va < poison_va + PAGE_SIZE) return 0;"""
+stub = stub.replace("static uint64_t kvtophys(vm_offset_t va) {", poison_hook, 1)
+assert "poison_va" in stub
 driver = (ROOT / "xnu/files/bsd/dev/adreno8_secure.c").read_text()
 setup = fixture["tests"].split("int main(void) {")[0]
 fakes = r'''
@@ -129,6 +134,24 @@ int main(int argc, char **argv) {
         puts("MP_ASSIGN WAITQ retained without continuation: PASS");
         return 0;
     }
+    if (argc > 1 && strcmp(argv[1], "poison") == 0) {
+        /* An unprovable physical page retains every buffer page until cold reset,
+         * whether the failing page sits before the first batch or after one. */
+        bool after_batch = argc > 2 && strcmp(argv[2], "boundary") == 0;
+        script(0, 0);
+        buffer = make_buffer(after_batch ? ASSIGN_SECTIONS + 8 : 2);
+        poison_va = buffer.memory + (after_batch ? ASSIGN_SECTIONS : 0) * PAGE_SIZE;
+        struct adreno8_gpu_space space = { .name = "secure", .context = SECURE_CONTEXT };
+        assert(adreno8_space_new_table(&space, 0, 0));
+        assert(!adreno8_secure_data(&buffer));
+        assert(adreno8_secure_lost());
+        assert(call_count == (after_batch ? 1u : 0u));
+        assert(!adreno8_secure_data(&buffer) && !adreno8_secure_page_tables(&space));
+        assert(call_count == (after_batch ? 1u : 0u));
+        printf("MP_ASSIGN retained after %s-batch physical check failure: PASS\n",
+            after_batch ? "boundary" : "pre");
+        return 0;
+    }
 
     /* The argument page allocation is retryable and never sets the retained flag. */
     buffer = make_buffer(1);
@@ -214,6 +237,6 @@ if __name__ == "__main__":
             binary = target / f"check-{page_size}"
             subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}", "-fsanitize=address,undefined",
                             "-fno-omit-frame-pointer", str(target / "check.c"), "-o", str(binary)], check=True)
-            for mode in ((), ("answer",), ("waitq",)):
+            for mode in ((), ("answer",), ("waitq",), ("poison", "pre"), ("poison", "boundary")):
                 subprocess.run([str(binary), *mode], check=True)
             print(f"XNU PAGE_SIZE={page_size}: PASS")

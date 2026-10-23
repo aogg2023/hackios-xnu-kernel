@@ -26,9 +26,11 @@ static bool adreno8_memory_failed;
 bool
 adreno8_memory_retained(void)
 {
+	/* adreno8_secure_lost marks pages whose ownership is unclear after a
+	 * failed or unconfirmed MP_ASSIGN; they stay reserved until cold reset. */
 	return adreno8_memory_count != 0 || adreno8_gpu_space.table_count != 0 ||
 	    adreno8_gpu_space.is_on || adreno8_secure_space.table_count != 0 ||
-	    adreno8_secure_space.is_on;
+	    adreno8_secure_space.is_on || adreno8_secure_lost();
 }
 
 static struct adreno8_memory *
@@ -91,9 +93,18 @@ adreno8_memory_alloc(const char *name, uint32_t size, uint32_t alignment,
 }
 
 /* kind 5 (CSW_PRIV_SECURE) buffers: the pages go to VMID CP_PIXEL through MP_ASSIGN.
- * The default GPU space keeps a placeholder mapping only to reserve the address;
- * while CP_PIXEL owns the pages, a SID0 access is refused by the secure world.
- * Once the data pages are assigned the CPU must not read or write them again. */
+ * Vendor kgsl_iommu.c keeps secure buffers in a separate secure pagetable, so the
+ * default GPU space needs no live mapping here; we keep a placeholder mapping only
+ * to reserve the address from the single VA allocator. While CP_PIXEL owns the
+ * pages the secure world refuses SID0 access; that refusal is a translation-time
+ * behavior only a device run can observe, and host tests cover just the driver
+ * side, which never touches these pages through either mapping. The CPU must not
+ * read or write the pages after MP_ASSIGN, and no code path may treat an SID0
+ * access as a probe for recovered ownership. Secure context 3 (TTBR, SCTLR and
+ * stream routing through adreno8_space_on) is initialized later, when a secure
+ * queue needs it; this allocation stage has no context-3 consumer, and page-table
+ * pages carry {HLOS read/write, CP_PIXEL read} so the walker can still read tables
+ * the secure world owns. */
 static struct adreno8_memory *
 adreno8_memory_alloc_secure(const char *name, uint32_t size, uint32_t alignment, uint32_t gpu_prot)
 {

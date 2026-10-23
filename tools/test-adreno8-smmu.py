@@ -197,6 +197,7 @@ int main(void) {
     assert(reads[(0x20000 + SMMU_CB_SCTLR) / 4] == 1);
     assert(reads[(0x21000 + SMMU_CB_SCTLR) / 4] == 1);
     assert(reads[(0x22000 + SMMU_CB_SCTLR) / 4] == 1);
+    assert(reads[(0x23000 + SMMU_CB_SCTLR) / 4] == 1);
     assert(writes == 0);
     /* AArch64 privileged instruction fetch requires AP_UNPRIV clear on writable pages. */
     assert((PTE_PAGE & (3u << 6)) == 0 && (PTE_PAGE & (3ULL << 53)) == 0);
@@ -232,6 +233,25 @@ int main(void) {
         assert(reads[(0x22000 + SMMU_CB_TTBR1) / 4] == 1);
         assert(reads[(0x22000 + SMMU_CB_MAIR1) / 4] == 1);
     }
+    /* Occupancy pre-check: an enabled context bank, or any stream whose S2CR
+     * routes to the requested context (active or fault leftover field), blocks
+     * the takeover. All three rejections are reads only. */
+    for (unsigned probe = 0; probe < 3; probe++) {
+        reset(&space, false);
+        map_one(&space);
+        if (probe == 0) regs[(0x22000 + SMMU_CB_SCTLR) / 4] = 1u;
+        if (probe == 1) { regs[SMMU_SMR(5) / 4] = 0x80000003; regs[SMMU_S2CR(5) / 4] = 2u; }
+        if (probe == 2) { regs[SMMU_SMR(5) / 4] = 0x80000003; regs[SMMU_S2CR(5) / 4] = 0x20002u; }
+        assert(!adreno8_space_on(&space, 5, 1));
+        assert(!space.is_on && writes == 0);
+    }
+    /* Routing to another context does not conflict, even while active. */
+    reset(&space, false);
+    map_one(&space);
+    regs[SMMU_SMR(5) / 4] = 0x80000003;
+    regs[SMMU_S2CR(5) / 4] = 0x10004;
+    assert(adreno8_space_on(&space, 5, 1));
+    adreno8_space_off(&space, 1);
     reset(&space, false);
     map_one(&space);
     assert(adreno8_space_on(&space, 5, 1));

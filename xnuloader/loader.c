@@ -712,6 +712,7 @@ struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
 	uint64_t gic_dist, gic_redist;   /* GICv3 */
+	uint64_t gic_redist_size, gic_redist_stride; /* 0 keeps the 1 MiB / 128 KiB defaults */
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
@@ -749,19 +750,16 @@ static const struct platform platform_redwood = {
 };
 
 /*
- * annibale (REDMI K90, SM8750 "sun"): values cross-checked against the device's own merged device
- * tree (a vendor_boot base DT plus its dtbo overlay): GIC 16000000/16080000 (arm,gic-v3, stride
- * 0x40000), PSCI method "smc", eight cores at MPIDR 0..500 and 10000/10100 -- six A720-class
- * (MIDR 0x514f0014) low-capacity and two primes. fb_base is the region our own firmware's
- * MemoryMapLib hands to GOP ("Display_Reserved" = 0xFC800000, docs/analysis/annibale-hw-map.md
- * notes the device's own DT reserves 0xF2400000 for display: the XBL carveout, kept separate
- * from what the panel DMA of our EDK2 build is told to use); a phone build selects this
- * platform with DIRECT_PHONE_PLAT even before that (the panel is not lit yet, so GOP may be
- * missing altogether, see docs/analysis/annibale-uefi-build.md).
+ * annibale (REDMI K90, SM8750): the merged device tree supplies the GIC ranges and
+ * 0x40000 redistributor stride, PSCI method "smc", and splash region at 0xFC800000.
+ * MPIDRs are 0..500 and 10000/10100; the linear core enumeration below reaches the first six.
+ * DIRECT_PHONE_PLAT selects this platform even without GOP. See docs/analysis/annibale-hw-map.md
+ * in the parent workspace for the device-tree measurements.
  */
 static const struct platform platform_annibale = {
 	.name = "annibale", .io_base = 0x00400000, .io_size = 0x3FC00000,
 	.gic_dist = 0x16000000, .gic_redist = 0x16080000,
+	.gic_redist_size = 0x200000, .gic_redist_stride = 0x40000,
 	/*
 	 * uart stays 0 on purpose: the console of this device is the GENI uart at 0xa9c000
 	 * (115200n8, docs/analysis/annibale-hw-map.md), but its QUP clock is gated until a
@@ -1180,6 +1178,8 @@ static int wdt_armed;
 static const struct kernel_live *running_live;
 static uint64_t running_slide;
 static void usb_poll_command(void);
+static void set_result(const char *what, uint64_t a, uint64_t b);
+static int firmware_fault;
 
 static uint64_t
 seconds_since(uint64_t then)
@@ -2470,14 +2470,9 @@ psci_call(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
 	return status;
 }
 
-/*
- * Run the kernel on the core with that MPIDR and wait until it is back. Returns 0 when it has
- * been and gone (the caller goes on as after loader_return_stub), a negative number if the
- * firmware refused to start the core, OTHER_CPU_NOT_STARTED, or OTHER_CPU_HUNG: then the kernel
- * is still sitting on that core, but what it logged is there to be read (loader_ctx, as after a
- * return). `live` is where the kernel shows its signs of life, if it has such a place;
- * `budget` is how many seconds it has said it will run.
- */
+/* Run the kernel on mpidr: 0 = returned, negative = PSCI refused, OTHER_CPU_NOT_STARTED
+ * or OTHER_CPU_HUNG = incomplete. loader_ctx retains the available log for a hung kernel.
+ * live holds its shared status; budget is the requested run duration in seconds. */
 static int64_t
 run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const struct kernel_live *live, uint64_t slide,
     uint64_t budget)
@@ -2500,6 +2495,13 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	clean_dcache((uint64_t)(uintptr_t)&psci_by_hvc, (uint64_t)(uintptr_t)&psci_by_hvc + 8);
 	clean_dcache((uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_entry + 0x1000);
 	clean_dcache((uint64_t)(uintptr_t)loader_ctx, (uint64_t)(uintptr_t)loader_ctx + sizeof(loader_ctx));
+	/* annibale uses polled USB; keep firmware IRQ handlers out of XNU's GIC setup. */
+	if (PLAT == &platform_annibale) {
+		watching_only = 1;
+		daif = READ_SYSREG(DAIF);
+		group1 = READ_SYSREG(S3_0_C12_C12_7);
+		__asm__ volatile ("msr daifset, #0xf\nmsr S3_0_C12_C12_7, %0\nisb" : : "r" ((uint64_t)0));
+	}
 
 	/* the last argument arrives in that core's x0 */
 	status = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_start);
@@ -2510,12 +2512,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		flush_log();
 	}
 	while (status == 0) {
-		/*
-		 * The first seconds are the ones in which a new arrangement goes wrong, and a machine
-		 * that resets takes this loader's memory with it: where there is storage for the log,
-		 * what the kernel is seen to do goes there as it happens. That needs UEFI's services,
-		 * so until NOTE_SECONDS are over this core keeps its interrupts.
-		 */
+		/* Storage logging needs firmware interrupts during NOTE_SECONDS on other platforms. */
 		if (!watching_only && seconds_since(started) >= noted + 2) {
 			noted = seconds_since(started);
 			if (PLAT->log_other_cpu) {
@@ -2527,10 +2524,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 				flush_log();
 			}
 		}
-		/*
-		 * After that this core only watches: no interrupts (the kernel reprograms the interrupt
-		 * controller's shared half; UEFI's handlers had better not run on top of that for long).
-		 */
+		/* Stop firmware interrupts before further use of XNU's shared interrupt controller. */
 		if (!watching_only && seconds_since(started) >= NOTE_SECONDS) {
 			watching_only = 1;
 			daif = READ_SYSREG(DAIF);
@@ -2552,11 +2546,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 				status = OTHER_CPU_NOT_STARTED;
 			}
 		}
-		/*
-		 * The watchdog is this core's to feed for as long as the kernel is expected to run:
-		 * the kernel does it too, but whether that counts from another core is not known.
-		 * After that a kernel that neither returns nor hangs visibly meets the watchdog.
-		 */
+		/* Feed this core's watchdog through the requested budget and a 60-second return margin. */
 		if (wdt_armed && seconds_since(last_pet) >= 5 && seconds_since(started) < budget + 60) {
 			wdt_pet();
 			last_pet = READ_SYSREG(CNTVCT_EL0);
@@ -2690,6 +2680,15 @@ exception_handler(int64_t type, uint64_t *ctx)
 	    ctx[EXC_CTX_ESR], ctx[EXC_CTX_FAR], ctx[EXC_CTX_LR], ctx[EXC_CTX_SP], ctx[EXC_CTX_SPSR]);
 	print("loader image base %x (elr offset %x)\n", (uint64_t)(uintptr_t)&__ImageBase,
 	    ctx[EXC_CTX_ELR] - (uint64_t)(uintptr_t)&__ImageBase);
+	if (PLAT == &platform_annibale && screen_quiet) {
+		/* Preserve the fault for USB retrieval; a new kernel needs a host-requested reboot. */
+		__asm__ volatile ("msr daifset, #0xf");
+		firmware_fault = 1;
+		running_live = NULL;
+		set_result("firmware-fault", (uint64_t)type, ctx[EXC_CTX_ELR]);
+		compose_logs(NULL, 0);
+		for (;;) { usb_poll_command(); }
+	}
 	flush_log();
 	ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
 	for (;;) {
@@ -3569,8 +3568,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_begin(&w, "gic");
 	dt_prop_str(&w, "device_type", "interrupt-controller");
 	dt_prop_str(&w, "compatible", "arm,gic-v3");
-	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, 0x100000 };
+	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base,
+	    plat->gic_redist_size ? plat->gic_redist_size : 0x100000 };
 	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
+	dt_prop_u64(&w, "redistributor-stride", plat->gic_redist_stride ? plat->gic_redist_stride : 0x20000);
 	dt_end(&w);
 	if (plat->uart != 0) {
 		dt_begin(&w, "uart0");
@@ -3926,7 +3927,7 @@ starts_with(const char *s, const char *prefix)
 static void
 fb_command(char *cmd)
 {
-	int busy = running_live != NULL;
+	int busy = running_live != NULL || firmware_fault;
 
 	{
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
@@ -3936,7 +3937,7 @@ fb_command(char *cmd)
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
-			if (busy) {
+			if (running_live != NULL) {
 				((struct kernel_live *)(uintptr_t)running_live)->stop = 1;
 			}
 			fb_reply("OKAY", "");
@@ -4013,6 +4014,11 @@ fb_command(char *cmd)
 			}
 		} else if (starts_with(cmd, "upload")) {
 			uint64_t sent = 0;
+			/* fastboot rejects DATA00000000 without reading the final status. */
+			if (staged_len == 0) {
+				fb_reply("FAIL", "no staged data");
+				return;
+			}
 			fb_reply_data(staged_len);
 			while (sent < staged_len) {
 				uint64_t chunk = staged_len - sent > USB_CHUNK ? USB_CHUNK : staged_len - sent;
@@ -4093,7 +4099,7 @@ fb_command(char *cmd)
 			fb_reply("OKAY", "");
 			probe_boot_a();
 		} else if (starts_with(cmd, "oem log")) {
-			if (busy) {
+			if (running_live != NULL) {
 				compose_live_log(running_live, running_slide);
 			} else {
 				compose_logs(NULL, 0);
@@ -4275,24 +4281,16 @@ efi_main(efi_handle image, efi_system_table *st)
 		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
 #ifdef DIRECT_PHONE_PLAT
 		/*
-		 * the panel of this phone is not lit yet, so a missing GOP is expected here; a build
-		 * made for one phone still knows which phone it runs on (k90-port: without this the
-		 * platform stayed qemu_virt and every SoC parameter of the kernel was wrong).
-		 *
-		 * And the phone still has a screen: booted through LK (the "reboot into slot" path),
-		 * LK drove the panel and blits its splash into splash_region 0xfc800000+0x2b00000,
-		 * the very region our MemoryMapLib carves as Display_Reserved (the device's own
-		 * device tree labels it cont_splash_region, docs/analysis/annibale-hw-map.md). Hand
-		 * that to the kernel as BootArgs.video and it has a display -- QEMU's SpringBoard
-		 * milestone draws into nothing but BootArgs.video, so this is the whole graphics
-		 * handover. Blits into it before LK ran (the "fastboot boot" path) are harmless:
-		 * the region is RAM either way, just no panel shows them yet.
+		 * A phone build must select annibale even without GOP. The device tree reserves
+		 * splash_region at 0xfc800000+0x2b00000, matching MemoryMapLib's Display_Reserved.
+		 * The P11 mode is 1156x2510. BootArgs.video uses that buffer for kernel output;
+		 * visible scanout still depends on the panel state left by LK.
 		 */
 		PLAT = &platform_annibale;
 		SCREEN.base = platform_annibale.fb_base;
-		SCREEN.width = 1440;              /* the panel's native mode, as LK drives it */
-		SCREEN.height = 3200;
-		SCREEN.stride = 1440 * 4;
+		SCREEN.width = 1156;              /* P11 mode from the device tree and Android DRM */
+		SCREEN.height = 2510;
+		SCREEN.stride = 1156 * 4;
 		print("display assumed at %x: LK splash region\n", SCREEN.base);
 #endif
 	} else {

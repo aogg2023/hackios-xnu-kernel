@@ -549,9 +549,8 @@ redwood_buttons_init(void)
 	if (!enabled) {
 		return;
 	}
-	if (redwood_soc_is_sm8750()) {
-		printf("buttons: buttons=1 records the redwood's keys through its TLMM, and this is the K90 "
-		    "(TCSR0 numbers its SoC 618); annibale_buttons takes the same arg on this board\n");
+	if (redwood_platform_blocks_legacy_drivers()) {
+		printf("buttons: legacy TLMM initialization skipped; annibale_buttons handles buttons= on annibale\n");
 		return;
 	}
 	PE_parse_boot_argn("buttons_steps", &steps, sizeof(steps));

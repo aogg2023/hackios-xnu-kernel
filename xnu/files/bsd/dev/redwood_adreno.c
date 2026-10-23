@@ -4028,8 +4028,8 @@ redwood_adreno_init(void)
 	uint32_t only = 0, done = 0, failed = 0, keep = 0;
 	bool by_itself = false;
 
-	if (redwood_soc_is_sm8750()) {
-		printf("adreno: gpu=1 and adreno=N drive the redwood's Adreno 660, and this is the K90 (TCSR0 numbers its SoC 618)\n");
+	if (redwood_platform_blocks_legacy_drivers()) {
+		printf("adreno: legacy Adreno 660 initialization skipped by platform guard\n");
 		return;
 	}
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {

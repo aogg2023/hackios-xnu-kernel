@@ -75,12 +75,13 @@ sleep_ms(uint32_t ms)
  * POCO X5 Pro (redwood, an SM7375), touchscreen=2 the REDMI K90 (annibale, an SM8750 "sun",
  * k90-port). Everything phone-shaped below is a variable set once from a table at startup:
  * pins, bases, the clock controller's model (a rate-selectable RCG there, a plain vote and a
- * fixed divider here), and the supply's name in the RPMh command database — whose address
- * annibale learns by scanning SMEM for the database's magic. Values cross-checked against the
+ * fixed divider here), and the supply's name and reserved-memory address in the RPMh command database.
+ * Values cross-checked against the
  * phone's own device tree and mainline gcc-sm8750.c / pinctrl-sm8750.c (docs/analysis/annibale-hw-map.md).
  */
 
 static int board_annibale;
+static uint32_t touch_steps = 5;  /* touch_hv_steps=1..5: database, GPIO, supplies, clocks, panel. */
 
 #define NO_STRAP                1000u     /* a GPIO number no phone has, so that a read of a strap reads none */
 
@@ -105,8 +106,6 @@ static unsigned pin_ft_id = NO_STRAP, pin_gx_id = NO_STRAP;
 #define PIN_FOCALTECH_ID        pin_ft_id /* FocalTech if this reads 0 ... */
 #define PIN_GOODIX_ID           pin_gx_id /* ... and this reads 1 (sm8350-kernel-OKX convention) */
 #define PIN_FUNCTION_SPI        1         /* "qup15"/"qup1_se2": the first non-GPIO function of these pins */
-#define NO_STRAP                1000u     /* a GPIO number no phone has, so that a read of a strap reads none */
-
 static void
 gpio_configure(unsigned pin, unsigned function, unsigned pull, unsigned ma, bool output)
 {
@@ -122,7 +121,7 @@ gpio_set(unsigned pin, bool high)
 static bool
 gpio_get(unsigned pin)
 {
-	return rd(GPIO_IO(pin)) & 1;
+	return pin != NO_STRAP && (rd(GPIO_IO(pin)) & 1);
 }
 
 static void
@@ -134,10 +133,8 @@ gpio_output(unsigned pin, bool high, unsigned pull, unsigned ma)
 
 /* ---- the I/O supply (RPMh) ----------------------------------------------------------------------- */
 
-/* the command database the boot loader left: redwood at an address written into its device tree,
- * annibale somewhere inside SMEM, which the driver learns by looking for the magic */
+/* Each board's device tree reserves a separate qcom,cmd-db memory region. */
 static uint64_t cmd_db_phys, cmd_db_size;
-static int cmd_db_scan;
 #define CMD_DB_PHYS             cmd_db_phys
 #define CMD_DB_SIZE             cmd_db_size
 #define RSC_PHYS                rsc_phys              /* the application processor's "DRV 2", whose slot layout is the same on both */
@@ -297,8 +294,8 @@ io_supply_on(void)
 #define GCC_SIZE                0x60000UL
 #define GCC_VOTE                (gcc + 0x52008)         /* the application processor's votes: the same register on both */
 static uint32_t vote_qup_bus, vote_se;                  /* the bits of this phone: the four bus clocks, then the engine */
-#define GCC_QUP1_M_AHB_CBCR     (gcc + 0x18004)         /* bit 31: the clock is off */
-#define GCC_QUP1_S_AHB_CBCR     (gcc + 0x18008)
+#define GCC_QUP1_M_AHB_CBCR     (gcc + (board_annibale ? 0x23140 : 0x18004)) /* bit 31: the clock is off */
+#define GCC_QUP1_S_AHB_CBCR     (gcc + (board_annibale ? 0x23144 : 0x18008))
 #define GCC_QUP1_SE5_CBCR       (gcc + 0x185fc)
 #define GCC_QUP1_SE5_CMD        (gcc + 0x18600)         /* bit 0: take the new configuration */
 #define GCC_QUP1_SE5_CFG        (gcc + 0x18604)         /* [4:0] 2*divider-1, [10:8] source, [13:12] mode */
@@ -311,7 +308,7 @@ static uint32_t vote_qup_bus, vote_se;                  /* the bits of this phon
 
 /* annibale: its engine (serial engine 6, the second of the second group) hangs off a fixed divider,
  * which hangs off a rate-selectable source; the names are mainline gcc-sm8750.c's */
-#define A_SE2_HALT              (gcc + 0x1827c)         /* bit 0: the engine's clock is off */
+#define A_SE2_HALT              (gcc + 0x1827c)         /* bit 31: the engine's clock is off */
 #define A_S2_CLK_SRC_DIV        (gcc + 0x1828c)         /* [3:0]: plus one, the divider of the source below */
 #define A_QSPI_REF_CFG          (gcc + 0x188c4)         /* [4:0] 2*divider-1, [10:8] source, [13:12] m/n */
 #define A_QSPI_REF_M            (gcc + 0x188cc)
@@ -357,7 +354,7 @@ clocks_on_annibale(void)
 	se_clock_select = 0;
 	wr(GCC_VOTE, rd(GCC_VOTE) | vote_se);
 	for (int i = 0; i < 1000; i++) {
-		if (!(rd(A_SE2_HALT) & 1)) {
+		if (!(rd(A_SE2_HALT) & CLOCK_OFF)) {
 			printf("goodix: engine clock %u Hz (source %#x, divider %#x)\n", se_source_hz, rd(A_QSPI_REF_CFG),
 			    rd(A_S2_CLK_SRC_DIV));
 			return true;
@@ -1409,7 +1406,7 @@ show_state(const char *when)
 {
 	printf("goodix: %s: votes %#x, clocks %#x %#x %#x, rate cfg %#x dfs %#x; pins cs/clk/mosi/miso cfg %#x %#x %#x %#x,"
 	    " reset %#x/%u, int %#x/%u, avdd %#x/%u, straps %u %u\n", when, rd(GCC_VOTE), rd(GCC_QUP1_M_AHB_CBCR),
-	    rd(GCC_QUP1_S_AHB_CBCR), rd(GCC_QUP1_SE5_CBCR), rd(GCC_QUP1_SE5_CFG), rd(GCC_QUP1_SE5_DFSR), rd(GPIO_CFG(PIN_CS)),
+	    rd(GCC_QUP1_S_AHB_CBCR), rd(board_annibale ? A_SE2_HALT : GCC_QUP1_SE5_CBCR), rd(board_annibale ? A_QSPI_REF_CFG : GCC_QUP1_SE5_CFG), board_annibale ? 0 : rd(GCC_QUP1_SE5_DFSR), rd(GPIO_CFG(PIN_CS)),
 	    rd(GPIO_CFG(PIN_CLK)), rd(GPIO_CFG(PIN_MOSI)), rd(GPIO_CFG(PIN_MISO)), rd(GPIO_CFG(PIN_RESET)),
 	    rd(GPIO_IO(PIN_RESET)), rd(GPIO_CFG(PIN_INT)), rd(GPIO_IO(PIN_INT)), rd(GPIO_CFG(PIN_AVDD)), rd(GPIO_IO(PIN_AVDD)),
 	    pin_ft_id == NO_STRAP ? 0 : gpio_get(PIN_FOCALTECH_ID), pin_gx_id == NO_STRAP ? 0 : gpio_get(PIN_GOODIX_ID));
@@ -1446,16 +1443,20 @@ static bool
 bring_up(void)
 {
 	const char *problem = "its clocks cannot be turned on";
-
+	printf("goodix: checking GPIO and clock state\n");
 	show_state("as found");
+	if (touch_steps < 3) { return false; }
 	touch_chip = touch_chip_detect();
 	printf("goodix: ID gpio96=%u gpio68=%u: selected %s\n", gpio_get(PIN_GOODIX_ID),
 	    gpio_get(PIN_FOCALTECH_ID), chip_name());
+	printf("goodix: enabling panel supplies\n");
 	power_on();
-
+	if (touch_steps < 4) { return false; }
+	printf("goodix: enabling SPI clocks\n");
 	if (clocks_on()) {
 		printf("goodix: serial engine: firmware %#x, interface %#x, parameters %#x, source clock %u Hz (select %u)\n",
 		    rd(GENI_FW_REVISION_RO), rd(GENI_IF_DISABLE_RO), rd(SE_HW_PARAM_0), se_source_hz, se_clock_select);
+		if (touch_steps < 5) { return false; }
 		uint32_t spi_hz = 1000000;
 
 		/* boot-arg touch_spi_hz=N: the bus at N Hz (Android's device tree gives the chip 5 MHz) */
@@ -1513,8 +1514,7 @@ board_setup(uint32_t which)
 		tlmm_phys = 0x0f000000UL;  tlmm_size = 0x202000UL;   /* the SM8750's 216 pins */
 		se_phys = 0x00a88000UL;                             /* serial engine 6: "qup1_se2", the touch chip's SPI */
 		rsc_phys = 0x16520000UL;                            /* apps_rsc "drv-2"; its slots too start at 0xd00 */
-		cmd_db_phys = 0x81d00000UL;  cmd_db_size = 0x200000UL;  /* SMEM, whose database must be looked for */
-		cmd_db_scan = 1;
+		cmd_db_phys = 0x81c60000UL;  cmd_db_size = 0x20000UL;  /* aop_cmd_db_region, qcom,cmd-db */
 		supply_name = "ldob12";                             /* L12B, the goodix vdd-supply of the device tree */
 		pin_miso = 40;  pin_mosi = 41;  pin_clk = 42;  pin_cs = 43;   /* mux 1 each: "qup1_se2" */
 		pin_int = 162;  pin_reset = 161;  pin_avdd = 114;   /* the interrupt, reset, and avdd-switch of that tree */
@@ -1549,27 +1549,10 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
 	se = ml_io_map(SE_PHYS, SE_SIZE);
 	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	printf("goodix: command database at %#llx (%#llx bytes)\n", CMD_DB_PHYS, CMD_DB_SIZE);
 	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
-	if (cmd_db_scan) {
-		/* the boot loader hands over SMEM, not the database inside it: look for the magic, which
-		 * the boot loader's own allocator only ever puts at page starts */
-		uint64_t off = 0;
-
-		for (; off + sizeof(struct cmd_db_header) <= CMD_DB_SIZE; off += 0x1000) {
-			const uint8_t *p = (const uint8_t *)(uintptr_t)(cmd_db + off);
-
-			if (p[4] == 0xdb && p[5] == 0x30 && p[6] == 0x03 && p[7] == 0x0c) {
-				break;
-			}
-		}
-		if (off + sizeof(struct cmd_db_header) > CMD_DB_SIZE) {
-			printf("goodix: no command database anywhere in SMEM\n");
-		} else {
-			printf("goodix: command database at +%u of SMEM\n", (unsigned)off);
-			cmd_db += off;
-		}
-	}
-
+	printf("goodix: command database resource %s = %#x\n", supply_name, rpmh_address(supply_name));
+	if (touch_steps == 1) { thread_terminate(current_thread()); return; }
 	if (!bring_up()) {
 		printf("goodix: no %s touch screen\n", chip_name());
 		thread_terminate(current_thread());
@@ -1627,12 +1610,13 @@ redwood_goodix_init(void)
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
-	if (enabled != 2 && redwood_soc_is_sm8750()) {
-		printf("goodix: touchscreen=1 talks to the redwood's panel with the redwood's QUP and TLMM numbers, and this "
-		    "is the K90 (TCSR0 numbers its SoC 618): touchscreen=2 is this board's, and keeps its way through\n");
+	if (enabled != 2 && redwood_platform_blocks_legacy_drivers()) {
+		printf("goodix: legacy panel initialization skipped; touchscreen=2 selects the annibale driver\n");
 		return;
 	}
 	board_setup(enabled);
+	PE_parse_boot_argn("touch_hv_steps", &touch_steps, sizeof(touch_steps));
+	if (touch_steps < 1 || touch_steps > 5) { touch_steps = 1; }
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
 	if (kernel_thread_start(goodix_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

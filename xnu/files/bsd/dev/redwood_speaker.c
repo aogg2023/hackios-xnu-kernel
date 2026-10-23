@@ -69,7 +69,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/redwood_audio.h>
-#include <sys/redwood_input.h>        /* redwood_soc_is_sm8750(): the fuse of the redwood era */
+#include <sys/redwood_input.h>        /* Platform guard for legacy hardware access. */
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
@@ -1206,9 +1206,8 @@ redwood_speaker_init(void)
 	if (!PE_parse_boot_argn("speaker_probe", &probe_level, sizeof(probe_level)) || probe_level == 0) {
 		return;
 	}
-	if (redwood_soc_is_sm8750()) {
-		printf("speaker: speaker_probe=N drives the redwood's speaker amp and its clocks, and this is the K90 "
-		    "(TCSR0 numbers its SoC 618)\n");
+	if (redwood_platform_blocks_legacy_drivers()) {
+		printf("speaker: legacy speaker initialization skipped by platform guard\n");
 		return;
 	}
 	if (kernel_thread_start(probe_thread, NULL, &thread) == KERN_SUCCESS) {

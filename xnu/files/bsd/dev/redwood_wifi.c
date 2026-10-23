@@ -4274,8 +4274,8 @@ redwood_wifi_init(void)
 		printf("wifi: wifi=%u is not understood: wifi=1 turns the radio on, wifi_step=N goes the first N steps of that\n", on);
 		return;
 	}
-	if (redwood_soc_is_sm8750()) {
-		printf("wifi: wifi=1 and wifi_step=N are for the redwood's radio, and this is the K90 (TCSR0 numbers its SoC 618)\n");
+	if (redwood_platform_blocks_legacy_drivers()) {
+		printf("wifi: wifi=1 and wifi_step=N require the redwood platform; legacy radio initialization skipped\n");
 		return;
 	}
 	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {

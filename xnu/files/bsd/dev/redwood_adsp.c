@@ -3202,8 +3202,8 @@ redwood_adsp_init(void)
 	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || on != 1)) {
 		return;
 	}
-	if (redwood_soc_is_sm8750()) {
-		printf("adsp: adsp=1 and adsp_step=N are for the redwood's audio DSP, and this is the K90 (TCSR0 numbers its SoC 618)\n");
+	if (redwood_platform_blocks_legacy_drivers()) {
+		printf("adsp: adsp=1 and adsp_step=N require the redwood platform; legacy DSP initialization skipped\n");
 		return;
 	}
 	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {

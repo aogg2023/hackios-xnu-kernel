@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/arm/km.c b/bsd/dev/arm/km.c
-index fd7a94b20794..69eaceedd248 100644
+index fd7a94b20794..58b855074c86 100644
 --- a/bsd/dev/arm/km.c
 +++ b/bsd/dev/arm/km.c
 @@ -205,6 +205,15 @@ kmioctl(dev_t dev, u_long cmd, caddr_t data, int flag, proc_t p)
@@ -18,22 +18,11 @@ index fd7a94b20794..69eaceedd248 100644
  	/* Bodge in the CLOCAL flag as the km device is always local */
  	case TIOCSETA_32:
  	case TIOCSETAW_32:
-@@ -252,6 +261,9 @@ fallthrough:
+@@ -252,6 +261,7 @@ fallthrough:
   *		assumptions here, this routine should be static (and
   *		inlined, given there is only one call site).
   */
 +
-+extern void loader_log_putc(char c);
-+
  int
  kmputc(__unused dev_t dev, char c)
  {
-@@ -363,6 +375,8 @@ kmoutput(struct tty * tp)
- 		for (cp = buf; cp < &buf[cc]; cp++) {
- 			/* output the buffer one charatcer at a time */
- 			*cp = *cp & 0x7f;
-+			/* What user space writes to /dev/console also goes to the loader's log. */
-+			loader_log_putc((char)*cp);
- 		}
- 		if (cc > 1) {
- 			console_write((char *)buf, cc);

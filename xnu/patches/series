@@ -50,10 +50,13 @@
 50-osfmk%arm64%corecrypto%arm64_isa_compatibility.h.patch
 51-osfmk%arm64%cpu.c.patch
 52-osfmk%arm64%machine_routines.c.patch
+52a-osfmk%arm64%sleh.c.patch
 53-osfmk%arm64%start.s.patch
 54-osfmk%conf%files.patch
 55-osfmk%conf%files.arm64.patch
+55a-osfmk%console%serial_console.c.patch
 56-osfmk%console%video_console.c.patch
+56a-osfmk%console%video_scroll.c.patch
 57-osfmk%kern%debug.c.patch
 58-osfmk%kern%exception.c.patch
 59-osfmk%kern%kalloc.h.patch

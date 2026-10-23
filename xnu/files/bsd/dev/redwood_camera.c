@@ -4227,8 +4227,8 @@ redwood_camera_init(void)
 	uint32_t fake_n = 0;
 
 	fake = level == 5 && PE_parse_boot_argn("cam_fake", &fake_n, sizeof(fake_n)) && fake_n != 0;
-	if (!fake && redwood_soc_is_sm8750()) {
-		printf("camera: cam=1..4 are for the redwood's camera, and this is the K90 (TCSR0 numbers its SoC 618); "
+	if (!fake && redwood_platform_blocks_legacy_drivers()) {
+		printf("camera: cam=1..4 require the redwood platform; legacy camera initialization skipped; "
 		    "cam=5 with cam_fake=1 asks no hardware and is served\n");
 		return;
 	}

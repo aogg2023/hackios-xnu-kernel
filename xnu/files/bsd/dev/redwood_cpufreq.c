@@ -560,9 +560,8 @@ redwood_cpufreq_init(void)
 	const ml_topology_info_t *topology = ml_get_topology_info();
 	uint32_t enabled = 0, cores[EPSS_DOMAINS] = { 0 }, before, here;
 
-	if (redwood_soc_is_sm8750()) {
-		printf("cpufreq: ddr= and cpufreq= drive the redwood's RPMh (rsc@18220000, EPSS@18591000), and this is the K90 "
-		    "(TCSR0 numbers its SoC 618)\n");
+	if (redwood_platform_blocks_legacy_drivers()) {
+		printf("cpufreq: legacy RPMh/EPSS initialization skipped by platform guard\n");
 		return;
 	}
 	load_start();

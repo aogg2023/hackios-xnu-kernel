@@ -14,6 +14,7 @@
 #include <sys/systm.h>
 #include <sys/uio.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 
 #define TOUCH_QUEUE     512             /* records; a power of two */
 
@@ -57,38 +58,27 @@ latency_lines(void)
 	return touch_lat != 0;
 }
 
-#define TCSR_PHYS       0x01fc0000ul    /* "syscon@1fc0000" of both phones' own device trees: its first word numbers the SoC */
-#define SM8750_SOC_NUMBER       0x26au  /* 618: the K90's SM8750 ("sun"), whose tree says qcom,msm-id = <0x26a 0x10000> */
-
-extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-
-/*
- * The fuse of the redwood era, from silicon and once: TCSR0 carries the SoC's number in its low
- * half, as Linux reads it too (drivers/soc/qcom/socinfo-tcsr.c, TCSR_ID_MASK), and the K90 answers
- * 618. The loader's own telling cannot separate the two phones -- its arm-io ranges begin at
- * 0x00400000 for both (xnuloader/loader.c, platform_redwood and platform_annibale) -- so every
- * pe_arm_get_soc_base_phys() check passes on the K90 and a boot-arg alone lets the old drivers
- * write the redwood's registers into this phone's clock controllers. QEMU's board backs nothing at
- * that address and reads whatever an empty window says, never 618, so its runs and the redwood's
- * stay as they were; a board where the page will not map is taken for not-K90, as it was before.
- */
+/* Preserve the existing redwood and QEMU paths using their loader GIC descriptions.
+ * Other or incomplete descriptions block legacy drivers without probing hardware. */
 bool
-redwood_soc_is_sm8750(void)
+redwood_platform_blocks_legacy_drivers(void)
 {
-	static uint32_t number = 0xffffffffu;           /* the low half of TCSR0, looked up once */
+	DTEntry entry;
+	const void *property;
+	unsigned int size;
 
-	if (number == 0xffffffffu) {
-		vm_offset_t tcsr = ml_io_map(TCSR_PHYS, 0x1000);
-		uint32_t raw = tcsr != 0 ? *(volatile uint32_t *)tcsr : 0u;
-
-		/* the reading itself, once, whatever it says: the device round is to
-		 * show 618 here on the K90, 360 on the redwood and a window's own
-		 * nonsense in QEMU -- review F02, and until some real hardware has
-		 * been seen to answer, that is all this fuse rests on */
-		printf("redwood: TCSR0 @0x1fc0000 reads 0x%08x\n", raw);
-		number = raw & 0xffffu;
+	if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess ||
+	    SecureDTGetProperty(entry, "reg", &property, &size) != kSuccess || size != 4 * sizeof(uint64_t)) {
+		return true;
 	}
-	return number == SM8750_SOC_NUMBER;
+	const uint64_t *reg = property;
+	vm_offset_t base = pe_arm_get_soc_base_phys();
+	if (reg[1] != 0x10000 || reg[3] != 0x100000) {
+		return true;
+	}
+	bool redwood = base == 0x00400000 && reg[0] == 0x17600000 && reg[2] == 0x17660000;
+	bool qemu = base == 0x08000000 && reg[0] == 0 && reg[2] == 0xa0000;
+	return !redwood && !qemu;
 }
 
 static LCK_GRP_DECLARE(touch_lck_grp, "redwood-touch");

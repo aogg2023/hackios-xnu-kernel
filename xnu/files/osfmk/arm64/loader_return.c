@@ -136,6 +136,37 @@ loader_log_line(const char *line)
 	__builtin_arm_wsr64("DAIF", daif);
 }
 
+/* Record the initial trap without acquiring the video console lock. */
+void loader_fault_log(const char *message, uint64_t pc, uint64_t lr, uint32_t esr, uint64_t far);
+
+void
+loader_fault_log(const char *message, uint64_t pc, uint64_t lr, uint32_t esr, uint64_t far)
+{
+	char text[256];
+
+	snprintf(text, sizeof(text), "\nFAULT: %s pc=0x%llx lr=0x%llx esr=0x%x far=0x%llx\n",
+	    message, pc, lr, esr, far);
+	loader_log_line(text);
+}
+
+/* Save the original panic before platform debugger setup can itself fault. */
+void loader_panic_log(const char *format, va_list *args, unsigned long caller);
+
+void
+loader_panic_log(const char *format, va_list *args, unsigned long caller)
+{
+	char text[768];
+	va_list copy;
+
+	snprintf(text, sizeof(text), "\nPANIC caller 0x%lx: ", caller);
+	loader_log_line(text);
+	va_copy(copy, *args);
+	vsnprintf(text, sizeof(text), format, copy);
+	va_end(copy);
+	loader_log_line(text);
+	loader_log_putc('\n');
+}
+
 static void
 loader_log_put_locked(char c)
 {
@@ -256,7 +287,8 @@ loader_jump(uint64_t reason, uint64_t code)
 	 * firmware switch this one off. It must go as the other cores do (psci_smp_cpu_off()), with
 	 * nothing pending: after a panic the "stop" signal and the timer are.
 	 */
-	if (PE_parse_boot_argn("bootcpu", &own_core, sizeof(own_core))) {
+	/* Early checkpoints can return before PE_init_platform installs bootArgs. */
+	if (PE_state.bootArgs != NULL && PE_parse_boot_argn("bootcpu", &own_core, sizeof(own_core))) {
 		__builtin_arm_wsr64("CNTV_CTL_EL0", CNTV_CTL_EL0_IMASKED);
 		gic_v3_irq_cpu_shutdown();
 	}

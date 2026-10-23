@@ -630,7 +630,15 @@ static const struct platform platform_redwood = {
  */
 static const struct platform platform_annibale = {
 	.name = "annibale", .io_base = 0x00400000, .io_size = 0x3FC00000,
-	.gic_dist = 0x16000000, .gic_redist = 0x16080000, .uart = 0, .log_other_cpu = 1,
+	.gic_dist = 0x16000000, .gic_redist = 0x16080000,
+	/*
+	 * uart stays 0 on purpose: the console of this device is the GENI uart at 0xa9c000
+	 * (115200n8, docs/analysis/annibale-hw-map.md), but its QUP clock is gated until a
+	 * driver enables it, so writing the register blind risks hanging the kernel's early
+	 * console; and with uart==0 the loader's cmdline omits serial= entirely, which is
+	 * what a device without a probe wire wants. Flip when the pad is instrumented.
+	 */
+	.uart = 0, .log_other_cpu = 1,
 	.cores = 8, .core_shift = 8,
 	.small_cores = 0x3f,
 	.fb_base = 0xFC800000,

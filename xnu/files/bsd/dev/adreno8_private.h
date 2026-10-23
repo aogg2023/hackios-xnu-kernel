@@ -217,7 +217,9 @@ struct adreno8_gpu_space {
 #define GMU_STREAM              5
 #define GMU_MATCH               1
 #define GMU_CONTEXT             2              /* vendor reserves contexts 0 and 1 for GPU SID 0/1 */
-#define SECURE_CONTEXT          3              /* candidate for the gfx3d_secure SID 2 (vendor sun-gpu.dtsi); stream-match index and conflict-free occupancy are confirmed by the boot scan and adreno8_space_available; secure-world reservations of a context bank stay invisible to HLOS */
+#define SECURE_CONTEXT          3              /* candidate for the gfx3d_secure SID 2 (vendor sun-gpu.dtsi); occupancy is re-checked by adreno8_secure_preflight before every secure handover; secure-world reservations of a context bank stay invisible to HLOS */
+#define SECURE_STREAM           2              /* gfx3d_secure stream id (vendor sun-gpu.dtsi, same SMMU as GMU SID 5) */
+#define SECURE_MATCH            2              /* candidate match slot: gfx3d_secure is the third stream-match entry in the vendor dtsi; a device scan confirms the slot the boot loader actually assigned */
 #define BCM_TCS_CMD(commit, valid, vote_x, vote_y) \
 	(((commit) ? 1u << 30 : 0u) | ((valid) ? 1u << 29 : 0u) | (((vote_x) & 0x3fffu) << 14) | ((vote_y) & 0x3fffu))
 #define BCM_COUNT               3                   /* the rows in adreno8_bcms: SH0, MC0, ACV */
@@ -267,6 +269,8 @@ extern struct adreno8_gpu_space adreno8_secure_space;
 extern bool adreno8_gpu8_keep;
 extern bool adreno8_reset_required;
 extern bool adreno8_gpu8_return;
+extern bool adreno8_gpu8_secure_preflight; /* boot-args adreno8_secure_preflight=1: stop kind-5 handling after the read-only preflight */
+extern bool adreno8_secure_execute;         /* production MP_ASSIGN path; stays 0 until the secure translation implementation review passes */
 bool adreno8_memory_retained(void);
 
 int

@@ -16,7 +16,8 @@ constants = "\n".join(
     line for line in header.splitlines()
     if line.startswith(("#define SMMU_", "#define PTE_", "#define SCTLR_", "#define TCR_",
                         "#define TCR2_", "#define MAIR0_", "#define FSR_", "#define SMR_", "#define STAGE_1",
-                        "#define GMU_CONTEXT", "#define SECURE_CONTEXT"))
+                        "#define GMU_CONTEXT", "#define SECURE_CONTEXT", "#define SECURE_STREAM",
+                        "#define SECURE_MATCH"))
 )
 # Replace only the privileged-platform MMIO instruction; the mapper and lifecycle run unchanged.
 driver, replaced = re.subn(
@@ -407,6 +408,46 @@ int main(void) {
     assert(regs[(0x20000 + SMMU_CB_TTBR0 + 4) / 4] >> 16 == 0);
     assert(regs[(0x22000 + SMMU_CB_TTBR0 + 4) / 4] >> 16 == 2);
     assert(regs[SMMU_SMR(2) / 4] == 0);
+
+    /* Secure preflight for the candidate route (stream 2, match 2, CB 3):
+     * every rejection is reads only, and bounds are checked before any MMIO
+     * read. A pass reports register state, nothing was written. */
+    unsigned reads_before = 0;
+    reset(&space, false);
+    assert(adreno8_secure_preflight());
+    assert(writes == 0);
+    assert(reads[(0x23000 + SMMU_CB_SCTLR) / 4] == 1);
+    assert(reads[SMMU_SMR(2) / 4] == 1 && reads[SMMU_SMR(23) / 4] == 1);
+    assert(reads[SMMU_S2CR(2) / 4] == 0);
+    reset(&space, false);
+    regs[(0x23000 + SMMU_CB_SCTLR) / 4] = 1u;
+    assert(!adreno8_secure_preflight() && writes == 0);
+    reset(&space, false);
+    regs[SMMU_SMR(2) / 4] = 0x80000002;
+    regs[SMMU_S2CR(2) / 4] = 3u;
+    assert(!adreno8_secure_preflight() && writes == 0);
+    assert(reads[SMMU_S2CR(2) / 4] == 1);
+    reset(&space, false);
+    regs[SMMU_SMR(5) / 4] = 0x80000002;
+    regs[SMMU_S2CR(5) / 4] = 0x20003u;
+    assert(!adreno8_secure_preflight() && writes == 0);
+    reset(&space, false);
+    regs[SMMU_SMR(5) / 4] = 0x80000004;
+    regs[SMMU_S2CR(5) / 4] = 3u;
+    assert(!adreno8_secure_preflight() && writes == 0);
+    reset(&space, false);
+    regs[SMMU_SMR(5) / 4] = 0x80000004;
+    regs[SMMU_S2CR(5) / 4] = 0x20004u;
+    assert(adreno8_secure_preflight() && writes == 0);
+    /* Candidate slot beyond the SMR count: rejected with no MMIO read at all. */
+    reset(&space, false);
+    regs[SMMU_IDR0 / 4] = 0x4c017e02;
+    assert(adreno8_step_smmu_read());
+    for (unsigned i = 0; i < sizeof(reads) / sizeof(reads[0]); i++) reads_before += reads[i];
+    assert(!adreno8_secure_preflight() && writes == 0);
+    unsigned reads_after = 0;
+    for (unsigned i = 0; i < sizeof(reads) / sizeof(reads[0]); i++) reads_after += reads[i];
+    assert(reads_after == reads_before);
     release_all();
     puts("SMMU mapping, register writes, ATOS capability and failure cleanup: PASS");
 }

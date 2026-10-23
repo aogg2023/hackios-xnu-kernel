@@ -33,6 +33,9 @@
  * adreno8_fine=1      also pause before individual accesses in that step
  * adreno8_watch=S     inspect GMU status for S seconds after step 11 or later (default 20)
  * adreno8_keep=1      retain resources; stage 15 requires a cold reset before memory reuse
+ * adreno8_secure_preflight=1  stage-14 experiment mode: answer kind 5 with the read-only SMMU
+ *                  preflight only; the start stops without MP_ASSIGN, without a MEM_ALLOC
+ *                  reply and without further HFI message processing
  * adreno8_speed=N     GX operating point; only 1 (125 MHz) is exposed before SKU selection
  * adreno8_gmuclk=1    select the GPU PLL clock parent; default uses the crystal
  * adreno8_return=1    return to the resident loader after cleanup
@@ -218,6 +221,7 @@ adreno8_wait_for(struct adreno8_block *b, uint32_t offset, uint32_t mask, uint32
 /* ---- leaving --------------------------------------------------------------------------------------------- */
 
 bool adreno8_gpu8_keep, adreno8_gpu8_return;
+bool adreno8_gpu8_secure_preflight;
 bool adreno8_reset_required;
 
 /* Stop GMU access before releasing mapped memory; restore CX configuration if changed. */
@@ -334,6 +338,8 @@ adreno8_init(void)
 	adreno8_gpu8_keep = PE_parse_boot_argn("adreno8_keep", &one, sizeof(one)) && one != 0;
 	one = 0;
 	adreno8_gpu8_return = PE_parse_boot_argn("adreno8_return", &one, sizeof(one)) && one != 0;
+	one = 0;
+	adreno8_gpu8_secure_preflight = PE_parse_boot_argn("adreno8_secure_preflight", &one, sizeof(one)) && one != 0;
 	one = 0;
 	adreno8_fine = PE_parse_boot_argn("adreno8_fine", &one, sizeof(one)) && one != 0;
 	PE_parse_boot_argn("adreno8_skip", &adreno8_skip_steps, sizeof(adreno8_skip_steps));

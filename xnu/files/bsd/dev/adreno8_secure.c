@@ -148,7 +148,7 @@ adreno8_secure_data(const struct adreno8_memory *buffer)
 	uint64_t bytes = ((uint64_t)buffer->size + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
 	unsigned filled = 0;
 
-	if (buffer->memory == 0 || !adreno8_assign_open()) {
+	if (buffer->memory == 0 || !adreno8_secure_preflight() || !adreno8_assign_open()) {
 		return false;
 	}
 	for (uint64_t at = 0; at < bytes; ) {
@@ -200,7 +200,7 @@ adreno8_secure_page_tables(struct adreno8_gpu_space *space)
 	struct assign_region batch[ASSIGN_SECTIONS];
 	unsigned filled = 0;
 
-	if (!adreno8_assign_open()) {
+	if (!adreno8_secure_preflight() || !adreno8_assign_open()) {
 		return false;
 	}
 	for (unsigned i = space->secure_tables; i < space->table_count; i++) {

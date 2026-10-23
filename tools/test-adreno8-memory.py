@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 fixture = runpy.run_path(str(ROOT / "tools/test-adreno8-smmu.py"))
 stub = fixture["stub"].replace("assert(size == 4096);", "assert(size != 0);")
 stub = stub.replace("static int adreno8_say", r'''
+static bool adreno8_gpu8_secure_preflight;
 static unsigned scm_calls, scm_sleeps, scm_fail_at = 999999u;
 int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
     uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *answer) {
@@ -52,6 +53,22 @@ int main(int argc, char **argv) {
         .kind = 1, .handle = 42, .size = 8193, .align = (12 << 8) | 16,
     };
     reset_memory();
+    if (argc > 1 && strcmp(argv[1], "gated") == 0) {
+        /* The production kind-5 request stops after the read-only preflight:
+         * no MP_ASSIGN, no retained range, no table work; the non-secure
+         * allocation path keeps working right afterwards. */
+        request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 11,
+            .size = 0x138000, .align = (12 << 8) | 16};
+        adreno8_gpu8_secure_preflight = true;
+        assert(!adreno8_hwsched_alloc(&request, &result));
+        assert(scm_calls == 0 && !adreno8_memory_failed && !adreno8_memory_retained());
+        assert(adreno8_memory_count == 0 && adreno8_secure_space.table_count == 0);
+        request.kind = 4;
+        request.flags = 0x007;
+        assert(adreno8_hwsched_alloc(&request, &again) && !again.secure);
+        puts("secure handover gated: no MP_ASSIGN, non-secure path intact: PASS");
+        return 0;
+    }
     if (argc > 1 && strcmp(argv[1], "secure-fail") == 0) {
         /* Real MP_ASSIGN path failing on the last data batch after earlier
          * batches succeeded: ownership is unclear, every page is retained, and
@@ -60,6 +77,7 @@ int main(int argc, char **argv) {
             .size = 0x138000, .align = (12 << 8) | 16};
         scm_fail_at = 1 + (request.size + PAGE_SIZE * ASSIGN_SECTIONS - 1) /
             (PAGE_SIZE * ASSIGN_SECTIONS);
+        adreno8_secure_execute = true;
         assert(!adreno8_hwsched_alloc(&request, &result));
         assert(scm_calls == scm_fail_at && adreno8_secure_lost());
         assert(adreno8_memory_failed && adreno8_memory_retained());
@@ -118,6 +136,7 @@ int main(int argc, char **argv) {
     reset_memory();
     request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 9,
         .size = 0x138000, .align = (12 << 8) | 16};
+    adreno8_secure_execute = true;
     assert(adreno8_hwsched_alloc(&request, &result));
     assert(result.secure && result.gpu_address != 0 && result.gmu_address == 0);
     assert(result.size == 0x138000);
@@ -239,6 +258,6 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
         subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}",
                         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                         str(target / "check.c"), "-o", str(binary)], check=True)
-        for mode in ((), ("secure-fail",)):
+        for mode in ((), ("secure-fail",), ("gated",)):
             subprocess.run([str(binary), *mode], check=True)
         print(f"XNU PAGE_SIZE={page_size}: PASS")

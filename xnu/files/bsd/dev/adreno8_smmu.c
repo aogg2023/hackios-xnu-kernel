@@ -391,6 +391,8 @@ adreno8_space_verify(struct adreno8_gpu_space *space, bool atos)
 static bool
 adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32_t match)
 {
+	uint32_t sctlr;
+
 	/*
 	 * Occupancy pre-check: reads only; the SMR/S2CR/context-bank registers
 	 * carry no read side effects (vendor arm-smmu.c:239,688 read context
@@ -399,13 +401,12 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
 	 * readable here and stays unconfirmed until a device run. TTBR and
 	 * stream routing are written later by adreno8_space_on, never here.
 	 */
-	uint32_t sctlr = adreno8_get(&adreno8_smmu, "cb free",
-	    (adreno8_smmu_pages + space->context) * adreno8_smmu_page + SMMU_CB_SCTLR);
-
 	if (space->context >= adreno8_smmu_contexts || match >= adreno8_smmu_matches || stream > 0x7fff ||
 	    (adreno8_smmu_pages + space->context + 1) * adreno8_smmu_page > adreno8_smmu.size) {
 		return false;
 	}
+	sctlr = adreno8_get(&adreno8_smmu, "cb free",
+	    (adreno8_smmu_pages + space->context) * adreno8_smmu_page + SMMU_CB_SCTLR);
 	if (sctlr != 0) {
 		printf("adreno8: %u: context %u already enabled: sctlr %#x\n", adreno8_step, space->context, sctlr);
 		return false;
@@ -430,6 +431,32 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
 			return false;
 		}
 	}
+	return true;
+}
+
+/*
+ * Read-only secure preflight, run before every secure page-table or data
+ * MP_ASSIGN. The candidate route is stream 2, match 2, context 3 (vendor
+ * sun-gpu.dtsi gfx3d_secure). Bounds are checked before any MMIO read, and
+ * the scan only touches the SMR/S2CR and context-bank registers the boot
+ * probe already reads. A pass means HLOS-side registers show context 3 and
+ * the candidate slot free of routing; it does not confirm what the secure
+ * world has reserved, and it never writes.
+ */
+bool
+adreno8_secure_preflight(void)
+{
+	if (SECURE_CONTEXT >= adreno8_smmu_contexts || SECURE_MATCH >= adreno8_smmu_matches ||
+	    SECURE_STREAM > 0x7fff ||
+	    (adreno8_smmu_pages + SECURE_CONTEXT + 1) * adreno8_smmu_page > adreno8_smmu.size) {
+		printf("adreno8: %u: secure candidate route falls outside the probed SMMU ranges\n", adreno8_step);
+		return false;
+	}
+	if (!adreno8_space_available(&adreno8_secure_space, SECURE_STREAM, SECURE_MATCH)) {
+		return false;
+	}
+	printf("adreno8: %u: secure preflight: stream %u match %u context %u carries no HLOS-side routing\n",
+	    adreno8_step, SECURE_STREAM, SECURE_MATCH, SECURE_CONTEXT);
 	return true;
 }
 

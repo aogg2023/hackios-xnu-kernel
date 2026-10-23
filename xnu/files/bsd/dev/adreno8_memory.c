@@ -23,6 +23,10 @@ static uint32_t adreno8_memory_count;
 static uint64_t adreno8_memory_bytes;
 static bool adreno8_memory_failed;
 
+/* The full handover-and-reply path needs a device-verified secure translation
+ * before it may run; host tests raise this flag to exercise the code path. */
+bool adreno8_secure_execute;
+
 bool
 adreno8_memory_retained(void)
 {
@@ -93,18 +97,29 @@ adreno8_memory_alloc(const char *name, uint32_t size, uint32_t alignment,
 }
 
 /* kind 5 (CSW_PRIV_SECURE) buffers: the pages go to VMID CP_PIXEL through MP_ASSIGN.
- * Vendor kgsl_iommu.c keeps secure buffers in a separate secure pagetable, so the
- * default GPU space needs no live mapping here; we keep a placeholder mapping only
- * to reserve the address from the single VA allocator. While CP_PIXEL owns the
- * pages the secure world refuses SID0 access; that refusal is a translation-time
- * behavior only a device run can observe, and host tests cover just the driver
- * side, which never touches these pages through either mapping. The CPU must not
- * read or write the pages after MP_ASSIGN, and no code path may treat an SID0
- * access as a probe for recovered ownership. Secure context 3 (TTBR, SCTLR and
- * stream routing through adreno8_space_on) is initialized later, when a secure
- * queue needs it; this allocation stage has no context-3 consumer, and page-table
- * pages carry {HLOS read/write, CP_PIXEL read} so the walker can still read tables
- * the secure world owns. */
+ * Vendor review established the ordering invariant: the secure context attach,
+ * its stream routing and the secure pagetable mapping are in place before the
+ * firmware receives the kind-5 reply. HLOS has never attached the candidate
+ * secure context, so replying from the current single-VA placeholder mapping
+ * would hand CP_PIXEL pages with no vendor-backed secure translation behind
+ * them. Until the secure translation implementation review passes,
+ * adreno8_secure_execute stays 0: kind-5 handling stops after the read-only
+ * adreno8_secure_preflight, with no MP_ASSIGN, no MEM_ALLOC reply and no
+ * further START processing. The boot probe and the preflight only read
+ * registers; the kind-5 request itself can make the firmware touch secure
+ * buffers, which is why the unverified path must not answer it.
+ * Vendor kgsl_iommu.c keeps secure buffers in a separate secure pagetable, so
+ * the default GPU space needs no live mapping here; we keep a placeholder
+ * mapping only to reserve the address from the single VA allocator. While
+ * CP_PIXEL owns the pages the secure world refuses SID0 access; that refusal
+ * is a translation-time behavior only a device run can observe, and host tests
+ * cover just the driver side, which never touches these pages through either
+ * mapping. The CPU must not read or write the pages after MP_ASSIGN, and no
+ * code path may treat an SID0 access as a probe for recovered ownership.
+ * Secure context 3 (TTBR, SCTLR and stream routing through adreno8_space_on)
+ * is initialized when the secure path executes; page-table pages carry {HLOS
+ * read/write, CP_PIXEL read} so the walker can still read tables the secure
+ * world owns. */
 static struct adreno8_memory *
 adreno8_memory_alloc_secure(const char *name, uint32_t size, uint32_t alignment, uint32_t gpu_prot)
 {
@@ -118,6 +133,21 @@ adreno8_memory_alloc_secure(const char *name, uint32_t size, uint32_t alignment,
 	    alignment < MEMORY_GRANULE || (alignment & (alignment - 1)) ||
 	    !(gpu_prot & ADRENO8_MEM_READ) || (gpu_prot & ~15u) ||
 	    allocated > MEMORY_TOTAL_LIMIT - adreno8_memory_bytes) {
+		return NULL;
+	}
+	/* Read-only occupancy check of the candidate secure route, run before
+	 * anything is staged for MP_ASSIGN; it writes no registers and issues
+	 * no SCM call. A rejection is a stop before the first handover, so it
+	 * leaves memory_failed alone and cannot mark pages uncertain. */
+	if (!adreno8_secure_preflight()) {
+		return NULL;
+	}
+	if (!adreno8_secure_execute) {
+		if (adreno8_gpu8_secure_preflight) {
+			printf("adreno8: secure preflight-only mode: START stops here without MP_ASSIGN or MEM_ALLOC reply\n");
+		} else {
+			printf("adreno8: secure handover gated: the MP_ASSIGN and MEM_ALLOC reply path awaits the secure translation implementation review\n");
+		}
 		return NULL;
 	}
 	if (adreno8_gpu_space.table_count == 0 &&

@@ -116,6 +116,28 @@ int main(int argc, char **argv) {
     bool answer_mode = argc > 1 && strcmp(argv[1], "answer") == 0;
     bool waitq_mode = argc > 1 && strcmp(argv[1], "waitq") == 0;
 
+    /* The production preflight reads the SMMU layout; seed the same register
+     * picture the boot probe sees so the handover paths can run. */
+    regs[SMMU_IDR0 / 4] = 0x4c017e18;
+    regs[SMMU_IDR1 / 4] = 0x40000015;
+    regs[SMMU_IDR2 / 4] = 0x5511;
+    regs[SMMU_SCR0 / 4] = 0x2e0406;
+    assert(adreno8_step_smmu_read());
+
+    if (argc > 1 && strcmp(argv[1], "preflight") == 0) {
+        /* An occupied candidate context bank stops both handover entries
+         * before staging, SCM calls or the uncertain-ownership flag. */
+        script(0, 0);
+        regs[(0x23000 + SMMU_CB_SCTLR) / 4] = 1u;
+        buffer = make_buffer(1);
+        assert(!adreno8_secure_data(&buffer));
+        struct adreno8_gpu_space space = { .name = "secure", .context = SECURE_CONTEXT };
+        assert(adreno8_space_new_table(&space, 0, 0));
+        assert(!adreno8_secure_page_tables(&space));
+        assert(call_count == 0 && !adreno8_secure_lost());
+        puts("secure preflight rejection stops handover before any SCM call: PASS");
+        return 0;
+    }
     if (answer_mode) {
         script(0, 5);
         buffer = make_buffer(1);
@@ -237,6 +259,6 @@ if __name__ == "__main__":
             binary = target / f"check-{page_size}"
             subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}", "-fsanitize=address,undefined",
                             "-fno-omit-frame-pointer", str(target / "check.c"), "-o", str(binary)], check=True)
-            for mode in ((), ("answer",), ("waitq",), ("poison", "pre"), ("poison", "boundary")):
+            for mode in ((), ("answer",), ("waitq",), ("preflight",), ("poison", "pre"), ("poison", "boundary")):
                 subprocess.run([str(binary), *mode], check=True)
             print(f"XNU PAGE_SIZE={page_size}: PASS")

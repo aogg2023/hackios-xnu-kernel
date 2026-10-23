@@ -18,4 +18,13 @@ bool adreno8_secure_page_tables(struct adreno8_gpu_space *space);
  * they are and no further secure assignment runs until a cold reset. */
 bool adreno8_secure_lost(void);
 
+/* Read-only occupancy preflight for the candidate secure route (stream 2,
+ * match 2, context 3; implemented in adreno8_smmu.c). Both handover entry
+ * points call it before staging anything; a false result rejects the handover
+ * without writing registers or issuing SCM calls and leaves the uncertain
+ * ownership flag alone, because nothing was transferred. A pass reports
+ * HLOS-side register state only: the secure world's own reservations stay
+ * invisible and translation behavior needs a device run. */
+bool adreno8_secure_preflight(void);
+
 #endif

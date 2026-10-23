@@ -209,8 +209,14 @@ int main(void) {
     assert(captured[7][4] == 0x1007 && captured[7][5] == 5 && captured[7][9] == 0x138000);
     reset(SECURE_MEM); result_fault = 11;
     assert(!adreno8_hwsched_start() && adreno8_reset_required && resource_replies == 0);
+    /* The secure request through the real HFI loop: a failed resource handler
+     * answers with nothing (7 pre-START messages, 0 replies), runs the
+     * postmortem once, and a repeated start attempt sends nothing new. */
+    assert(sent_count == 7 && failure_snapshots == 1);
     reset(SECURE_MEM); allocation_ok = false;
     assert(!adreno8_hwsched_start() && adreno8_reset_required && resource_replies == 0);
+    assert(sent_count == 7 && failure_snapshots == 1);
+    assert(!adreno8_hwsched_start() && sent_count == 7 && failure_snapshots == 1);
     for (unsigned i = 1; i <= 7; i++) {
         reset(NORMAL); fail_at = i;
         assert(!adreno8_hwsched_start() && !adreno8_hwsched_ready());

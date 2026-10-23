@@ -98,6 +98,7 @@ adreno8_step_smmu_read(void)
 
 struct adreno8_gpu_space adreno8_gmu_space = { "gmu", GMU_CONTEXT };
 struct adreno8_gpu_space adreno8_gpu_space = { "gpu", 0 };
+struct adreno8_gpu_space adreno8_secure_space = { "secure", SECURE_CONTEXT };
 
 static bool adreno8_space_sync(struct adreno8_gpu_space *space);
 

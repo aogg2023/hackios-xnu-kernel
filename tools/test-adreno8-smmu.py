@@ -15,7 +15,8 @@ structures = "\n".join(
 constants = "\n".join(
     line for line in header.splitlines()
     if line.startswith(("#define SMMU_", "#define PTE_", "#define SCTLR_", "#define TCR_",
-                        "#define TCR2_", "#define MAIR0_", "#define FSR_", "#define SMR_", "#define STAGE_1", "#define GMU_CONTEXT"))
+                        "#define TCR2_", "#define MAIR0_", "#define FSR_", "#define SMR_", "#define STAGE_1",
+                        "#define GMU_CONTEXT", "#define SECURE_CONTEXT"))
 )
 # Replace only the privileged-platform MMIO instruction; the mapper and lifecycle run unchanged.
 driver, replaced = re.subn(

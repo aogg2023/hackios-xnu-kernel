@@ -9,6 +9,23 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 fixture = runpy.run_path(str(ROOT / "tools/test-adreno8-smmu.py"))
 stub = fixture["stub"].replace("assert(size == 4096);", "assert(size != 0);")
+stub = stub.replace("static int adreno8_say", r'''
+static bool adreno8_secure_fail;
+static unsigned secure_pt_calls, secure_data_calls;
+struct adreno8_memory;
+bool adreno8_secure_lost(void) { return false; }
+bool adreno8_secure_page_tables(struct adreno8_gpu_space *space) {
+    secure_pt_calls++;
+    if (adreno8_secure_fail) return false;
+    space->secure_tables = space->table_count;
+    return true;
+}
+bool adreno8_secure_data(const struct adreno8_memory *buffer) {
+    (void)buffer;
+    secure_data_calls++;
+    return !adreno8_secure_fail;
+}
+static int adreno8_say''', 1)
 driver = (ROOT / "xnu/files/bsd/dev/adreno8_memory.c").read_text()
 driver, replaced = re.subn(
     r'static void\nadreno8_memory_invalidate\(.*?\n}',
@@ -22,6 +39,11 @@ static void reset_memory(void) {
     reset(&adreno8_gmu_space, false);
     memset(&adreno8_gpu_space, 0, sizeof(adreno8_gpu_space));
     adreno8_gpu_space.name = "gpu";
+    memset(&adreno8_secure_space, 0, sizeof(adreno8_secure_space));
+    adreno8_secure_space.name = "secure";
+    adreno8_secure_space.context = SECURE_CONTEXT;
+    adreno8_secure_fail = false;
+    secure_pt_calls = secure_data_calls = 0;
     memset(adreno8_memory_entries, 0, sizeof(adreno8_memory_entries));
     adreno8_memory_count = 0;
     adreno8_memory_bytes = 0;
@@ -79,6 +101,50 @@ int main(void) {
     assert(!adreno8_memory_acquire(shared, UINT32_MAX, 4096) && invalidations == 1);
     regs[(0x20000 + SMMU_CB_FSR) / 4] = 8;
     assert(adreno8_gpu_faulted());
+
+    reset_memory();
+    request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 9,
+        .size = 0x138000, .align = (12 << 8) | 16};
+    assert(adreno8_hwsched_alloc(&request, &result));
+    assert(result.secure && result.gpu_address != 0 && result.gmu_address == 0);
+    assert(result.size == 0x138000);
+    assert(secure_pt_calls == 1 && secure_data_calls == 1);
+    assert(!adreno8_secure_space.is_on &&
+           adreno8_secure_space.secure_tables == adreno8_secure_space.table_count);
+    struct adreno8_memory *secure = &adreno8_memory_entries[0].buffer;
+    assert(adreno8_memory_entries[0].secure);
+    for (unsigned offset = 0; offset < result.size; offset += 4096) {
+        assert(walk(adreno8_secure_space.tables[0].phys, result.gpu_address + offset) ==
+               walk(adreno8_gpu_space.tables[0].phys, result.gpu_address + offset));
+        assert(walk(adreno8_secure_space.tables[0].phys, result.gpu_address + offset) ==
+               kvtophys(secure->memory + offset));
+    }
+    assert(!adreno8_memory_publish(secure, 0, 4096));
+    assert(!adreno8_memory_acquire(secure, 0, 4096));
+    assert(adreno8_hwsched_alloc(&request, &again));
+    assert(again.secure && again.gpu_address == result.gpu_address);
+    assert(secure_data_calls == 1 && allocation_count > 0);
+    request.handle = 10;
+    request.flags = 0x007;
+    assert(!adreno8_hwsched_alloc(&request, &again));
+    request.flags = 0x100f;
+    assert(!adreno8_hwsched_alloc(&request, &again));
+    request.kind = 4;
+    request.flags = 0x1007;
+    assert(!adreno8_hwsched_alloc(&request, &again));
+    request.flags = 0x007;
+    assert(adreno8_hwsched_alloc(&request, &again));
+    assert(!again.secure);
+
+    reset_memory();
+    adreno8_secure_fail = true;
+    request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 7,
+        .size = 8192, .align = 12};
+    assert(!adreno8_hwsched_alloc(&request, &result));
+    assert(adreno8_memory_failed && adreno8_memory_retained());
+    assert(!adreno8_memory_entries[0].complete);
+    request = (struct adreno8_hfi_mem_request){.flags = ADRENO8_HFI_MEM_GMU, .size = 4096};
+    assert(!adreno8_hwsched_alloc(&request, &result));
 
     reset_memory();
     request = (struct adreno8_hfi_mem_request){.flags = ADRENO8_HFI_MEM_GMU |
@@ -154,7 +220,7 @@ int main(void) {
 with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
     target = Path(directory)
     (target / "adreno8_private.h").write_text(stub)
-    for name in ("adreno8_memory_private.h", "adreno8_hwsched_private.h"):
+    for name in ("adreno8_memory_private.h", "adreno8_hwsched_private.h", "adreno8_secure_private.h"):
         (target / name).write_text((ROOT / "xnu/files/bsd/dev" / name).read_text())
     (target / "adreno8_smmu.c").write_text(fixture["driver"])
     (target / "adreno8_memory.c").write_text(driver)

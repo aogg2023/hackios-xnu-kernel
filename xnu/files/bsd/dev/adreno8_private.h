@@ -81,6 +81,7 @@ struct adreno8_gpu_space {
 	uint32_t context;
 	struct adreno8_space_table tables[1024];
 	unsigned table_count;
+	unsigned secure_tables;           /* pages already assigned to {HLOS read/write, CP_PIXEL read} */
 	bool is_on;
 };
 
@@ -216,6 +217,7 @@ struct adreno8_gpu_space {
 #define GMU_STREAM              5
 #define GMU_MATCH               1
 #define GMU_CONTEXT             2              /* vendor reserves contexts 0 and 1 for GPU SID 0/1 */
+#define SECURE_CONTEXT          3              /* candidate for the gfx3d_secure SID; occupancy is verified by adreno8_space_on */
 #define BCM_TCS_CMD(commit, valid, vote_x, vote_y) \
 	(((commit) ? 1u << 30 : 0u) | ((valid) ? 1u << 29 : 0u) | (((vote_x) & 0x3fffu) << 14) | ((vote_y) & 0x3fffu))
 #define BCM_COUNT               3                   /* the rows in adreno8_bcms: SH0, MC0, ACV */
@@ -261,6 +263,7 @@ extern vm_offset_t adreno8_log_view[4];
 extern vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd, adreno8_hfi_view_resp;
 extern vm_offset_t adreno8_hfi_view_debug;
 extern struct adreno8_gpu_space adreno8_gmu_space;
+extern struct adreno8_gpu_space adreno8_secure_space;
 extern bool adreno8_gpu8_keep;
 extern bool adreno8_reset_required;
 extern bool adreno8_gpu8_return;

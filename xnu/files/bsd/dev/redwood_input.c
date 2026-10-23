@@ -79,8 +79,14 @@ redwood_soc_is_sm8750(void)
 
 	if (number == 0xffffffffu) {
 		vm_offset_t tcsr = ml_io_map(TCSR_PHYS, 0x1000);
+		uint32_t raw = tcsr != 0 ? *(volatile uint32_t *)tcsr : 0u;
 
-		number = tcsr != 0 ? *(volatile uint32_t *)tcsr & 0xffffu : 0u;
+		/* the reading itself, once, whatever it says: the device round is to
+		 * show 618 here on the K90, 360 on the redwood and a window's own
+		 * nonsense in QEMU -- review F02, and until some real hardware has
+		 * been seen to answer, that is all this fuse rests on */
+		printf("redwood: TCSR0 @0x1fc0000 reads 0x%08x\n", raw);
+		number = raw & 0xffffu;
 	}
 	return number == SM8750_SOC_NUMBER;
 }

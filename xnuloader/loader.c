@@ -159,6 +159,8 @@ str_len(const char *s)
 	return n;
 }
 
+/* LC-STR-BEGIN -- extracted verbatim by tools/test-loader-buildid.py: the comparison every
+ * getvar answer uses */
 static int
 str_eq(const char *a, const char *b)
 {
@@ -167,6 +169,7 @@ str_eq(const char *a, const char *b)
 	}
 	return *a == *b;
 }
+/* LC-STR-END */
 
 /*
  * Set once the loader takes commands over USB: its log travels that way, and
@@ -4260,6 +4263,37 @@ fb_reply_data(uint64_t len)
 }
 /* LC-FB-END */
 
+/* LC-BID-BEGIN -- extracted verbatim by tools/test-loader-buildid.py: what the image says it
+ * is. LOADER_BUILD_ID names the source commit the build was made from: build.sh passes a full
+ * 40-hex BUILD_ID in from outside the source, the build manifest pairs that value with the
+ * artifact hash recorded after the link. The artifact hash stays out of the image: a file that
+ * contains its own hash changes that hash by being written. The identifier supports what the
+ * image claims to be; the manifest and the load record are what back what actually ran, and
+ * neither is a cryptographic proof of the running code. An unset value reports "unknown" as
+ * it is, and build.sh warns at the build that produced it. */
+#ifndef LOADER_BUILD_ID
+#define LOADER_BUILD_ID "unknown"   /* no build-time id was given: the answer says so */
+#endif
+
+/* the three identity variables of "fastboot getvar", answered through fb_reply: 1 when this
+ * var was one of them; the reply packer fits 63 characters with the code, so a 40-hex
+ * identifier sits well inside the limit */
+static int
+fb_getvar_identity(const char *var)
+{
+	if (str_eq(var, "product")) {
+		fb_reply("OKAY", "xnuloader");
+	} else if (str_eq(var, "version")) {
+		fb_reply("OKAY", "0.5");
+	} else if (str_eq(var, "build-id")) {
+		fb_reply("OKAY", LOADER_BUILD_ID);
+	} else {
+		return 0;
+	}
+	return 1;
+}
+/* LC-BID-END */
+
 static int
 starts_with(const char *s, const char *prefix)
 {
@@ -4302,10 +4336,7 @@ fb_command(char *cmd)
 			}
 		} else if (starts_with(cmd, "getvar:")) {
 			const char *var = cmd + 7;
-			if (str_eq(var, "product")) {
-				fb_reply("OKAY", "xnuloader");
-			} else if (str_eq(var, "version")) {
-				fb_reply("OKAY", "0.5");
+			if (fb_getvar_identity(var)) {   /* product, version and build-id answer from one block */
 			} else if (str_eq(var, "max-download-size")) {
 				fb_reply("OKAY", download_to_ramdisk ? "0xffffffff" : "0x03f00000");
 			} else if (str_eq(var, "result")) {

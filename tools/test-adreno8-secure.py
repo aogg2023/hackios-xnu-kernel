@@ -329,10 +329,17 @@ if __name__ == "__main__":
                     # single-page regions, ceil(regions / 32) data calls plus one
                     # table call over the three pages.
                     want = ("70 pages merge into 70 data regions plus 3 table pages, "
-                            "4 MP_ASSIGN calls")
+                            "4 logical MP_ASSIGN batches")
                     assert want in result.stdout, (want, result.stdout)
-                    assert "secure handover complete: 70 pages owned by CP_PIXEL" in result.stdout
+                    assert ("secure handover complete: 70 pages owned by CP_PIXEL "
+                            "after 4 MP_ASSIGN attempts") in result.stdout
                     assert "no MEM_ALLOC reply" in result.stdout
+                if mode == ("ebusy",):
+                    # The log tells logical batches apart from real SCM attempts:
+                    # the EBUSY retry makes three attempts for two batches.
+                    assert "2 logical MP_ASSIGN batches" in result.stdout
+                    assert ("secure handover complete: 3 pages owned by CP_PIXEL "
+                            "after 3 MP_ASSIGN attempts") in result.stdout
                 if mode == ("argfail",) or mode == ("poison",):
                     assert "ends before any MP_ASSIGN; no page transferred" in result.stdout
                     assert "secure handover attempted" not in result.stdout

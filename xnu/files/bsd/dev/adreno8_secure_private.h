@@ -8,10 +8,10 @@
 bool adreno8_secure_lost(void);
 
 /* Read-only occupancy preflight for the candidate secure route (stream 2,
- * match 2, context 3; implemented in adreno8_smmu.c). Both handover entry
- * points call it before staging anything; a false result rejects the handover
- * without writing registers or issuing SCM calls and leaves the uncertain
- * ownership flag alone, because nothing was transferred. A pass reports
+ * match 2, context 3; implemented in adreno8_smmu.c). The handover entry calls
+ * it before staging anything; a false result rejects the handover without
+ * writing registers or issuing SCM calls and leaves the uncertain ownership
+ * flag alone, because nothing was transferred. A pass reports
  * HLOS-side register state only: the secure world's own reservations stay
  * invisible and translation behavior needs a device run. */
 bool adreno8_secure_preflight(void);
@@ -29,7 +29,8 @@ uint32_t adreno8_secure_xfer_state(void);
 /* Close the experiment before any MP_ASSIGN goes out (no usable data page, no
  * argument page, or the driver could not stage the batch). Nothing transferred,
  * so no page is marked lost; the terminal state still ends the secure path for
- * the rest of the boot. */
+ * the rest of the boot. The call is inert once an attempt went out: after the
+ * first MP_ASSIGN only the transfer result may close the state. */
 void adreno8_secure_xfer_abort(void);
 
 /* One isolated handover of the kernel's own kind-5 buffer: assign this space's

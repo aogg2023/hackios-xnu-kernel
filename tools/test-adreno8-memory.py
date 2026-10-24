@@ -315,7 +315,7 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
                 # single-page regions, one table call, ceil(pages / 32) data calls.
                 pages = 0x138000 // page_size
                 want = (f"{pages} pages merge into {pages} data regions plus 3 table pages, "
-                        f"{(pages + 31) // 32 + 1} MP_ASSIGN calls")
+                        f"{(pages + 31) // 32 + 1} logical MP_ASSIGN batches")
                 assert want in result.stdout, (want, result.stdout)
                 assert "secure handover complete" in result.stdout
                 assert "no MEM_ALLOC reply is built" in result.stdout

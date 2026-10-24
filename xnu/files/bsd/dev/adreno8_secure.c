@@ -36,10 +36,17 @@ struct assign_perm {
 #define ASSIGN_EXTENDED     640u       /* four little-endian argument words */
 #define ASSIGN_USED         (ASSIGN_EXTENDED + 4 * sizeof(uint64_t))
 
+/* The layout above is the TrustZone-side ABI: record sizes come from the
+ * vendor wire format and every byte must stay inside the one argument page. */
+_Static_assert(sizeof(struct assign_region) == 16, "MP_ASSIGN region record must be 16 bytes");
+_Static_assert(sizeof(struct assign_perm) == 24, "MP_ASSIGN permission record must be 24 bytes");
+_Static_assert(ASSIGN_USED <= PAGE_SIZE, "MP_ASSIGN argument layout must fit one page");
+
 static struct {
 	vm_offset_t page;
 	uint64_t page_phys;
 	bool lost;
+	unsigned attempts;               /* SCM calls actually made, retries included */
 } adreno8_assign;
 
 bool
@@ -105,6 +112,7 @@ adreno8_assign_call(uint64_t regions_bytes, uint64_t perms_bytes)
 	 * cancels the TrustZone call; a host timeout only bounds host waiting.
 	 */
 	for (unsigned retry = 0; retry < ASSIGN_EBUSY_RETRY; retry++) {
+		adreno8_assign.attempts++;
 		status = adreno8_scm_call(SCM_MP_ASSIGN, SCM_ASSIGN_ARGINFO, adreno8_assign.page_phys,
 		    regions_bytes, sources_phys, extended_phys, &answer);
 		if (status != ASSIGN_EBUSY) {
@@ -274,10 +282,15 @@ adreno8_secure_xfer_state(void)
 
 /* Close the experiment when the driver cannot reach the first MP_ASSIGN (no
  * usable page, no argument page). Nothing was transferred, so no page is
- * marked lost; the state still ends the secure path for this boot. */
+ * marked lost; the state still ends the secure path for this boot. Once an
+ * attempt went out the caller owns the outcome: this must not overwrite an
+ * attempted state or claim no page transferred after a real call. */
 void
 adreno8_secure_xfer_abort(void)
 {
+	if (adreno8_xfer_state != SECURE_XFER_NOT_STARTED) {
+		return;
+	}
 	adreno8_xfer_state = SECURE_XFER_TERMINAL;
 	printf("adreno8: secure handover ends before any MP_ASSIGN; no page transferred\n");
 }
@@ -307,7 +320,7 @@ adreno8_secure_xfer(struct adreno8_gpu_space *space, const struct adreno8_memory
 	adreno8_xfer_state = SECURE_XFER_ATTEMPTED;
 	batches = (regions + ASSIGN_SECTIONS - 1) / ASSIGN_SECTIONS +
 	    (space->table_count - space->secure_tables + ASSIGN_SECTIONS - 1) / ASSIGN_SECTIONS;
-	printf("adreno8: secure handover attempted: %u pages merge into %u data regions plus %u table pages, %u MP_ASSIGN calls\n",
+	printf("adreno8: secure handover attempted: %u pages merge into %u data regions plus %u table pages, %u logical MP_ASSIGN batches\n",
 	    pages, regions, space->table_count - space->secure_tables, batches);
 	if (!adreno8_assign_tables(space) || !adreno8_assign_data(buffer)) {
 		adreno8_xfer_state = SECURE_XFER_TERMINAL;
@@ -315,7 +328,7 @@ adreno8_secure_xfer(struct adreno8_gpu_space *space, const struct adreno8_memory
 	}
 	space->secure_tables = space->table_count;
 	adreno8_xfer_state = SECURE_XFER_TERMINAL;
-	printf("adreno8: secure handover complete: %u pages owned by CP_PIXEL, retained until cold reset; no MEM_ALLOC reply\n",
-	    pages);
+	printf("adreno8: secure handover complete: %u pages owned by CP_PIXEL after %u MP_ASSIGN attempts, retained until cold reset; no MEM_ALLOC reply\n",
+	    pages, adreno8_assign.attempts);
 	return true;
 }

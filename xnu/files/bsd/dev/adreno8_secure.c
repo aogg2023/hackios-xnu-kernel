@@ -230,28 +230,6 @@ adreno8_assign_tables(struct adreno8_gpu_space *space)
 	return true;
 }
 
-bool
-adreno8_secure_data(const struct adreno8_memory *buffer)
-{
-	if (buffer->memory == 0 || !adreno8_secure_preflight() || !adreno8_assign_open()) {
-		return false;
-	}
-	return adreno8_assign_data(buffer);
-}
-
-bool
-adreno8_secure_page_tables(struct adreno8_gpu_space *space)
-{
-	if (!adreno8_secure_preflight() || !adreno8_assign_open()) {
-		return false;
-	}
-	if (!adreno8_assign_tables(space)) {
-		return false;
-	}
-	space->secure_tables = space->table_count;
-	return true;
-}
-
 /* Count the data pages and merge runs into region entries without staging, so
  * an experiment can print its batch plan before any MP_ASSIGN. The counts come
  * from the real PAGE_SIZE and the merge rule adreno8_assign_data uses. */

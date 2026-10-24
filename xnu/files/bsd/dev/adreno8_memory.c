@@ -23,10 +23,6 @@ static uint32_t adreno8_memory_count;
 static uint64_t adreno8_memory_bytes;
 static bool adreno8_memory_failed;
 
-/* The full handover-and-reply path needs a device-verified secure translation
- * before it may run; host tests raise this flag to exercise the code path. */
-bool adreno8_secure_execute;
-
 bool
 adreno8_memory_retained(void)
 {
@@ -175,41 +171,32 @@ adreno8_memory_alloc_xfer(const char *name, uint32_t size, uint32_t alignment,
  * Vendor review established the ordering invariant: the secure context attach,
  * its stream routing and the secure pagetable mapping are in place before the
  * firmware receives the kind-5 reply. HLOS has never attached the candidate
- * secure context, so replying from the current single-VA placeholder mapping
- * would hand CP_PIXEL pages with no vendor-backed secure translation behind
- * them. Until the secure translation implementation review passes,
- * adreno8_secure_execute stays 0: kind-5 handling stops after the read-only
- * adreno8_secure_preflight, with no MP_ASSIGN, no MEM_ALLOC reply and no
- * further START processing. The boot probe and the preflight only read
- * registers; the kind-5 request itself can make the firmware touch secure
- * buffers, which is why the unverified path must not answer it.
- * Vendor kgsl_iommu.c keeps secure buffers in a separate secure pagetable, so
- * the default GPU space needs no live mapping here; we keep a placeholder
- * mapping only to reserve the address from the single VA allocator. While
- * CP_PIXEL owns the pages the secure world refuses SID0 access; that refusal
- * is a translation-time behavior only a device run can observe, and host tests
- * cover just the driver side, which never touches these pages through either
- * mapping. The CPU must not read or write the pages after MP_ASSIGN, and no
- * code path may treat an SID0 access as a probe for recovered ownership.
- * Secure context 3 (TTBR, SCTLR and stream routing through adreno8_space_on)
- * is initialized when the secure path executes; page-table pages carry {HLOS
- * read/write, CP_PIXEL read} so the walker can still read tables the secure
- * world owns.
- * The boot-args mode picks the behavior: 1 stops after the read-only
- * preflight, 2 runs the isolated experiment above, and both reply nothing; 0 or
- * an unknown value keeps the path closed. The state of the secure bridge after
- * the first handover is unknown: the earlier park and PSCI verification covered
- * runs without any MP_ASSIGN, and whether a cold reset recovers a first
- * handover still needs device confirmation. A single MP_ASSIGN SMC may never
- * return; the EBUSY retry bound counts retries and a host-side timeout only
- * bounds host waiting, it cancels nothing inside TrustZone. */
+ * secure context, so the full service that answers kind 5 awaits the secure
+ * translation implementation: a reply would hand CP_PIXEL pages with no
+ * vendor-backed secure translation behind them. The boot-args mode picks the
+ * supported behavior: 0 keeps the path closed, 1 stops after the read-only
+ * adreno8_secure_preflight, 2 runs the isolated one-shot handover above. None
+ * of the modes answers MEM_ALLOC, and none maps these pages into the default
+ * GPU space; vendor kgsl_iommu.c keeps secure buffers in a separate secure
+ * pagetable. The boot probe and the preflight only read registers; the kind-5
+ * request itself can make the firmware touch secure buffers, which is why an
+ * unverified path must not answer it. While CP_PIXEL owns the pages the secure
+ * world refuses SID0 access; that refusal is a translation-time behavior only
+ * a device run can observe, and host tests cover the driver side only. The CPU
+ * must not read or write the pages after MP_ASSIGN, and no code path may treat
+ * an SID0 access as a probe for recovered ownership. Secure context 3 stays
+ * disabled in the experiment; page-table pages carry {HLOS read/write,
+ * CP_PIXEL read} so the walker can still read tables the secure world owns.
+ * The state of the secure bridge after the first handover is unknown: the
+ * earlier park and PSCI verification covered runs without any MP_ASSIGN, and
+ * whether a cold reset recovers a first handover still needs device
+ * confirmation. A single MP_ASSIGN SMC may never return; the EBUSY retry bound
+ * counts retries and a host-side timeout only bounds host waiting, it cancels
+ * nothing inside TrustZone. */
 static struct adreno8_memory *
 adreno8_memory_alloc_secure(const char *name, uint32_t size, uint32_t alignment, uint32_t gpu_prot)
 {
-	struct adreno8_memory_entry *entry;
-	struct adreno8_memory *buffer;
 	uint64_t allocated = ((uint64_t)size + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
-	uint32_t gpu_address = 0;
 
 	if (adreno8_memory_failed || adreno8_memory_count == MEMORY_COUNT || name == NULL ||
 	    size == 0 || (size & (MEMORY_GRANULE - 1)) || size > MEMORY_BLOCK_LIMIT ||
@@ -225,67 +212,17 @@ adreno8_memory_alloc_secure(const char *name, uint32_t size, uint32_t alignment,
 	if (!adreno8_secure_preflight()) {
 		return NULL;
 	}
-	if (!adreno8_secure_execute) {
-		/* The device never raises adreno8_secure_execute, so the full
-		 * handover-and-reply path below stays host-test only. Experiment
-		 * mode runs one isolated handover inside this gate; the full
-		 * path's address publication and CB0 mapping never run there. */
-		if (adreno8_gpu8_secure_mode == SECURE_MODE_HANDOVER) {
-			return adreno8_memory_alloc_xfer(name, size, alignment, gpu_prot, allocated);
-		}
-		if (adreno8_gpu8_secure_mode == SECURE_MODE_PREFLIGHT) {
-			printf("adreno8: secure preflight-only mode: START stops here without MP_ASSIGN or MEM_ALLOC reply\n");
-		} else {
-			printf("adreno8: secure handover gated: the MP_ASSIGN and MEM_ALLOC reply path awaits the secure translation implementation review\n");
-		}
-		return NULL;
+	switch (adreno8_gpu8_secure_mode) {
+	case SECURE_MODE_HANDOVER:
+		return adreno8_memory_alloc_xfer(name, size, alignment, gpu_prot, allocated);
+	case SECURE_MODE_PREFLIGHT:
+		printf("adreno8: secure preflight-only mode: START stops here without MP_ASSIGN or MEM_ALLOC reply\n");
+		break;
+	default:
+		printf("adreno8: secure handover off: the MP_ASSIGN and MEM_ALLOC reply service awaits the secure translation implementation\n");
+		break;
 	}
-	if (adreno8_gpu_space.table_count == 0 &&
-	    adreno8_space_new_table(&adreno8_gpu_space, 0, 0) == 0) {
-		return NULL;
-	}
-	if (adreno8_secure_space.table_count == 0 &&
-	    adreno8_space_new_table(&adreno8_secure_space, 0, 0) == 0) {
-		return NULL;
-	}
-	/* The default GPU space is the single VA allocator; every range free there
-	 * is free in the secure space too, because secure buffers are placeholder
-	 * mapped in both. */
-	if (!adreno8_space_find_range(&adreno8_gpu_space, GPU_IOVA_START, GPU_IOVA_END,
-	    size, alignment, &gpu_address)) {
-		return NULL;
-	}
-	entry = &adreno8_memory_entries[adreno8_memory_count];
-	buffer = &entry->buffer;
-	if (kmem_alloc(kernel_map, &buffer->memory, (vm_size_t)allocated,
-	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-		buffer->memory = 0;
-		return NULL;
-	}
-	/* Record ownership before any descriptor can expose this allocation to DMA. */
-	adreno8_memory_count++;
-	adreno8_memory_bytes += allocated;
-	buffer->name = name;
-	buffer->size = size;
-	buffer->gpu_address = gpu_address;
-	/* Publish the zero fill: after MP_ASSIGN no HLOS cache line of these pages
-	 * may be written back over what the secure world stores there. */
-	adreno8_to_memory(buffer->memory, (vm_size_t)allocated);
-	if (!adreno8_space_map_region(&adreno8_secure_space, gpu_address, buffer->memory,
-	    size, gpu_prot) ||
-	    !adreno8_space_map_region(&adreno8_gpu_space, gpu_address, buffer->memory,
-	    size, gpu_prot) ||
-	    !adreno8_secure_page_tables(&adreno8_secure_space) ||
-	    !adreno8_secure_data(buffer)) {
-		adreno8_memory_failed = true;
-		printf("adreno8: secure allocation failed; retain GPU memory until cold reset\n");
-		return NULL;
-	}
-	entry->complete = true;
-	entry->secure = true;
-	printf("adreno8: secure buffer %s: size %#x, GPU %#x, owner CP_PIXEL\n",
-	    name, size, gpu_address);
-	return buffer;
+	return NULL;
 }
 
 struct adreno8_memory *

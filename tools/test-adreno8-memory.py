@@ -160,28 +160,6 @@ int main(int argc, char **argv) {
         puts("secure handover ends before any MP_ASSIGN when the argument page is missing: PASS");
         return 0;
     }
-    if (argc > 1 && strcmp(argv[1], "secure-fail") == 0) {
-        /* Real MP_ASSIGN path failing on the last data batch after earlier
-         * batches succeeded: ownership is unclear, every page is retained, and
-         * the memory subsystem refuses later requests of any kind. */
-        request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 7,
-            .size = 0x138000, .align = (12 << 8) | 16};
-        scm_fail_at = 1 + (request.size + PAGE_SIZE * ASSIGN_SECTIONS - 1) /
-            (PAGE_SIZE * ASSIGN_SECTIONS);
-        adreno8_secure_execute = true;
-        assert(!adreno8_hwsched_alloc(&request, &result));
-        assert(scm_calls == scm_fail_at && adreno8_secure_lost());
-        assert(adreno8_memory_failed && adreno8_memory_retained());
-        assert(!adreno8_memory_entries[0].complete);
-        unsigned calls_before = scm_calls;
-        request.handle = 8;
-        assert(!adreno8_hwsched_alloc(&request, &result));
-        request.kind = 4;
-        assert(!adreno8_hwsched_alloc(&request, &result));
-        assert(scm_calls == calls_before);
-        puts("MP_ASSIGN batch failure retained through the memory path: PASS");
-        return 0;
-    }
     assert(!adreno8_memory_retained() && !adreno8_gpu_memory_ready());
     struct adreno8_memory *sqe = adreno8_gpu_alloc("sqe", 111472, 4096,
         ADRENO8_MEM_READ | ADRENO8_MEM_EXEC);
@@ -227,30 +205,11 @@ int main(int argc, char **argv) {
     reset_memory();
     request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 9,
         .size = 0x138000, .align = (12 << 8) | 16};
-    adreno8_secure_execute = true;
-    assert(adreno8_hwsched_alloc(&request, &result));
-    assert(result.secure && result.gpu_address != 0 && result.gmu_address == 0);
-    assert(result.size == 0x138000);
-    /* Production MP_ASSIGN: one page-table batch plus ceil(pages / 32) data
-     * batches; the fixture never hands out neighbor physical pages. */
-    unsigned data_batches = (result.size + PAGE_SIZE * ASSIGN_SECTIONS - 1) /
-        (PAGE_SIZE * ASSIGN_SECTIONS);
-    assert(scm_calls == 1 + data_batches && !adreno8_secure_lost());
-    assert(!adreno8_secure_space.is_on &&
-           adreno8_secure_space.secure_tables == adreno8_secure_space.table_count);
-    struct adreno8_memory *secure = &adreno8_memory_entries[0].buffer;
-    assert(adreno8_memory_entries[0].secure);
-    for (unsigned offset = 0; offset < result.size; offset += 4096) {
-        assert(walk(adreno8_secure_space.tables[0].phys, result.gpu_address + offset) ==
-               walk(adreno8_gpu_space.tables[0].phys, result.gpu_address + offset));
-        assert(walk(adreno8_secure_space.tables[0].phys, result.gpu_address + offset) ==
-               kvtophys(secure->memory + offset));
-    }
-    assert(!adreno8_memory_publish(secure, 0, 4096));
-    assert(!adreno8_memory_acquire(secure, 0, 4096));
-    assert(adreno8_hwsched_alloc(&request, &again));
-    assert(again.secure && again.gpu_address == result.gpu_address);
-    assert(scm_calls == 1 + data_batches && allocation_count > 0);
+    /* Mode 0 keeps the secure path closed: the preflight reads, then nothing
+     * stages, answers or allocates; MP_ASSIGN count stays zero. */
+    assert(!adreno8_hwsched_alloc(&request, &result));
+    assert(scm_calls == 0 && adreno8_memory_count == 0 && !adreno8_memory_failed);
+    assert(adreno8_gpu_space.table_count == 0 && adreno8_secure_space.table_count == 0);
     request.handle = 10;
     request.flags = 0x007;
     assert(!adreno8_hwsched_alloc(&request, &again));
@@ -349,7 +308,7 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
         subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}",
                         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                         str(target / "check.c"), "-o", str(binary)], check=True)
-        for mode in ((), ("secure-fail",), ("gated",), ("xfer",), ("xfer-fail",), ("xfer-open-fail",)):
+        for mode in ((), ("gated",), ("xfer",), ("xfer-fail",), ("xfer-open-fail",)):
             result = subprocess.run([str(binary), *mode], check=True, capture_output=True, text=True)
             if mode == ("xfer",):
                 # The plan line prints from the real PAGE_SIZE and merge rule:

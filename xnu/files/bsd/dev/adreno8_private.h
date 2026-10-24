@@ -274,7 +274,6 @@ extern uint32_t adreno8_gpu8_secure_mode; /* boot-args adreno8_secure_preflight=
 #define SECURE_MODE_OFF          0u
 #define SECURE_MODE_PREFLIGHT    1u            /* answer kind 5 with the read-only preflight only, no MP_ASSIGN and no reply */
 #define SECURE_MODE_HANDOVER     2u            /* isolated experiment: one handover of the kernel's own pages, terminal afterwards, no reply and no CB3 write */
-extern bool adreno8_secure_execute;         /* production MP_ASSIGN path; stays 0 until the secure translation implementation review passes */
 bool adreno8_memory_retained(void);
 
 int

@@ -35,11 +35,15 @@ struct assign_perm {
 #define ASSIGN_EXTENDED     640u       /* four little-endian argument words */
 #define ASSIGN_USED         (ASSIGN_EXTENDED + 4 * sizeof(uint64_t))
 
-/* The layout above is the TrustZone-side ABI: record sizes come from the
- * vendor wire format and every byte must stay inside the one argument page. */
+/* Record sizes come from the vendor wire format; the 512/576/640 offsets are
+ * this driver's staging layout inside the argument page.  Every used byte
+ * must stay inside one page. */
 _Static_assert(sizeof(struct assign_region) == 16, "MP_ASSIGN region record must be 16 bytes");
 _Static_assert(sizeof(struct assign_perm) == 24, "MP_ASSIGN permission record must be 24 bytes");
-_Static_assert(ASSIGN_USED <= PAGE_SIZE, "MP_ASSIGN argument layout must fit one page");
+/* XNU ARM PAGE_MIN_SHIFT is 12. PAGE_SIZE can be runtime-valued in
+ * exported arm64 headers; the layout must fit the smallest supported page. */
+_Static_assert(ASSIGN_USED <= 4096u,
+    "MP_ASSIGN argument layout must fit the smallest supported kernel page");
 
 static struct {
 	vm_offset_t page;

@@ -655,3 +655,15 @@ if __name__ == "__main__":
                     assert "input rejected" in result.stdout
                     assert "secure handover complete: 1 pages owned by CP_PIXEL" in result.stdout
             print(f"XNU PAGE_SIZE={page_size}: PASS")
+        # PAGE_SIZE coming from an extern variable, the shape the upstream
+        # osfmk/mach/arm/vm_param.h of xnu-8796.121.2 gives it (PAGE_SHIFT_CONST
+        # is declared there, not defined as a constant).  The same production
+        # file, layout and asserts must compile without a constant PAGE_SIZE.
+        (target / "runtime-page.h").write_text(
+            "extern unsigned long vm_page_size;\n"
+            "unsigned long vm_page_size = 4096;\n")
+        subprocess.run(["cc", "-std=c11", "-DPAGE_SIZE=vm_page_size",
+                        "-include", str(target / "runtime-page.h"), "-c",
+                        str(target / "check.c"), "-o", str(target / "check-rt.o")],
+                       check=True)
+        print("PAGE_SIZE from an extern variable: layout and asserts compile: PASS")

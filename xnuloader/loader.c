@@ -8,6 +8,11 @@
  *   - copies the Mach-O segments there, builds an Apple-format device tree
  *     and a boot_args structure behind the kernel
  *   - exits boot services, turns the MMU off and jumps to the kernel entry
+ *
+ * Line convention (AGENTS.md 2): this file predates the 800-line limit and is one UEFI
+ * entry point whose state threads through the boot services; this round adds the local
+ * lifecycle-protection fix (kernel_resources_held and the LC blocks, exercised by
+ * tools/test-loader-lifecycle.py) without restructuring the whole loader.
  */
 #include "efi.h"
 #include "identity.h"         /* who iOS shall think we are: from the iPhone's own device tree (mkidentity.py) */
@@ -351,18 +356,149 @@ static int hc_log_skips;                /* logs not written this run (said twice
 static void hc_print_state(const char *when);
 static void hc_take_back(const char *when);
 static int skip_ufs_arbitration;        /* annibale: the kernel never shares the UFS controller, set at platform selection */
+static int firmware_fault;              /* UEFI exception handler ran (set in exception_handler) */
 
+/* LC-BEGIN -- host-extracted verbatim by tools/test-loader-lifecycle.py: the production kernel
+ * lifecycle logic, pure C with no UEFI dependencies so the host test compiles it as it is.
+ * kernel_resources_held is separate from running_live, the log pointer: what was started on
+ * another core may own memory and devices from the CPU_ON request on, and releases only on
+ * proof (ruling 2026-10-25): the kernel returned and every core this run handed to XNU
+ * answers AFFINITY_INFO off. A hung or never-arrived kernel keeps the hold, and so does a
+ * CPU_ON answer outside the refusal whitelist below. While held the loader keeps to
+ * operations that touch no shared hardware: status queries, staged logs, and reboot. The
+ * cooperative services inside run_on_other_cpu's watch loop are the one listed exception
+ * (active_watch), bounded by the round ending the moment a timeout is decided (LC-WATCH). */
+#define OTHER_CPU_NOT_STARTED 1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
+#define OTHER_CPU_HUNG          1001  /* ... the kernel stopped giving signs of life */
+
+#define LC_STOP_NOTIFY 0              /* a live kernel is told to end (oem stop) */
+#define LC_STOP_IDLE 1                /* nothing started: the reply stays the harmless OKAY */
+#define LC_STOP_HELD 2                /* held with no live kernel: nothing can be notified, say so */
+
+/* PSCI return codes as the SMC Calling Convention spells them out, the way TF-A defines
+ * them in include/lib/psci/psci.h (PSCI_RET_*). tools/test-loader-lifecycle.py asserts
+ * every one of these against raw spec numbers of its own, so a wrong constant here cannot
+ * pass by being shared with the test. */
+#define PSCI_E_NOT_SUPPORTED    (-1)
+#define PSCI_E_INVALID_PARAMS   (-2)
+#define PSCI_E_DENIED           (-3)
+#define PSCI_E_ALREADY_ON       (-4)
+#define PSCI_E_ON_PENDING       (-5)
+#define PSCI_E_INTERNAL_FAILURE (-6)
+#define PSCI_E_NOT_PRESENT      (-7)
+#define PSCI_E_DISABLED         (-8)
+#define PSCI_E_INVALID_ADDRESS  (-9)
+
+#define PSCI_CPU_ON        0xC4000003u
+#define PSCI_AFFINITY_OFF  1
+
+static int kernel_resources_held;   /* a started kernel may still own memory and devices: gate on this */
+static int active_watch;            /* inside run_on_other_cpu's watch loop: the one exception to the gates */
+
+static int64_t psci_call(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3);
+
+static inline int
+lc_starts(const char *s, const char *p)
+{
+	while (*p) {
+		if (*s++ != *p++) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* commands that take over memory or device state, refused while anything runs or is held:
+ * the payload window, the kernel start itself, storage writes and the display write */
+static inline int
+lc_blocked_cmd(const char *cmd)
+{
+	static const char *const blocked[] = { "oem ramdisk", "download:", "oem run", "oem selftest",
+		"oem hang", "oem recording", "oem sound", "oem clearscreen", "oem memmap", "oem probe",
+		"oem logwrite" };
+
+	for (unsigned i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
+		if (lc_starts(cmd, blocked[i])) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static inline int
+lc_busy(int hold, int fault, int live)
+{
+	return live || fault || hold;
+}
+
+static inline int
+lc_cmd_denied(int hold, int fault, int live, const char *cmd)
+{
+	return lc_busy(hold, fault, live) && lc_blocked_cmd(cmd);
+}
+
+static inline int
+lc_stop_action(int hold, int live)
+{
+	if (live) {
+		return LC_STOP_NOTIFY;
+	}
+	return hold ? LC_STOP_HELD : LC_STOP_IDLE;
+}
+
+/* CPU_ON answers that prove the request itself was refused -- the core was not started by
+ * it, and nothing of the kernel's is in flight. Everything else (accepted, already on,
+ * pending, internal failure, not present, disabled, an unknown negative, a positive) leaves
+ * the core's state unknown and keeps the hold (ruling 2026-10-25: only the whitelist). */
+static inline int
+lc_cpu_on_refused(int64_t status)
+{
+	return status == PSCI_E_NOT_SUPPORTED || status == PSCI_E_INVALID_PARAMS ||
+	    status == PSCI_E_DENIED || status == PSCI_E_INVALID_ADDRESS;
+}
+
+/* the request and its answer, as the loader acts on them: from the request on the core may
+ * already own memory and devices; only the whitelist above hands that back */
+static int64_t
+lc_cpu_on_issue(uint64_t mpidr, uint64_t entry, uint64_t arg)
+{
+	int64_t status;
+
+	kernel_resources_held = 1;
+	status = psci_call(PSCI_CPU_ON, mpidr, entry, arg);
+	kernel_resources_held = lc_cpu_on_refused(status) ? 0 : 1;
+	return status;
+}
+
+/* only an explicit off answers the question; ON, ON_PENDING, errors and NOT_SUPPORTED do not */
+static inline int
+lc_core_off(int64_t state)
+{
+	return state == PSCI_AFFINITY_OFF;
+}
+/* LC-END */
+
+/* LC-WRITE-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: the whole of
+ * write_logs, so the host test counts the real side effects (partition query, block writes,
+ * echo) through stubbed firmware calls. */
 static void
 write_logs(const char *klog, uint64_t klog_len)
 {
-	efi_block_io *bio = find_log_partition();
+	efi_block_io *bio;
 
 	compose_logs(klog, klog_len);
+	/* while memory and devices are held, or after a firmware fault, not even the firmware's
+	 * partition query runs (find_log_partition walks BootServices); the staged text is what
+	 * "upload" fetches. The active watch loop is the only exception, and the exception
+	 * handler revokes it at its entry (LC-EXC). */
+	bio = ((kernel_resources_held || firmware_fault) && !active_watch) ? NULL : find_log_partition();
 	if (bio == NULL) {
 		/*
-		 * No log partition, and boot_a writes are the oem logwrite command's business alone
-		 * (review F09 ruling b): QEMU and the automatic phone flushes land here, echoing the
-		 * returned kernel log on the console instead. "upload" still stages the same text.
+		 * No log partition, or a kernel that was started and not proven done may still own the
+		 * storage: writing through it then belongs to the held set. boot_a writes are the oem
+		 * logwrite command's business alone (review F09 ruling b): QEMU and the automatic phone
+		 * flushes land here, echoing the returned kernel log on the console instead. "upload"
+		 * still stages the same text.
 		 */
 		if (klog != NULL) {
 			print("\n== KERNEL LOG ==\n");
@@ -410,6 +546,7 @@ write_logs(const char *klog, uint64_t klog_len)
 	    EFI_ERROR(ws) ? "not tried" : same ? "the same" : "DIFFERENT", rs);
 	compose_logs(klog, klog_len);
 }
+/* LC-WRITE-END */
 
 
 /* F09-PROBE-BEGIN -- host-extracted verbatim by /tmp/task19/probe_harness.c */
@@ -715,8 +852,11 @@ dt_end(struct dt_writer *w)
 static void
 reboot(void)
 {
-	hc_take_back("before the reset");
-	flush_log();
+	/* while a kernel is held the controller may answer to it: reset without touching storage */
+	if (!kernel_resources_held) {
+		hc_take_back("before the reset");
+		flush_log();
+	}
 	ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
 	for (;;) {
 	}
@@ -905,7 +1045,6 @@ jump_to_kernel(uint64_t entry, uint64_t boot_args_pa)
 /* 0 and switches its own core off.                                         */
 
 #define PSCI_CPU_OFF       0x84000002u
-#define PSCI_CPU_ON        0xC4000003u
 #define PSCI_AFFINITY_INFO 0xC4000004u      /* (MPIDR, 0): 0 = that core is on, 1 = off, 2 = being started */
 #define PSCI_SYSTEM_RESET 0x84000009u
 #define PSCI_NOT_SUPPORTED (-1)
@@ -1090,8 +1229,6 @@ static const char *sound_data;
 static uint64_t sound_len;
 #define KERNEL_LIVE_MAGIC2      0x324556494c554e58ULL
 #define KERNEL_LIVE_MAGIC       0x214556494c554e58ULL
-#define OTHER_CPU_NOT_STARTED   1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
-#define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
 #define START_SECONDS           5
 #define SILENCE_SECONDS         50
 #define NOTE_SECONDS            24      /* how long the kernel's progress is written down as it happens */
@@ -1107,7 +1244,6 @@ static const struct kernel_live *running_live;
 static uint64_t running_slide;
 static void usb_poll_command(void);
 static void set_result(const char *what, uint64_t a, uint64_t b);
-static int firmware_fault;
 
 static uint64_t
 seconds_since(uint64_t then)
@@ -2398,6 +2534,79 @@ psci_call(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
 	return status;
 }
 
+static uint64_t held_daif, held_group1;   /* interrupt state at a handoff, restored when the hold releases */
+static int held_irq_masked;
+
+/* LC-WATCH-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: one round of
+ * watching the started core, exactly what run_on_other_cpu's loop runs per pass. It
+ * returns nonzero when the loop must stop: the core returned (status stays 0) or a timeout
+ * was decided (status set). A timeout ends the round right there: no charger, storage or
+ * USB service runs after the decision, because from that moment the hold stands and the
+ * kernel may still own whatever these services would touch. The note and IRQ-mask passes
+ * that precede the round stay inline in run_on_other_cpu (wiring-checked by the test). */
+static int
+lc_watch_round(const struct kernel_live *live, uint64_t slide, uint64_t started, uint64_t budget, int *arrived,
+    uint64_t *last_pet, uint64_t *last_battery, uint64_t *last_beat, uint64_t *last_beat_at, int64_t *status)
+{
+	/* both are written by a core with its caches off: look at memory, not at our copy */
+	flush_dcache((uint64_t)(uintptr_t)&other_cpu_done, (uint64_t)(uintptr_t)&other_cpu_done + 8);
+	if (other_cpu_done) {
+		/* what the kernel returned, written the same way */
+		flush_dcache((uint64_t)(uintptr_t)&loader_ctx[CTX_LOG_PA], (uint64_t)(uintptr_t)&loader_ctx[CTX_KSP + 1]);
+		return 1;
+	}
+	if (!*arrived) {
+		flush_dcache((uint64_t)(uintptr_t)&other_cpu_stage, (uint64_t)(uintptr_t)&other_cpu_stage + 8);
+		*arrived = other_cpu_stage != 0;
+		if (!*arrived && seconds_since(started) >= START_SECONDS) {
+			*status = OTHER_CPU_NOT_STARTED;
+			return 1;   /* held at once: the charger and the storage are not touched this round */
+		}
+	}
+	/* Feed this core's watchdog through the requested budget and a 60-second return margin. */
+	if (wdt_armed && seconds_since(*last_pet) >= 5 && seconds_since(started) < budget + 60) {
+		wdt_pet();
+		*last_pet = READ_SYSREG(CNTVCT_EL0);
+	}
+	/* Qualcomm's UEFI charger stack owns the PMIC/GLINK side; keep XNU's cache live. */
+	if (charger_enabled && seconds_since(*last_battery) >= 5 && hc_list_is_uefis()) {
+		/* (not while the kernel's own transfer list is in: Qualcomm's DXEs are not to touch the storage) */
+		charger_poll();
+		*last_battery = READ_SYSREG(CNTVCT_EL0);
+	}
+	if (*arrived && live != NULL) {
+		if (live->heartbeat != *last_beat) {
+			*last_beat = live->heartbeat;
+			*last_beat_at = READ_SYSREG(CNTVCT_EL0);
+		} else if (seconds_since(*last_beat_at) >= SILENCE_SECONDS) {
+			log_of_hung_kernel(live, slide);  /* the hung kernel's snapshot is read-only: kept */
+			*status = OTHER_CPU_HUNG;
+			return 1;   /* held at once: no block, USB or charger service past the decision */
+		}
+	}
+	if (block_enabled) {
+		block_poll();
+	}
+	usb_poll_command();
+	if (block_enabled) {
+		/*
+		 * The pause is spent looking at the kernel's mailbox: with one look a pass, a
+		 * request waited 60-75 us on average before this core noticed it, more than a
+		 * 4 KB ReadBlocks takes (27 us). Same length of pause as below.
+		 */
+		for (int k = 0; k < 64; k++) {
+			block_poll();
+			for (volatile int i = 0; i < 300; i++) {
+			}
+		}
+	} else {
+		for (volatile int i = 0; i < 20000; i++) {
+		}
+	}
+	return 0;
+}
+/* LC-WATCH-END */
+
 /* Run the kernel on mpidr: 0 = returned, negative = PSCI refused, OTHER_CPU_NOT_STARTED
  * or OTHER_CPU_HUNG = incomplete. loader_ctx retains the available log for a hung kernel.
  * live holds its shared status; budget is the requested run duration in seconds. */
@@ -2432,13 +2641,22 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	}
 
 	/* the last argument arrives in that core's x0 */
-	status = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_start);
+	/* LC-ENTER-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: the bridge from
+	 * the request to the watch, where the service exemption opens only on the answer 0
+	 * (rev1 review section 3); LC-EXC closes it again at the fault entry. */
+	status = lc_cpu_on_issue(mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_start);
 
 	started = last_pet = last_battery = last_beat_at = READ_SYSREG(CNTVCT_EL0);
 	print("core %x: the firmware answers %d to the request to start it\n", mpidr, (uint64_t)status);
+	if (status == 0) {
+		/* the exemption covers the formal watch this answer opens and nothing else: a refused
+		 * or unknown start keeps the held gates closed, its log stays in the RAM echo */
+		active_watch = 1;
+	}
 	if (PLAT->log_other_cpu) {
 		flush_log();
 	}
+	/* LC-ENTER-END */
 	while (status == 0) {
 		/* Storage logging needs firmware interrupts during NOTE_SECONDS on other platforms. */
 		if (!watching_only && seconds_since(started) >= noted + 2) {
@@ -2460,65 +2678,25 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			group1 = READ_SYSREG(S3_0_C12_C12_7);          /* ICC_IGRPEN1_EL1 */
 			__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" ((uint64_t)0));
 		}
-		/* both are written by a core with its caches off: look at memory, not at our copy */
-		flush_dcache((uint64_t)(uintptr_t)&other_cpu_done, (uint64_t)(uintptr_t)&other_cpu_done + 8);
-		if (other_cpu_done) {
-			/* what the kernel returned, written the same way */
-			flush_dcache((uint64_t)(uintptr_t)&loader_ctx[CTX_LOG_PA], (uint64_t)(uintptr_t)&loader_ctx[CTX_KSP + 1]);
-			break;
-		}
-		if (!arrived) {
-			flush_dcache((uint64_t)(uintptr_t)&other_cpu_stage, (uint64_t)(uintptr_t)&other_cpu_stage + 8);
-			arrived = other_cpu_stage != 0;
-			if (!arrived && seconds_since(started) >= START_SECONDS) {
-				status = OTHER_CPU_NOT_STARTED;
-			}
-		}
-		/* Feed this core's watchdog through the requested budget and a 60-second return margin. */
-		if (wdt_armed && seconds_since(last_pet) >= 5 && seconds_since(started) < budget + 60) {
-			wdt_pet();
-			last_pet = READ_SYSREG(CNTVCT_EL0);
-		}
-		/* Qualcomm's UEFI charger stack owns the PMIC/GLINK side; keep XNU's cache live. */
-		if (charger_enabled && seconds_since(last_battery) >= 5 && hc_list_is_uefis()) {
-			/* (not while the kernel's own transfer list is in: Qualcomm's DXEs are not to touch the storage) */
-			charger_poll();
-			last_battery = READ_SYSREG(CNTVCT_EL0);
-		}
-		if (arrived && live != NULL) {
-			if (live->heartbeat != last_beat) {
-				last_beat = live->heartbeat;
-				last_beat_at = READ_SYSREG(CNTVCT_EL0);
-			} else if (seconds_since(last_beat_at) >= SILENCE_SECONDS) {
-				log_of_hung_kernel(live, slide);
-				status = OTHER_CPU_HUNG;
-			}
-		}
-		if (block_enabled) {
-			block_poll();
-		}
-		usb_poll_command();
-		if (block_enabled) {
-			/*
-			 * The pause is spent looking at the kernel's mailbox: with one look a pass, a
-			 * request waited 60-75 us on average before this core noticed it, more than a
-			 * 4 KB ReadBlocks takes (27 us). Same length of pause as below.
-			 */
-			for (int k = 0; k < 64; k++) {
-				block_poll();
-				for (volatile int i = 0; i < 300; i++) {
-				}
-			}
-		} else {
-			for (volatile int i = 0; i < 20000; i++) {
-			}
+		if (lc_watch_round(live, slide, started, budget, &arrived, &last_pet, &last_battery, &last_beat,
+		    &last_beat_at, &status) != 0) {
+			break;  /* returned, or a timeout decided at once: the hold stands, no service after it */
 		}
 	}
-	running_live = NULL;
+	active_watch = 0;
+	running_live = NULL;   /* the log pointer drops here; the hold does not until the proof */
 
 	if (watching_only) {
-		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
-		__asm__ volatile ("msr daif, %0" : : "r" (daif));
+		if (kernel_resources_held || firmware_fault) {
+			/* interrupts stay off while the kernel may own the interrupt controller; the
+			 * release point in the LC-RETURN block restores them */
+			held_daif = daif;
+			held_group1 = group1;
+			held_irq_masked = 1;
+		} else {
+			__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
+			__asm__ volatile ("msr daif, %0" : : "r" (daif));
+		}
 	}
 	return status;
 }
@@ -2601,9 +2779,14 @@ wdt_arm(void)
 
 extern char __ImageBase;
 
+/* LC-EXC-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py. */
 static void EFIAPI
 exception_handler(int64_t type, uint64_t *ctx)
 {
+	/* first act: revoke the watch exemption. This path does not return to the caller that
+	 * owns the watch (its annibale branch never leaves the poll loop), and a fault leaves
+	 * no proof that the storage or the other core is in a state to take new requests */
+	active_watch = 0;
 	print("\nUEFI EXCEPTION type=%d elr=%x esr=%x far=%x lr=%x sp=%x spsr=%x\n", (uint64_t)type, ctx[EXC_CTX_ELR],
 	    ctx[EXC_CTX_ESR], ctx[EXC_CTX_FAR], ctx[EXC_CTX_LR], ctx[EXC_CTX_SP], ctx[EXC_CTX_SPSR]);
 	print("loader image base %x (elr offset %x)\n", (uint64_t)(uintptr_t)&__ImageBase,
@@ -2622,6 +2805,7 @@ exception_handler(int64_t type, uint64_t *ctx)
 	for (;;) {
 	}
 }
+/* LC-EXC-END */
 
 static void
 install_exception_hook(void)
@@ -2996,6 +3180,82 @@ plan_layout(uint64_t phys_base, uint64_t win_size, uint64_t vm_lo, uint64_t vm_h
  * written to the log partition. Returns 0 if the kernel could not be started.
  */
 static int starts_with(const char *s, const char *prefix);
+
+/* LC-RETURN-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: what happens
+ * the moment the kernel is back. Both run kinds consume the core answers (ruling
+ * 2026-10-25): the cores asked are the ones this run handed to XNU (cpu_mpidr[0..]), the
+ * loader's own core excluded. Memory and devices release only on the kernel's return plus
+ * an explicit off from every one of them; hc_take_back and the interrupt restore follow
+ * that decision, never precede it. (host coverage: hc_take_back and psci_call counted
+ * through stubs; the interrupt-restore instructions themselves stay asm, wiring-checked.) */
+static void
+lc_after_return(int ran_other_core, const uint64_t *cpu_mpidr, int cpu_count)
+{
+	int cores_off = 1;
+
+	for (int i = (ran_other_core ? 0 : 1); i < cpu_count; i++) {
+		int64_t state = psci_call(PSCI_AFFINITY_INFO, cpu_mpidr[i], 0, 0);
+
+		if (!lc_core_off(state)) {
+			cores_off = 0;
+		}
+		if (state != PSCI_AFFINITY_OFF) {
+			print("core %x: the firmware answers %d to the question whether it is off: restart before running another\n",
+			    cpu_mpidr[i], (uint64_t)state);
+		}
+	}
+	kernel_resources_held = cores_off ? 0 : 1;  /* proof or no proof: the only release point */
+	if (!kernel_resources_held && held_irq_masked) {
+		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (held_group1));
+		__asm__ volatile ("msr daif, %0" : : "r" (held_daif));
+		held_irq_masked = 0;
+	}
+	if (!kernel_resources_held) {
+		hc_take_back("the kernel came back");   /* before anything here touches the storage */
+		if (hc_known) {
+			flush_dcache((uint64_t)(uintptr_t)&block_shared.kernel_native,
+			    (uint64_t)(uintptr_t)&block_shared.kernel_native + sizeof(block_shared.kernel_native));
+			print("ufs: the kernel put its own list in %d times and took it out %d times\n",
+			    (uint64_t)block_shared.kernel_native.switched_in, (uint64_t)block_shared.kernel_native.switched_out);
+		}
+	} else {
+		print("ufs: left as the kernel left it: not every core answered off (memory and devices stay held)\n");
+	}
+}
+
+/* What the kernel left behind for the host. While memory is held its own records are not
+ * read: a core that did not answer off may still be writing them. The log metadata the
+ * return stub copied into loader_ctx is loader memory: that stays (run_kernel below). */
+static void
+lc_after_return_collect(const struct kernel_live *live, uint64_t slide, uint64_t checkpoint)
+{
+	recording_data = NULL;
+	recording_len = 0;
+	sound_data = NULL;
+	sound_len = 0;
+	if (kernel_resources_held || live == NULL) {
+		return;
+	}
+	if (live->recording != 0 && checkpoint != CHECKPOINT_SELFTEST) {
+		const uint64_t *recording = (const uint64_t *)(live->recording + slide);
+
+		if (recording[0] != 0 && recording[1] > 24 && recording[1] <= (1ULL << 30)) {
+			recording_data = (const char *)recording[0];
+			recording_len = recording[1];
+			print("the kernel left a screen recording: %d bytes at %x\n", recording_len, recording[0]);
+		}
+	}
+	if (live->magic2 == KERNEL_LIVE_MAGIC2 && live->sound != 0 && checkpoint != CHECKPOINT_SELFTEST) {
+		const uint64_t *sound = (const uint64_t *)(live->sound + slide);
+
+		if (sound[0] != 0 && sound[1] > 24 && sound[1] <= (1ULL << 30)) {
+			sound_data = (const char *)sound[0];
+			sound_len = sound[1];
+			print("the kernel left a sound recording: %d bytes at %x\n", sound_len, sound[0]);
+		}
+	}
+}
+/* LC-RETURN-END */
 
 static int
 run_kernel(int have_checkpoint, uint64_t checkpoint)
@@ -3535,6 +3795,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	wdt_set_ms(60000);
 
 	/* --- hand off (UEFI is left resident, see loader_save_ctx) ------------ */
+	int ran_other_core = 0;
 	if (loader_save_ctx() == 0) {
 		/*
 		 * On real hardware (under the Qualcomm hypervisor) dirty data-cache
@@ -3563,18 +3824,25 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			jump_to_kernel((uint64_t)(uintptr_t)&loader_return_stub, 0);
 		}
 		if (kernel_mpidr != this_mpidr) {
-			int64_t status = run_on_other_cpu(kernel_mpidr, entry_va + slide, ba_pa, kernel_live, slide, kernel_budget);
+			int64_t status;
+
+			ran_other_core = 1;
+			status = run_on_other_cpu(kernel_mpidr, entry_va + slide, ba_pa, kernel_live, slide, kernel_budget);
 
 			wdt_set_ms(WDT_BITE_MS);
 			if (status != 0) {
-				/* a kernel that hung may have left its own transfer list in the controller */
-				hc_take_back(status == OTHER_CPU_HUNG ? "the kernel hung" : "the kernel did not start");
+				if (kernel_resources_held) {
+					/* started and unproven: the controller and the memory may answer to the kernel */
+					print("ufs: left as the kernel left it (memory and devices held)\n");
+				} else {
+					hc_take_back("the kernel did not start");
+				}
 			}
 			if (status == OTHER_CPU_HUNG) {
 				/* the kernel still has that core; what it logged can be had all the same */
 				print("THE KERNEL HUNG on core %x: no sign of life for %d seconds; its log follows\n", kernel_mpidr,
 				    (uint64_t)SILENCE_SECONDS);
-				set_result("hung", loader_ctx[CTX_LOG_LEN], 0);
+				set_result(kernel_resources_held ? "hung-held" : "hung", loader_ctx[CTX_LOG_LEN], 0);
 				write_logs((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
 				return 1;
 			} else if (status != 0) {
@@ -3584,7 +3852,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				} else {
 					print("core %x did not start: PSCI error %d\n", kernel_mpidr, (uint64_t)-status);
 				}
-				set_result("no-such-core", (uint64_t)(status < 0 ? -status : status), 0);
+				set_result(kernel_resources_held ? "no-such-core-held" : "no-such-core", (uint64_t)(status < 0 ? -status : status), 0);
 				write_logs(NULL, 0);
 				return 1;
 			}
@@ -3595,70 +3863,35 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	/* --- the kernel came back ------------------------------------------- */
 	wdt_set_ms(WDT_BITE_MS);
-	hc_take_back("the kernel came back");   /* before anything here touches the storage */
-	if (hc_known) {
-		flush_dcache((uint64_t)(uintptr_t)&block_shared.kernel_native,
-		    (uint64_t)(uintptr_t)&block_shared.kernel_native + sizeof(block_shared.kernel_native));
-		print("ufs: the kernel put its own list in %d times and took it out %d times\n",
-		    (uint64_t)block_shared.kernel_native.switched_in, (uint64_t)block_shared.kernel_native.switched_out);
-	}
+	/* the cores this run handed to XNU are asked whether each is off; only on every yes do
+	 * memory and devices release (LC-RETURN block, same ruling for both run kinds) */
+	lc_after_return(ran_other_core, cpu_mpidr, cpu_count);
 	if (block_write_requested) {
 		print("ufs: %d writes into darwin, %d bytes, read back the same; %d refused\n", block_writes,
 		    block_write_bytes, block_writes_refused);
 	}
-	/* ... and its other cores should all be off again: the next kernel cannot start one that is not */
-	for (int i = 1; i < cpu_count; i++) {
-		int64_t state = psci_call(PSCI_AFFINITY_INFO, cpu_mpidr[i], 0, 0);
-
-		if (state != 1 && state != PSCI_NOT_SUPPORTED) {
-			print("THE KERNEL LEFT CORE %x RUNNING (the firmware says %d): restart before running another\n", cpu_mpidr[i],
-			    (uint64_t)state);
-		}
-	}
-	recording_data = NULL;
-	recording_len = 0;
-	if (kernel_live != NULL && kernel_live->recording != 0 && checkpoint != CHECKPOINT_SELFTEST) {
-		const uint64_t *recording = (const uint64_t *)(kernel_live->recording + slide);
-
-		if (recording[0] != 0 && recording[1] > 24 && recording[1] <= (1ULL << 30)) {
-			recording_data = (const char *)recording[0];
-			recording_len = recording[1];
-			print("the kernel left a screen recording: %d bytes at %x\n", recording_len, recording[0]);
-		}
-	}
-	sound_data = NULL;
-	sound_len = 0;
-	if (kernel_live != NULL && kernel_live->magic2 == KERNEL_LIVE_MAGIC2 && kernel_live->sound != 0 &&
-	    checkpoint != CHECKPOINT_SELFTEST) {
-		const uint64_t *sound = (const uint64_t *)(kernel_live->sound + slide);
-
-		if (sound[0] != 0 && sound[1] > 24 && sound[1] <= (1ULL << 30)) {
-			sound_data = (const char *)sound[0];
-			sound_len = sound[1];
-			print("the kernel left a sound recording: %d bytes at %x\n", sound_len, sound[0]);
-		}
-	}
+	lc_after_return_collect(kernel_live, slide, checkpoint);
 	const char *klog = (const char *)loader_ctx[CTX_LOG_PA];
 	uint64_t klog_len = loader_ctx[CTX_LOG_LEN];
 	uint64_t reason = loader_ctx[CTX_REASON];
 	if (checkpoint == CHECKPOINT_SELFTEST) {
 		print("return-path self test passed\n");
-		set_result("selftest-ok", 0, 0);
+		set_result(kernel_resources_held ? "selftest-ok-held" : "selftest-ok", 0, 0);
 		klog = NULL;
 		klog_len = 0;
 	} else {
 		print("kernel returned: log at %x, %d bytes\n", (uint64_t)(uintptr_t)klog, klog_len);
 		if (reason == 2) {
 			print("STOPPED AT CHECKPOINT %d\n", loader_ctx[CTX_ESR]);
-			set_result("checkpoint", loader_ctx[CTX_ESR], 0);
+			set_result(kernel_resources_held ? "checkpoint-held" : "checkpoint", loader_ctx[CTX_ESR], 0);
 		} else if (reason == 1) {
 			print("EARLY KERNEL EXCEPTION: esr=%x elr=%x far=%x lr=%x sp=%x\n", loader_ctx[CTX_ESR], loader_ctx[CTX_ELR],
 			    loader_ctx[CTX_FAR], loader_ctx[CTX_LR], loader_ctx[CTX_KSP]);
 			print("  (pa-va slide %x: subtract it from physical addresses to symbolicate)\n", slide);
-			set_result("early-exception", 0, loader_ctx[CTX_ELR]);
+			set_result(kernel_resources_held ? "early-exception-held" : "early-exception", 0, loader_ctx[CTX_ELR]);
 			klog_len = klog_len > (1u << 20) ? 0 : klog_len;
 		} else {
-			set_result("returned", klog_len, 0);
+			set_result(kernel_resources_held ? "returned-held" : "returned", klog_len, 0);
 		}
 	}
 	write_logs(klog, klog_len);
@@ -3764,6 +3997,134 @@ usb_start(void)
  * Returns the byte count, or -1 if the transfer was cancelled or the cable
  * state changed. Keeps the watchdog fed while idle.
  */
+/* LC-USB-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: the wait for one
+ * USB event and both transfers, with the buffer-ownership rules the rev1 and rev4 reviews
+ * asked for. The three-second bound is a lifecycle rule, not a log-pointer detail: it
+ * covers a held state with no kernel to watch and a firmware fault, so a host that went
+ * away cannot stop the loader from answering the commands that end the state (the reboot
+ * starts over). Ownership: a transfer belongs to the controller until a verified
+ * notification ends it, and only a verified one: the handle_event call must have returned
+ * success, the event must cover the transfer fields, its data_buffer must be the buffer
+ * this endpoint's recorded request submitted, and bytes_completed must stay within the
+ * submitted length. A CompleteOK that passes the checks releases the buffer and is the
+ * only status read. Active and values outside the four documented statuses keep
+ * everything: no read, no release, no resend, the bounded wait continues. A cancelled,
+ * error, mismatched or unreadable notification keeps the buffer and stops the endpoint:
+ * efi.h names those statuses but records no buffer-return semantics behind the names, so
+ * the loader releases nothing it cannot confirm. The interface carries no generation or
+ * request id, so matching a notification to a request assumes one unfinished request per
+ * endpoint and one terminal event per request: an assumption this matching depends on
+ * in software, verified against no firmware behavior here either way. A notification that
+ * finds no recorded request (a late duplicate) changes nothing, and so does any event that
+ * arrives after the endpoint was stopped: a stopped endpoint keeps its buffer and its flags
+ * until the reset. The submit record is written only where a send succeeded, and taking over
+ * a queued request requires the recorded buffer and length. No field of the event union is
+ * read before the event type's own payload size was checked; a transfer event too short to
+ * read names no endpoint, so every owned request stops. DeviceStateChange and the timeout
+ * keep the buffer: the cable proves nothing about a transfer, a timeout hands a still
+ * owned receive back to the queue flag, whose rule already forbids sending the same
+ * buffer twice, and an unconfirmed owned IN stops its endpoint until the machine is
+ * reset. efi.h offers abort_xfer but records no completion semantics behind its return,
+ * so the loader makes no unverified abort claim. A completion in hand is verified before
+ * the time budget, so a terminal event at the deadline is kept, and a wait without one
+ * still ends within the budget. */
+static int usb_rx_queued;       /* usb_poll_command() has left the receive for the next command with the controller */
+static int usb_out_owned;       /* the OUT buffer is with the controller, its end unconfirmed */
+static int usb_in_owned;        /* the IN buffer is with the controller, its end unconfirmed */
+static int usb_out_lost;        /* stopped: a reboot is the only way back the code can prove */
+static int usb_in_lost;
+static void *usb_out_buf;       /* what the owned request submitted, kept to verify the notification */
+static uint64_t usb_out_len;
+static void *usb_in_buf;
+static uint64_t usb_in_len;
+
+static void
+usb_stop_endpoint(int out, const char *why)
+{
+	if (out) {
+		if (!usb_out_lost) {
+			print("usb: OUT %s: the buffer stays with the controller, reboot to start over\n", why);
+			usb_out_lost = 1;
+		}
+	} else if (!usb_in_lost) {
+		print("usb: IN %s: the buffer stays with the controller, reboot to start over\n", why);
+		usb_in_lost = 1;
+	}
+}
+
+static void
+usb_lost_on_unconfirmed(void)
+{
+	/* the cable moved, no transfer was confirmed over: the ownership can no longer be trusted */
+	if (usb_out_owned || usb_rx_queued) {
+		usb_stop_endpoint(1, "still owned at a device change");
+	}
+	if (usb_in_owned) {
+		usb_stop_endpoint(0, "still owned at a device change");
+	}
+	usb_rx_queued = 0;
+}
+
+/* a transfer event below the transfer struct cannot name an endpoint or a buffer: with one
+ * on hand the loader keeps no in-flight claim it cannot still account for */
+static void
+usb_short_event_stops_all(void)
+{
+	if (usb_out_owned || usb_rx_queued) {
+		usb_stop_endpoint(1, "event too short to attribute");
+	}
+	if (usb_in_owned) {
+		usb_stop_endpoint(0, "event too short to attribute");
+	}
+}
+
+/* the shared rule for usb_wait and usb_poll_command: verify one transfer notification against
+ * the endpoint's recorded request before anything is reused, and the caller has proven the
+ * event carries a full transfer struct. 1: verified CompleteOK, ownership released, *bytes is
+ * the answer; 0: keep everything as it is (stopped, no recorded request, Active, undocumented
+ * value); -1: the endpoint was stopped and its buffer stays with the controller */
+static int
+usb_notification(int out, const usb_device_event_data *data, uint64_t *bytes)
+{
+	void *sub = out ? usb_out_buf : usb_in_buf;
+	uint64_t sub_len = out ? usb_out_len : usb_in_len;
+
+	if (out ? usb_out_lost : usb_in_lost) {
+		return 0;   /* stopped keeps its buffer and its flags: a late event changes nothing */
+	}
+	if (out ? !usb_out_owned : !usb_in_owned) {
+		return 0;   /* nothing on file: a late duplicate of an old request changes nothing */
+	}
+	if (sub == NULL) {
+		usb_stop_endpoint(out, "request on file without its submitted buffer");
+		return -1;
+	}
+	if (data->transfer.data_buffer != sub) {
+		usb_stop_endpoint(out, "notification for a buffer the loader did not submit");
+		return -1;
+	}
+	if (data->transfer.status == UsbDeviceTransferStatusActive ||
+	    data->transfer.status > UsbDeviceTransferStatusCompleteError) {
+		return 0;   /* the controller may still work on the buffer: no read, no release, no resend */
+	}
+	if (data->transfer.status != UsbDeviceTransferStatusCompleteOK) {
+		usb_stop_endpoint(out, "completed with a status whose buffer return is unproven");
+		return -1;
+	}
+	if (data->transfer.bytes_completed > sub_len) {
+		usb_stop_endpoint(out, "completed more bytes than submitted");
+		return -1;
+	}
+	*bytes = data->transfer.bytes_completed;
+	if (out) {
+		usb_out_owned = 0;    /* this notification is the firmware's confirmation of the end */
+		usb_rx_queued = 0;    /* the queue's claim on the buffer ends with the transfer it covered */
+	} else {
+		usb_in_owned = 0;
+	}
+	return 1;
+}
+
 static int64_t
 usb_wait(uint8_t endpoint)
 {
@@ -3773,20 +4134,50 @@ usb_wait(uint8_t endpoint)
 
 	for (;;) {
 		uint32_t msg = UsbDeviceEventNoEvent;
-		uint64_t size = 0;
+		uint64_t size = 0, bytes = 0;
 		usb_device_event_data data;
 
-		USB->handle_event(&msg, &size, &data);
+		if (EFI_ERROR(USB->handle_event(&msg, &size, &data))) {
+			msg = UsbDeviceEventNoEvent;   /* a failed call delivered no event to read */
+		}
 		if (msg == UsbDeviceEventDeviceStateChange) {
-			usb_connected = (data.device_state == UsbDeviceStateConnected);
+			/* no union field is read before the event's own payload was size-checked */
+			if (size >= sizeof(data.device_state)) {
+				usb_connected = (data.device_state == UsbDeviceStateConnected);
+			}
+			/* the cable moved: readable state or not, nothing in flight is trusted any more */
+			usb_lost_on_unconfirmed();
 			return -1;
 		}
-		/* with a kernel running, a host that went away must not keep this core from watching it */
-		if (running_live != NULL && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
-			return -1;
+		if (msg == UsbDeviceEventTransferNotification) {
+			if (size < sizeof(data.transfer)) {
+				usb_short_event_stops_all();   /* nothing readable names the request it ends */
+				return -1;
+			}
+			if (data.transfer.endpoint_index == endpoint) {
+				/* a completion in hand is verified before the budget: one arriving at the
+				 * deadline must not be thrown away */
+				int kept = usb_notification(endpoint == USB_EP_OUT, &data, &bytes);
+
+				if (kept == 1) {
+					return (int64_t)bytes;
+				}
+				if (kept < 0) {
+					return -1;    /* usb_notification stopped the endpoint on a bad notification */
+				}
+			}
 		}
-		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
-			return data.transfer.status == UsbDeviceTransferStatusCompleteOK ? (int64_t)data.transfer.bytes_completed : -1;
+		/* with a kernel running, a kernel that may still hold the devices, or a firmware fault,
+		 * a host that went away must not keep this core from watching or from reaching the
+		 * commands that end the state */
+		if ((running_live != NULL || kernel_resources_held || firmware_fault) && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
+			if (usb_out_owned) {
+				usb_rx_queued = 1;   /* the receive keeps its buffer and its place in the queue */
+			}
+			if (endpoint == USB_EP_IN && usb_in_owned) {
+				usb_stop_endpoint(0, "unconfirmed at a timeout");
+			}
+			return -1;
 		}
 		if (READ_SYSREG(CNTVCT_EL0) - last_pet > freq) {
 			last_pet = READ_SYSREG(CNTVCT_EL0);
@@ -3795,15 +4186,27 @@ usb_wait(uint8_t endpoint)
 	}
 }
 
-static int usb_rx_queued;       /* usb_poll_command() has left the receive for the next command with the controller */
-
 static int64_t
 usb_rx(uint8_t *buf, uint64_t len)
 {
+	if (usb_out_lost) {
+		usb_wait(0xff);     /* bounded and watchdog-feeding, so the caller's loop cannot spin */
+		return -1;          /* the stopped channel keeps its buffer: no new send, no overwrite */
+	}
 	if (usb_rx_queued) {
+		/* the pending request stays exactly as it was submitted: only a caller using the
+		 * recorded buffer and length may take it over */
+		if (buf != usb_out_buf || len != usb_out_len) {
+			return -1;      /* refused: the on-file request and its ownership are untouched */
+		}
 		usb_rx_queued = 0;      /* (every command is received the same way, into the same buffer) */
-	} else if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {
-		return -1;
+	} else {
+		if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {
+			return -1;
+		}
+		usb_out_owned = 1;      /* the submit record is written only for a send that succeeded */
+		usb_out_buf = buf;      /* the notification is only believed for this buffer and length */
+		usb_out_len = len;
 	}
 	return usb_wait(USB_EP_OUT);
 }
@@ -3811,26 +4214,39 @@ usb_rx(uint8_t *buf, uint64_t len)
 static int64_t
 usb_tx(const uint8_t *data, uint64_t len)
 {
+	if (usb_in_lost) {
+		return -1;          /* the old send may still read the buffer: no memcpy over it, no send */
+	}
 	if (data != usb_tx_buf) {
 		memcpy(usb_tx_buf, data, len);
 	}
 	if (EFI_ERROR(USB->send(USB_EP_IN, len, usb_tx_buf))) {
 		return -1;
 	}
+	usb_in_owned = 1;
+	usb_in_buf = usb_tx_buf;    /* the notification is only believed for this buffer and length */
+	usb_in_len = len;
 	return usb_wait(USB_EP_IN);
 }
+/* LC-USB-END */
 
+/* LC-FB-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: both reply forms pack
+ * into their own stack buffers, so usb_tx stays the one place allowed to touch usb_tx_buf
+ * (rev3 review: a reply written while the IN transfer was owned or lost overwrote the
+ * controller's buffer before usb_tx's guard ran). Both loops carry a hard limit. */
 static void
 fb_reply(const char *code, const char *text)
 {
+	char msg[64];
 	uint32_t n = 0;
-	for (; *code; code++) {
-		usb_tx_buf[n++] = (uint8_t)*code;
+
+	for (; *code && n < sizeof(msg) - 1; code++) {
+		msg[n++] = (uint8_t)*code;
 	}
-	for (; *text && n < 63; text++) {
-		usb_tx_buf[n++] = (uint8_t)*text;
+	for (; *text && n < sizeof(msg) - 1; text++) {
+		msg[n++] = (uint8_t)*text;
 	}
-	usb_tx(usb_tx_buf, n);
+	usb_tx((const uint8_t *)msg, n);
 }
 
 static void
@@ -3842,6 +4258,7 @@ fb_reply_data(uint64_t len)
 	}
 	usb_tx((const uint8_t *)msg, 12);
 }
+/* LC-FB-END */
 
 static int
 starts_with(const char *s, const char *prefix)
@@ -3856,25 +4273,33 @@ starts_with(const char *s, const char *prefix)
 
 /*
  * One command from the host. While a kernel runs on another core (running_live) only what does
- * not disturb it: questions, the screen, the log so far, and "oem stop".
+ * not disturb it: questions, the screen, the log so far, and "oem stop". While memory and devices
+ * are held (kernel_resources_held) the same commands pass and the same ones are refused, with
+ * nothing to notify: the transitions live in the LC / LC-ENTER / LC-WATCH / LC-RETURN /
+ * LC-WRITE / LC-USB / LC-FB / LC-POLL / LC-EXC
+ * blocks and are exercised by tools/test-loader-lifecycle.py.
  */
 static void
 fb_command(char *cmd)
 {
-	int busy = running_live != NULL || firmware_fault;
+	int live = running_live != NULL;
 
 	{
-		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
-		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
-		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap") ||
-		    starts_with(cmd, "oem probe") || starts_with(cmd, "oem logwrite"))) {
-			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
+		if (lc_cmd_denied(kernel_resources_held, firmware_fault, live, cmd)) {
+			fb_reply("FAIL", live ? "a kernel is running (oem stop ends it)"
+			    : "a kernel may still hold memory or devices: reboot to start over");
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
-			if (running_live != NULL) {
-				((struct kernel_live *)(uintptr_t)running_live)->stop = 1;
+			int act = lc_stop_action(kernel_resources_held, live);
+
+			if (act == LC_STOP_HELD) {
+				fb_reply("FAIL", "no kernel to notify: memory and devices may still be held (reboot to start over)");
+			} else {
+				if (act == LC_STOP_NOTIFY) {
+					((struct kernel_live *)(uintptr_t)running_live)->stop = 1;
+				}
+				fb_reply("OKAY", "");
 			}
-			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "getvar:")) {
 			const char *var = cmd + 7;
 			if (str_eq(var, "product")) {
@@ -4073,26 +4498,45 @@ usb_poll_command(void)
 	if (USB == NULL) {
 		return;         /* this run was not started over USB */
 	}
-	if (!usb_rx_queued && usb_connected && !EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
+	/* LC-POLL-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: the queue rules
+	 * around the ownership flags of the LC-USB block; a queued request ends only through the
+	 * shared verified rule, so the wait and the poll cannot grow two sets of conditions. */
+	if (!usb_rx_queued && !usb_out_lost && usb_connected && !EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
 		usb_rx_queued = 1;
+		usb_out_owned = 1;
+		usb_out_buf = usb_rx_buf;   /* what this queued request submitted, kept for the check */
+		usb_out_len = 511;
 	}
-	USB->handle_event(&msg, &size, &data);
+	if (EFI_ERROR(USB->handle_event(&msg, &size, &data))) {
+		return;         /* a failed call delivered no event to act on */
+	}
 	if (msg == UsbDeviceEventDeviceStateChange) {
-		usb_connected = (data.device_state == UsbDeviceStateConnected);
-		usb_rx_queued = 0;
+		if (size >= sizeof(data.device_state)) {
+			usb_connected = (data.device_state == UsbDeviceStateConnected);
+		}
+		usb_lost_on_unconfirmed();
 		return;
 	}
-	if (msg != UsbDeviceEventTransferNotification || data.transfer.endpoint_index != USB_EP_OUT) {
+	if (msg != UsbDeviceEventTransferNotification) {
 		return;
 	}
-	usb_rx_queued = 0;
-	if (data.transfer.status != UsbDeviceTransferStatusCompleteOK || data.transfer.bytes_completed == 0) {
+	if (size < sizeof(data.transfer)) {
+		usb_short_event_stops_all();   /* nothing readable names the request it ends */
 		return;
 	}
-	n = data.transfer.bytes_completed < sizeof(cmd) - 1 ? data.transfer.bytes_completed : sizeof(cmd) - 1;
+	if (data.transfer.endpoint_index != USB_EP_OUT) {
+		return;
+	}
+	if (usb_notification(1, &data, &n) != 1 || n == 0) {
+		return;         /* kept, stopped or ended empty: the receive buffer is not read */
+	}
+	if (n > sizeof(cmd) - 1) {
+		n = sizeof(cmd) - 1;
+	}
 	memcpy(cmd, usb_rx_buf, (size_t)n);
 	cmd[n] = 0;
 	fb_command(cmd);
+	/* LC-POLL-END */
 }
 
 static void

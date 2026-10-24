@@ -306,6 +306,9 @@ int main(int argc, char **argv) {
         space->secure_tables = space->table_count + 1;
         assert(!adreno8_secure_xfer(space, &buffer));
         space->secure_tables = space->table_count;
+        space->table_count = sizeof(space->tables) / sizeof(space->tables[0]) + 1;
+        assert(!adreno8_secure_xfer(space, &buffer));
+        space->table_count = 1;
         space->is_on = true;
         assert(!adreno8_secure_xfer(space, &buffer));
         space->is_on = false;
@@ -391,6 +394,24 @@ int main(int argc, char **argv) {
         assert(space->secure_tables == 0);
         printf("unaligned %s page ends the handover before any MP_ASSIGN: PASS\n",
             on_table ? "table" : "data");
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "va-unaligned") == 0) {
+#if PAGE_SIZE > SMMU_GRANULE
+        /* Shifting the buffer start 4 KiB inside a 16 KiB page keeps every
+         * physical page aligned and contiguous under the fixture map, so
+         * only the native-alignment rule in the page helper rejects it. */
+        pa_flat = true;
+        space = secure_space(1);
+        buffer = make_buffer(2);
+        buffer.memory += SMMU_GRANULE;
+        assert(!run_xfer(space, &buffer));
+        assert(call_count == 0 && !adreno8_secure_lost());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        puts("native-unaligned buffer ends the handover before any MP_ASSIGN: PASS");
+#else
+        puts("native page equals the granule here, no unaligned start exists: PASS");
+#endif
         return 0;
     }
     if (argc > 1 && strcmp(argv[1], "table-align") == 0) {
@@ -479,7 +500,7 @@ if __name__ == "__main__":
                          ("guards",), ("contig",), ("regions31",), ("regions32",),
                          ("regions33",), ("mixed31",), ("mixed32",), ("mixed33",),
                          ("unaligned",), ("unaligned-table",), ("table-align",),
-                         ("parange-table",)):
+                         ("va-unaligned",), ("parange-table",)):
                 result = subprocess.run([str(binary), *mode], check=True,
                                         capture_output=True, text=True)
                 if mode == ():
@@ -500,6 +521,10 @@ if __name__ == "__main__":
                             "after 3 MP_ASSIGN attempts") in result.stdout
                 abort_modes = {("argfail",), ("poison",), ("unaligned",),
                                ("unaligned-table",), ("table-align",)}
+                if page_size == 16384:
+                    # At 4 KiB there is no start between the native page and
+                    # the granule, so only the 16 KiB build rejects a page.
+                    abort_modes.add(("va-unaligned",))
                 if mode in abort_modes or (mode == ("parange-table",) and page_size == 16384):
                     assert "ends before any MP_ASSIGN; no page transferred" in result.stdout
                     assert "secure handover attempted" not in result.stdout

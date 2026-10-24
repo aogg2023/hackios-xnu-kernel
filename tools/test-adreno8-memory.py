@@ -21,6 +21,26 @@ int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0
 }
 void adreno8_sleep_ms(uint32_t ms) { scm_sleeps++; (void)ms; }
 static int adreno8_say''', 1)
+# The two middle-break flags move only granule 1 of every page of the
+# matching allocation: both ends of each page stay contiguous, only the
+# middle of a 16 KiB page points to another physical page. The 0x138000 size
+# selects the secure buffer, the PAGE_SIZE size selects table pages. At
+# 4 KiB the condition never matches, so the same mode proves the success path.
+stub = stub.replace("static vm_offset_t skew_va, shift_va;",
+    "static vm_offset_t skew_va, shift_va;\nstatic bool mid_break_data, mid_break_tables;", 1)
+stub = stub.replace(
+    "            uint64_t page = delta / PAGE_SIZE, off = delta % PAGE_SIZE;\n"
+    "            if (!pa_flat) {\n"
+    "                return a.pa + page * 0x20000 + off;\n"
+    "            }",
+    "            uint64_t page = delta / PAGE_SIZE, off = delta % PAGE_SIZE;\n"
+    "            bool hit = off >= SMMU_GRANULE && off < 2 * SMMU_GRANULE &&\n"
+    "                (mid_break_data ? a.size == 0x138000 :\n"
+    "                 mid_break_tables ? a.size == PAGE_SIZE : false);\n"
+    "            if (!pa_flat) {\n"
+    "                return a.pa + page * 0x20000 + off + (hit ? 0x100000 : 0);\n"
+    "            }", 1)
+assert "mid_break_data ? a.size == 0x138000" in stub
 driver = (ROOT / "xnu/files/bsd/dev/adreno8_memory.c").read_text()
 driver, replaced = re.subn(
     r'static void\nadreno8_memory_invalidate\(.*?\n}',
@@ -177,6 +197,48 @@ int main(int argc, char **argv) {
         request.flags = 0x007;
         assert(adreno8_hwsched_alloc(&request, &again) && !again.secure);
         puts("secure handover rejects a changed GMU route before any table work: PASS");
+        return 0;
+    }
+    if (argc > 1 && (strcmp(argv[1], "xfer-middle-data") == 0 ||
+                     strcmp(argv[1], "xfer-middle-table") == 0)) {
+        /* Only granule 1 of every 16 KiB page moves to another physical page
+         * while both ends stay contiguous: a check of first and last word
+         * alone would pass, the granule walk rejects. The data variant
+         * breaks the buffer (allocation 1), the table variant the root table
+         * page (allocation 0). With 4 KiB pages no middle granule exists and
+         * the same mode completes the handover. */
+        bool table_case = argv[1][12] == 't';
+        request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 33,
+            .size = 0x138000, .align = (12 << 8) | 16};
+        adreno8_gpu8_secure_mode = SECURE_MODE_HANDOVER;
+        if (table_case) {
+            mid_break_tables = true;
+        } else {
+            mid_break_data = true;
+        }
+        assert(!adreno8_hwsched_alloc(&request, &result));
+        if (PAGE_SIZE == 4096) {
+            unsigned pages = 0x138000 / 4096;
+            assert(scm_calls == (pages + ASSIGN_SECTIONS - 1) / ASSIGN_SECTIONS + 1);
+            assert(!adreno8_secure_lost() && !adreno8_memory_failed && adreno8_memory_retained());
+            assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+            assert(adreno8_memory_entries[0].complete && adreno8_memory_entries[0].terminal);
+            puts(table_case ? "middle-break table page cannot exist at 4 KiB: handover completes: PASS"
+                 : "middle-break data page cannot exist at 4 KiB: handover completes: PASS");
+            return 0;
+        }
+        assert(scm_calls == 0 && !adreno8_secure_lost());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        assert(adreno8_memory_failed && adreno8_memory_retained());
+        assert(!adreno8_memory_entries[0].complete);
+        unsigned calls_before = scm_calls;
+        assert(!adreno8_hwsched_alloc(&request, &again));
+        request.kind = 4;
+        request.flags = 0x007;
+        assert(!adreno8_hwsched_alloc(&request, &again));
+        assert(scm_calls == calls_before);
+        puts(table_case ? "middle granule of a table page rejected before any MP_ASSIGN: PASS"
+             : "middle granule of a data page rejected before any MP_ASSIGN: PASS");
         return 0;
     }
     if (argc > 1 && (strcmp(argv[1], "xfer-subpage") == 0 || strcmp(argv[1], "xfer-skew") == 0)) {
@@ -379,7 +441,8 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
                         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                         str(target / "check.c"), "-o", str(binary)], check=True)
         for mode in ((), ("gated",), ("xfer",), ("xfer-fail",), ("xfer-open-fail",),
-                     ("xfer-gmu-changed",), ("xfer-subpage",), ("xfer-skew",), ("xfer-parange",)):
+                     ("xfer-gmu-changed",), ("xfer-middle-data",), ("xfer-middle-table",),
+                     ("xfer-subpage",), ("xfer-skew",), ("xfer-parange",)):
             result = subprocess.run([str(binary), *mode], check=True, capture_output=True, text=True)
             if mode == ("xfer",):
                 # The plan line prints from the real PAGE_SIZE and merge rule:
@@ -396,6 +459,14 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
             if mode == ("xfer-gmu-changed",):
                 assert "GMU route context changed" in result.stdout
                 assert "secure handover attempted" not in result.stdout
+            if mode in (("xfer-middle-data",), ("xfer-middle-table",)):
+                key = "secure table page" if mode == ("xfer-middle-table",) else "secure page"
+                if page_size == 4096:
+                    assert "secure handover complete" in result.stdout
+                else:
+                    assert key in result.stdout and "unusable for MP_ASSIGN" in result.stdout
+                    assert "ends before any MP_ASSIGN; no page transferred" in result.stdout
+                    assert "secure handover attempted" not in result.stdout
             if mode in (("xfer-subpage",), ("xfer-skew",)):
                 if page_size == 4096:
                     want = ("312 pages merge into 1 data regions plus 3 table pages, "

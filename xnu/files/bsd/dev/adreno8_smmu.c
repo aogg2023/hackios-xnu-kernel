@@ -418,37 +418,51 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
 		    (adreno8_smmu_pages + space->context) * adreno8_smmu_page + SMMU_CB_SCTLR);
 		if (sctlr != 0) {
 			uint64_t now = mach_absolute_time(), ns;
-			unsigned live = 0, hits = 0;
+			unsigned scanned = 0, valid = 0, hits = 0;
 
 			printf("adreno8: %u: secure preflight: context %u SCTLR %#x is nonzero; the context bank fails the preflight\n",
 			    adreno8_step, space->context, sctlr);
 			/*
-			 * Same-moment routing sample: one read-only pass over the
-			 * probed SMR/S2CR range, no writes; the step number and the
-			 * monotonic nanoseconds tag when it was taken. The SCTLR
-			 * verdict already stands; a clean scan keeps the rejection
-			 * and a conflicting scan adds no new reason.
+			 * Same-moment routing view: one read-only pass; values
+			 * print as read, no second pass, no MMIO beyond one SMR
+			 * per slot plus one S2CR per valid SMR. The candidate
+			 * slot's SMR prints even when invalid, and then its
+			 * S2CR is explicitly unread. Every valid entry prints
+			 * (bounded by the probed match count), so post-analysis
+			 * can check whether the kernel's own GMU route (a valid
+			 * entry covering stream 5 with the S2CR pointing at
+			 * context 2) shows up: all SMRs reading invalid is
+			 * degraded read-out, a different picture from a clear
+			 * one. Nothing in the view describes what the secure
+			 * world has reserved. The step number and monotonic
+			 * nanoseconds tag the moment; the SCTLR verdict
+			 * already stands.
 			 */
 			absolutetime_to_nanoseconds(now, &ns);
 			for (unsigned i = 0; i < adreno8_smmu_matches; i++) {
 				uint32_t smr = adreno8_get(&adreno8_smmu, "smr sample", SMMU_SMR(i));
-				uint32_t s2cr, mask;
+				uint32_t s2cr = 0, mask;
 
+				scanned++;
 				if (!(smr & SMR_VALID)) {
+					if (i == match) {
+						printf("adreno8: %u: preflight routing sample: match %u smr %#x invalid; s2cr not read\n",
+						    adreno8_step, i, smr);
+					}
 					continue;
 				}
 				s2cr = adreno8_get(&adreno8_smmu, "s2cr sample", SMMU_S2CR(i));
+				valid++;
+				printf("adreno8: %u: preflight routing sample: match %u smr %#x s2cr %#x\n",
+				    adreno8_step, i, smr, s2cr);
 				mask = (smr >> 16 & 0x7fff) | SMR_MASK;
-				live++;
 				if (i == match || ((smr ^ stream) & 0x7fff & ~mask) == 0 ||
 				    (s2cr & 0xff) == space->context) {
 					hits++;
-					printf("adreno8: %u: preflight routing sample: match %u smr %#x s2cr %#x sits on the candidate route or context %u\n",
-					    adreno8_step, i, smr, s2cr, space->context);
 				}
 			}
-			printf("adreno8: %u: preflight routing sample at t=%lluns: %u valid match(es), %u on the candidate route or context; the SCTLR rejection stands\n",
-			    adreno8_step, ns, live, hits, space->context);
+			printf("adreno8: %u: preflight routing sample at t=%lluns: scanned %u, valid %u, %u on the candidate route or context %u; the SCTLR rejection stands\n",
+			    adreno8_step, ns, scanned, valid, hits, space->context);
 			return false;
 		}
 	}

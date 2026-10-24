@@ -54,10 +54,12 @@ adreno8_secure_lost(void)
 	return adreno8_assign.lost;
 }
 
-/* Prove one kernel page is wholly ours and mappable: a real physical start,
- * aligned to the SMMU granule and to this kernel's page size, covering the
- * whole page contiguously (a 16 KiB kernel page may sit on four separate 4 KiB
- * SMMU leaves), and ending inside the range the SMMU can translate. Every page
+/* Prove one kernel page is wholly ours and mappable: a virtual address with
+ * this kernel's native alignment, a real physical start aligned to the SMMU
+ * granule and to this kernel's page size, every 4 KiB granule of the page
+ * mapping at first + offset (a 16 KiB kernel page may sit on four separate
+ * 4 KiB SMMU leaves, and a middle leaf can move while both ends still look
+ * right), and ending inside the range the SMMU can translate. Every page
  * that reaches MP_ASSIGN passes through here, including the argument page. */
 static bool
 adreno8_assign_page_phys(vm_offset_t va, uint64_t *phys)
@@ -65,12 +67,18 @@ adreno8_assign_page_phys(vm_offset_t va, uint64_t *phys)
 	uint64_t first = kvtophys(va);
 
 	*phys = first;
-	if (first == 0 || (first & SMMU_GRANULE_MASK) || (first & (PAGE_SIZE - 1)) ||
-	    kvtophys(va + PAGE_SIZE - 1) != first + PAGE_SIZE - 1 ||
-	    first + PAGE_SIZE > SMMU_PHYS_LIMIT) {
+	if ((va & (PAGE_SIZE - 1)) || first == 0 || (first & SMMU_GRANULE_MASK) ||
+	    (first & (PAGE_SIZE - 1)) || first > SMMU_PHYS_LIMIT - PAGE_SIZE) {
 		return false;
 	}
-	return true;
+	/* Walk every granule boundary instead of trusting the two ends: the
+	 * range test subtracts PAGE_SIZE so no uint64 sum can wrap around. */
+	for (vm_offset_t at = 0; at < PAGE_SIZE; at += SMMU_GRANULE) {
+		if (kvtophys(va + at) != first + at) {
+			return false;
+		}
+	}
+	return kvtophys(va + PAGE_SIZE - 1) == first + PAGE_SIZE - 1;
 }
 
 /* One physically contiguous, zeroed argument page. A page that fails

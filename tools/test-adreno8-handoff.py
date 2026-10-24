@@ -258,8 +258,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (strcmp(which, "ebusy") == 0) {
-        /* The firmware answers MP_ASSIGN with EBUSY forever: the vendor retry
-         * bound runs out inside the first batch and the boot is retained. */
+        /* The firmware answers MP_ASSIGN with EBUSY forever: this driver's bound of
+         * 20 attempts runs out inside the first batch and the boot is retained. */
         scm_ebusy = 1;
         boot();
         assert(scm_calls == ASSIGN_EBUSY_RETRY && scm_sleeps == ASSIGN_EBUSY_RETRY);

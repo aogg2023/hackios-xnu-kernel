@@ -75,6 +75,14 @@ adreno8_step_smmu_read(void)
 	for (uint32_t cb = 0; cb <= SECURE_CONTEXT && cb < adreno8_smmu_contexts; cb++) {
 		uint32_t base = (adreno8_smmu_pages + cb) * adreno8_smmu_page;
 
+		/* adreno8_smmu_layout only proves the GMU context fits the mapped
+		 * block; apply the preflight's bound to every context observed
+		 * here so a bigger granule or page count cannot read past the end. */
+		if ((adreno8_smmu_pages + cb + 1) * adreno8_smmu_page > adreno8_smmu.size) {
+			printf("adreno8: %u: context %u starts past the mapped SMMU block: its reads are skipped\n",
+			    adreno8_step, cb);
+			break;
+		}
 		adreno8_get(&adreno8_smmu, "cb sctlr", base + SMMU_CB_SCTLR);
 		adreno8_get(&adreno8_smmu, "cb ttbr0, low", base + SMMU_CB_TTBR0);
 		adreno8_get(&adreno8_smmu, "cb ttbr0, high", base + SMMU_CB_TTBR0 + 4);
@@ -554,11 +562,12 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
 }
 
 /*
- * Read-only secure preflight, run before every secure page-table or data
- * MP_ASSIGN. The candidate route is stream 2, match 2, context 3 (vendor
- * sun-gpu.dtsi gfx3d_secure). Bounds are checked before any MMIO read, and
- * the scan only touches the SMR/S2CR and context-bank registers the boot
- * probe already reads. A context SCTLR with M set, a valid SMR on the
+ * Read-only secure preflight, run once per kind-5 secure allocation before
+ * that request's first MP_ASSIGN batch. The candidate route is stream 2,
+ * match 2, context 3 (vendor sun-gpu.dtsi gfx3d_secure). Bounds are checked
+ * before any MMIO read; the scan reads every probed SMR/S2CR pair (24 slots
+ * on annibale, while the boot probe samples only the first 16) and the
+ * context-bank registers inside the mapped range. A context SCTLR with M set, a valid SMR on the
  * candidate slot or covering stream 2, and an S2CR of any type pointing at
  * context 3 each fail the check. The check additionally requires the GMU's
  * own stream 5 route to read back exactly as adreno8_space_on configured it:

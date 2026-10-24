@@ -12,9 +12,11 @@ stub = fixture["stub"].replace("assert(size == 4096);", "assert(size != 0);")
 stub = stub.replace("static int adreno8_say", r'''
 uint32_t adreno8_gpu8_secure_mode;
 static unsigned scm_calls, scm_sleeps, scm_fail_at = 999999u;
+static unsigned scm_clean_floor = ~0u; /* clean event count when the first MP_ASSIGN ran */
 int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
     uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *answer) {
     assert(function == 0x42000c16ull && arginfo == 0x1117ull);
+    if (scm_clean_floor == ~0u) scm_clean_floor = clean_count;
     scm_calls++;
     *answer = scm_calls == scm_fail_at ? 5 : 0;
     return scm_calls == scm_fail_at ? -5 : 0;
@@ -116,6 +118,15 @@ int main(int argc, char **argv) {
         assert(adreno8_memory_entries[0].secure && adreno8_memory_entries[0].complete &&
                adreno8_memory_entries[0].terminal && secure->memory != 0);
         assert(secure->gpu_address >= 0x10000000 && secure->gpu_address < 0xe0000000);
+        /* TrustZone reads the buffer from DRAM: a clean over the whole request
+         * range must land before the first MP_ASSIGN of this handover. */
+        int data_clean = 0;
+        for (unsigned i = 0; i < scm_clean_floor; i++) {
+            if (cleaned[i].start == secure->memory && cleaned[i].size >= request.size) {
+                data_clean = 1;
+            }
+        }
+        assert(data_clean);
         for (unsigned offset = 0; offset < request.size; offset += 4096) {
             assert(walk(adreno8_secure_space.tables[0].phys, secure->gpu_address + offset) ==
                    kvtophys(secure->memory + offset));

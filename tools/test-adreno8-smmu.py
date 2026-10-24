@@ -47,6 +47,15 @@ static int kernel_map;
 static unsigned adreno8_step;
 extern uint32_t adreno8_gpu8_secure_mode; /* defined by the memory harness; unused by the SMMU tests */
 ''' + structures + "\n" + constants + r'''
+/* One record per cache-clean call: address, length, and a snapshot of the
+ * first bytes (up to the cap). The secure handover tests check the cleanup
+ * order per SCM call against these events; cleans larger than the cap record
+ * addr/len only, which is all their coverage checks need. Declared ahead of
+ * the harness fakes, which reference the event log from inside adreno8_scm_call. */
+#define CLEAN_SNAP_CAP 1024
+struct clean_event { vm_offset_t start; vm_size_t size; unsigned snap_len; unsigned char snap[CLEAN_SNAP_CAP]; };
+static struct clean_event cleaned[4096];
+static unsigned clean_count;
 /* The driver's printf is adreno8_say; the real one reaches the console, so
  * the stub forwards to stdout and the runner can check message order. */
 static int adreno8_say(const char *s, ...) {
@@ -69,8 +78,6 @@ static unsigned writes, translations, ats_requests;
 struct write_record { uint32_t offset, value; };
 static struct write_record write_log[512];
 static unsigned write_log_count;
-static vm_offset_t cleaned[4096];
-static unsigned clean_count;
 static unsigned reads[0x40000 / 4];
 static bool sync_ok = true, atos_ok = true, atos_wait_ok = true;
 static uint32_t reject_offset = ~0u, reject_value;
@@ -184,7 +191,12 @@ static bool adreno8_wait_for(struct adreno8_block *b, uint32_t offset, uint32_t 
 static void adreno8_to_memory(vm_offset_t memory, vm_size_t size) {
     assert(size == 4096);
     assert(clean_count < 4096);
-    cleaned[clean_count++] = memory;
+    cleaned[clean_count] = (struct clean_event){memory, size, 0, {0}};
+    if (size <= CLEAN_SNAP_CAP) {
+        memcpy(cleaned[clean_count].snap, (void *)memory, size);
+        cleaned[clean_count].snap_len = (unsigned)size;
+    }
+    clean_count++;
 }
 static void mock_atos(vm_offset_t address, uint64_t value) {
     assert(address == 0x22800);
@@ -253,6 +265,15 @@ int main(void) {
     assert(reads[(0x22000 + SMMU_CB_SCTLR) / 4] == 1);
     assert(reads[(0x23000 + SMMU_CB_SCTLR) / 4] == 1);
     assert(writes == 0);
+    /* G3: the boot probe must carry the same mapped-range bound as the
+     * secure preflight. With CB3 starting exactly at the end of the mapped
+     * block, CB2 is still observed and every CB3 read is skipped. */
+    reset(&space, false);
+    adreno8_smmu.size = 0x23000;
+    assert(adreno8_step_smmu_read());
+    assert(reads[(0x22000 + SMMU_CB_SCTLR) / 4] == 1);
+    assert(reads[0x23000 / 4] == 0);
+    adreno8_smmu.size = 0x40000;
     /* AArch64 privileged instruction fetch requires AP_UNPRIV clear on writable pages. */
     assert((PTE_PAGE & (3u << 6)) == 0 && (PTE_PAGE & (3ULL << 53)) == 0);
     assert((PTE_PAGE & (3u << 10)) == (3u << 10) && (MAIR0_NORMAL & 255) == 0x44);
@@ -465,8 +486,8 @@ int main(void) {
     clean_count = 0;
     assert(adreno8_space_map_region(&space, 0x800000, payload, 4096,
                                    ADRENO8_MEM_READ | ADRENO8_MEM_WRITE | ADRENO8_MEM_PRIV));
-    assert(cleaned[0] == adreno8_space_table(&space, 2, 4)->table);
-    assert(cleaned[1] == adreno8_space_table(&space, 1, 0)->table);
+    assert(cleaned[0].start == adreno8_space_table(&space, 2, 4)->table);
+    assert(cleaned[1].start == adreno8_space_table(&space, 1, 0)->table);
     assert((*adreno8_space_entry(&space, 0x800000) & ~PTE_ADDRESS) == (0xe03 | (3ULL << 53)));
     alloc_fail_after = 1;
     assert(!adreno8_space_map_region(&space, 0x3ffff000, payload, 8192, ADRENO8_MEM_READ));

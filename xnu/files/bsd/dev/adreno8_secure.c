@@ -9,9 +9,16 @@
  * buffer whose physical address occupies register slot x5. */
 #define SCM_MP_ASSIGN        0x42000c16ull
 #define SCM_ASSIGN_ARGINFO   0x1117ull
-#define ASSIGN_SECTIONS      32u       /* vendor BATCH_MAX_SECTIONS: region entries per SCM call */
+/* vendor BATCH_MAX_SECTIONS: region entries per SCM call. The vendor caps a
+ * batch at BATCH_MAX_SIZE (2 MiB) on top (vendor-secure_buffer.c); this
+ * driver batches by entry count only. The current kind-5 request (0x138000)
+ * stays under 2 MiB; the vendor's reason for that cap is unverified. */
+#define ASSIGN_SECTIONS      32u
 #define ASSIGN_EBUSY         (-12)
-#define ASSIGN_EBUSY_RETRY   20u       /* vendor QCOM_SCM_EBUSY_MAX_RETRY at 30 ms spacing */
+/* 20 attempts, 30 ms sleep after each EBUSY (20 sleeps, including one after
+ * the last EBUSY). The vendor loop allows up to 22 attempts and 21 sleeps
+ * (vendor-qcom_scm-smc.c); the counts differ. */
+#define ASSIGN_EBUSY_RETRY   20u
 #define ASSIGN_EBUSY_MS      30u
 #define VMID_HLOS            3u
 #define VMID_CP_PIXEL        0xAu
@@ -88,9 +95,11 @@ adreno8_assign_page_phys(vm_offset_t va, uint64_t *phys)
 }
 
 /* One physically contiguous, zeroed argument page. A page that fails
- * verification here is freed and retried on the next call instead of marking
- * `lost`: the argument page is a plain HLOS page never handed to the secure
- * world, so its ownership is never in doubt. */
+ * verification here is freed and does not mark `lost`: the argument page is a
+ * plain HLOS page never handed to the secure world, so its ownership is never
+ * in doubt. The failed handover itself is terminal — adreno8_secure_xfer_abort
+ * closes the state and no call retries it this boot; the free only returns a
+ * page the secure world never saw. */
 static bool
 adreno8_assign_open(void)
 {
@@ -213,13 +222,14 @@ adreno8_assign_data(const struct adreno8_memory *buffer, unsigned batch_base)
 		if (!adreno8_assign_page_phys(buffer->memory + at, &phys)) {
 			/*
 			 * A page whose physical start cannot be proven closes the secure path for
-			 * the whole boot, whether or not an earlier batch already ran. Before the
-			 * first MP_ASSIGN the pages are still HLOS-owned and the cost is only a
-			 * closed secure path; after one, the driver cannot learn which regions TZ
-			 * accepted, so every page of this buffer stays reserved until cold reset.
-			 * The check never runs against a page TZ may own, so no CPU read probes a
-			 * transferred page for recovery; a cold reset recovering a first handover
-			 * is itself unconfirmed and needs device-side confirmation.
+			 * the whole boot: the driver cannot learn which regions TZ accepted, so
+			 * every page of this buffer stays reserved until cold reset. Reaching it
+			 * means at least one MP_ASSIGN already went out: adreno8_assign_plan
+			 * proves every data page before the first batch, and the table batches
+			 * precede the data batches. The check reads only page tables through
+			 * kvtophys, so no CPU read probes a transferred page for recovery; a
+			 * cold reset recovering a first handover is itself unconfirmed and needs
+			 * device-side confirmation.
 			 */
 			printf("adreno8: secure page %#llx unusable for MP_ASSIGN\n", phys);
 			adreno8_assign.lost = true;
@@ -393,12 +403,13 @@ adreno8_secure_xfer(struct adreno8_gpu_space *space, const struct adreno8_memory
 	}
 	/* The rules this path can prove from its arguments alone: the buffer
 	 * must exist, the secure context must still be disabled for the
-	 * experiment, and the table list must be non-empty, inside the array
-	 * the space carries, and have an unprocessed tail. buffer and space
-	 * are caller-owned structures that the allocation path dereferences
-	 * before calling, so neither may be NULL; table contents are proven
-	 * page by page in adreno8_assign_tables_check. buffer->size is a
-	 * uint32, so rounding it up in uint64 cannot overflow. */
+	 * experiment, and the table list must be non-empty and inside the
+	 * array the space carries, with the cursor at or below the count (a
+	 * cursor equal to the count contributes no table batches). buffer and
+	 * space are caller-owned structures that the allocation path
+	 * dereferences before calling, so neither may be NULL; table contents
+	 * are proven page by page in adreno8_assign_tables_check. buffer->size
+	 * is a uint32, so rounding it up in uint64 cannot overflow. */
 	if (buffer->memory == 0 || buffer->size == 0 || space->is_on ||
 	    space->table_count == 0 ||
 	    space->table_count > sizeof(space->tables) / sizeof(space->tables[0]) ||

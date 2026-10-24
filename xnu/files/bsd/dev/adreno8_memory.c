@@ -26,8 +26,9 @@ static bool adreno8_memory_failed;
 bool
 adreno8_memory_retained(void)
 {
-	/* adreno8_secure_lost marks pages whose ownership is unclear after a
-	 * failed or unconfirmed MP_ASSIGN; they stay reserved until cold reset. */
+	/* Recorded pages and tables stay retained until cold reset. adreno8_secure_lost
+	 * records uncertain ownership left by a failed or unconfirmed MP_ASSIGN; whenever
+	 * it is set, the allocation and table counts above already hold retention. */
 	return adreno8_memory_count != 0 || adreno8_gpu_space.table_count != 0 ||
 	    adreno8_gpu_space.is_on || adreno8_secure_space.table_count != 0 ||
 	    adreno8_secure_space.is_on || adreno8_secure_lost();

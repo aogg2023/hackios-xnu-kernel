@@ -33,11 +33,14 @@
  * adreno8_fine=1      also pause before individual accesses in that step
  * adreno8_watch=S     inspect GMU status for S seconds after step 11 or later (default 20)
  * adreno8_keep=1      retain resources; stage 15 requires a cold reset before memory reuse
- * adreno8_secure_preflight=N  stage-14 secure experiment: 1 answers kind 5 with the read-only
- *                  SMMU preflight only; 2 runs the isolated handover experiment: one MP_ASSIGN
- *                  handover of the kernel's own kind-5 data and secure page-table pages, then
- *                  the GPU memory path stops; neither mode replies to MEM_ALLOC, writes CB3 or
- *                  hands addresses to the firmware; unknown values keep the secure path off
+ * adreno8_secure_preflight=N  stage-14 secure experiment: every kind-5 request runs the
+ *                  read-only adreno8_secure_preflight before the mode branch; mode 1 stops
+ *                  after it with the preflight-only log, mode 2 runs the isolated handover
+ *                  experiment: one MP_ASSIGN handover of the kernel's own kind-5 data and
+ *                  secure page-table pages, then the GPU memory path stops; mode 0 and
+ *                  unknown values stop after the preflight with the closed-path log; none
+ *                  of the modes replies to MEM_ALLOC, writes CB3 or hands addresses to the
+ *                  firmware
  * adreno8_speed=N     GX operating point; only 1 (125 MHz) is exposed before SKU selection
  * adreno8_gmuclk=1    select the GPU PLL clock parent; default uses the crystal
  * adreno8_return=1    return to the resident loader after cleanup

@@ -26,8 +26,9 @@ bool adreno8_secure_preflight(void);
 
 uint32_t adreno8_secure_xfer_state(void);
 
-/* Close the experiment before any MP_ASSIGN goes out (no usable data page, no
- * argument page, or the driver could not stage the batch). Nothing transferred,
+/* Close the experiment before any MP_ASSIGN goes out: no secure root table
+ * page, no free IOVA range, no buffer allocation, no region mapping, no
+ * provable data or table page, no argument page. Nothing transferred,
  * so no page is marked lost; the terminal state still ends the secure path for
  * the rest of the boot. The call is inert once an attempt went out: after the
  * first MP_ASSIGN only the transfer result may close the state. */

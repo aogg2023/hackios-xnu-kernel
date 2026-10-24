@@ -38,7 +38,7 @@ static struct scm_call { uint64_t function, arginfo, args[4]; } calls[80];
 static struct wire_region snap[80][32];
 static struct wire_perm perm_snap[80][2];
 static uint64_t ext_snap[80][4];
-static unsigned call_count, clean_at_call[80];
+static unsigned call_count, clean_at_call[80], clean_lo[80];
 static int32_t outcomes[80][2];
 static uint64_t outcome_answers[80];
 static unsigned outcome_count, outcome_next;
@@ -69,6 +69,7 @@ int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0
     assert(call_count < 80);
     assert(function == 0x42000c16ull && arginfo == 0x1117ull);
     calls[call_count] = (struct scm_call){function, arginfo, {argument0, argument1, argument2, argument3}};
+    clean_lo[call_count] = call_count ? clean_at_call[call_count - 1] : 0;
     clean_at_call[call_count] = clean_count;
     for (unsigned i = 0; i < argument1 / 16; i++) {
         struct wire_region *live = (struct wire_region *)(uintptr_t)physical_table(argument0);
@@ -95,6 +96,26 @@ int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0
     return status;
 }
 void adreno8_sleep_ms(uint32_t ms) { sleeps++; sleeps_total += ms; }
+/* Every byte MP_ASSIGN reads from the argument page: 32 region slots, the
+ * source word at 512, the permission records at 576 and the four extended
+ * argument words at 640 (ASSIGN_USED). */
+#define ARG_CLEAN_BYTES (640u + 4u * sizeof(uint64_t))
+/* Cleans before run_xfer are setup noise (page-table creation, a freed and
+ * re-taken argument page could even reuse the address); batch checks start
+ * at this baseline instead of the window start. */
+static unsigned xfer_clean_base;
+static int arg_clean_event(unsigned call) {
+    vm_offset_t arg_va = (vm_offset_t)(uintptr_t)physical_table(calls[call].args[0]);
+    unsigned lo = clean_lo[call] > xfer_clean_base ? clean_lo[call] : xfer_clean_base;
+    int ev = -1;
+    for (unsigned i = lo; i < clean_at_call[call]; i++) {
+        if (cleaned[i].start == arg_va && cleaned[i].size >= ARG_CLEAN_BYTES &&
+            cleaned[i].snap_len >= ARG_CLEAN_BYTES) {
+            ev = (int)i; /* last covering clean inside this call's window */
+        }
+    }
+    return ev;
+}
 static void check_envelope(unsigned call, unsigned regions) {
     struct scm_call *c = &calls[call];
     assert(c->args[0] == kvtophys((vm_offset_t)(uintptr_t)physical_table(c->args[0])));
@@ -102,7 +123,21 @@ static void check_envelope(unsigned call, unsigned regions) {
     assert(c->args[2] == c->args[0] + 512 && c->args[3] == c->args[0] + 640);
     assert(*staged_sources(c->args[0]) == 3);
     assert(ext_snap[call][0] == 4 && ext_snap[call][1] == c->args[0] + 576);
-    assert(clean_at_call[call] >= 1); /* the page was cleaned before this call */
+    int ev = arg_clean_event(call);
+    assert(ev >= 0); /* a clean over all 672 wire bytes ran since the previous SCM */
+    /* The bytes at clean time must equal what the SMC entry reads. Later
+     * batches restage the same page, so compare against the call-time
+     * snapshots; a clean staged early leaves stale snapshot bytes here. */
+    const unsigned char *sn = cleaned[ev].snap;
+    assert(sizeof(struct wire_region) == 16 && sizeof(struct wire_perm) == 24);
+    for (unsigned i = 0; i < regions; i++) {
+        assert(memcmp(sn + i * 16, &snap[call][i], sizeof(snap[call][0])) == 0);
+    }
+    uint32_t sources_three = 3;
+    assert(memcmp(sn + 512, &sources_three, 4) == 0);
+    assert(ext_snap[call][2] % 24 == 0 && ext_snap[call][2] <= 48);
+    assert(memcmp(sn + 576, perm_snap[call], (size_t)ext_snap[call][2]) == 0);
+    assert(memcmp(sn + 640, ext_snap[call], 4 * sizeof(uint64_t)) == 0);
 }
 '''
 fakes = fakes.replace("@@SNAPHELP@@", logcheck.SNAP_HELPERS_C).replace(
@@ -127,6 +162,7 @@ static struct adreno8_gpu_space *secure_space(unsigned tables) {
     return &adreno8_secure_space;
 }
 static bool run_xfer(struct adreno8_gpu_space *space, struct adreno8_memory *buffer) {
+    xfer_clean_base = clean_count; /* batch clean checks start at this event index */
     return adreno8_secure_preflight() && adreno8_secure_xfer(space, buffer);
 }
 static void check_regions(unsigned call, struct adreno8_memory *buffer, unsigned pages,
@@ -158,9 +194,22 @@ static void check_table_call(unsigned call, struct adreno8_gpu_space *space, uns
     assert(perm_snap[call][0].vmid == 3 && perm_snap[call][0].perm == 6);
     assert(perm_snap[call][1].vmid == 10 && perm_snap[call][1].perm == 4);
     assert(ext_snap[call][2] == 48);
+    int ev = arg_clean_event(call);
     for (unsigned i = 0; i < count; i++) {
         assert(snap[call][i].address == space->tables[i].phys);
         assert(snap[call][i].size == PAGE_SIZE);
+        /* Each table page is cleaned over its native page before the batch
+         * stages, so the clean event sits inside this call's window and
+         * predates the argument-page clean. */
+        vm_offset_t tva = (vm_offset_t)(uintptr_t)physical_table(snap[call][i].address);
+        int hit = 0;
+        unsigned lo = clean_lo[call] > xfer_clean_base ? clean_lo[call] : xfer_clean_base;
+        for (unsigned j = lo; j < (unsigned)ev; j++) {
+            if (cleaned[j].start == tva && cleaned[j].size >= PAGE_SIZE) {
+                hit = 1;
+            }
+        }
+        assert(hit);
     }
 }
 int main(int argc, char **argv) {
@@ -298,7 +347,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc > 1 && strcmp(argv[1], "ebusy") == 0) {
-        /* -EBUSY retries at the vendor's 30 ms spacing; the second attempt of
+        /* -EBUSY retries at the driver's own 30 ms spacing; the second attempt of
          * the table batch lands and the handover completes. */
         script(-12, 0);
         script(0, 0);

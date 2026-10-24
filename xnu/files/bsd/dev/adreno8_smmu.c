@@ -387,15 +387,17 @@ adreno8_space_verify(struct adreno8_gpu_space *space, bool atos)
 }
 
 /*
- * The handover rides on the GMU's own route: firmware reaches MP_ASSIGN
- * through stream 5, so a strict preflight only stands while that route still
- * reads exactly what adreno8_space_on wrote for the GMU space. Require the
- * GMU space to be enabled, the GMU_MATCH slot to read back
- * SMR_VALID | SMR_MASK << 16 | GMU_STREAM, and the S2CR to be a translate
- * naming adreno8_gmu_space.context. A missing slot, a moved route, or a
- * changed type or context rejects the secure experiment; the check reads two
- * registers and writes nothing. The secure world's own reservations stay
- * invisible to this check like everywhere else in the preflight.
+ * Confirm the GMU space's route still reads back exactly as adreno8_space_on
+ * configured it: require the GMU space to be enabled, the GMU_MATCH slot to
+ * read back SMR_VALID | SMR_MASK << 16 | GMU_STREAM, and the S2CR to be a
+ * translate naming adreno8_gmu_space.context. The MP_ASSIGN SCM call goes
+ * out as an SMC from this CPU, so this readback says nothing about the SCM
+ * path or about secure resource ownership; it covers the MMIO view and the
+ * completed initialization configuration only. A missing slot, a moved
+ * route, or a changed type or context rejects the secure experiment; the
+ * check reads two registers and writes nothing. The secure world's own
+ * reservations stay invisible to this check like everywhere else in the
+ * preflight.
  */
 static bool
 adreno8_gmu_route_matches(void)
@@ -403,7 +405,7 @@ adreno8_gmu_route_matches(void)
 	uint32_t smr, s2cr;
 
 	if (!adreno8_gmu_space.is_on) {
-		printf("adreno8: %u: secure preflight: GMU route check: the GMU space is not enabled; stream 5 cannot vouch for the handover\n", adreno8_step);
+		printf("adreno8: %u: secure preflight: GMU route check: the GMU space is not enabled, so the configured route is not there to read back\n", adreno8_step);
 		return false;
 	}
 	if (GMU_MATCH >= adreno8_smmu_matches) {
@@ -519,8 +521,8 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
 		if (m_set || hits != 0) {
 			return false;
 		}
-		/* The candidate side passed; the GMU route the handover rides on
-		 * must still read as configured. */
+		/* The candidate side passed; the GMU space's own route must
+		 * still read back as it was configured. */
 		return adreno8_gmu_route_matches();
 	}
 	for (unsigned i = 0; i < adreno8_smmu_matches; i++) {

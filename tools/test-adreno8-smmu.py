@@ -236,7 +236,7 @@ static void map_one(struct adreno8_gpu_space *space) {
 }
 /* Seed the GMU route exactly as stage 9 writes it: valid slot 1 naming
  * stream 5 with mask 0 and a translate S2CR into context 2. The strict
- * preflight requires this route because the secure handover rides on it. */
+ * preflight requires this route to still read back as it was configured. */
 static void seed_gmu_route(void) {
     adreno8_gmu_space.is_on = true;
     regs[SMMU_SMR(1) / 4] = SMR_VALID | SMR_MASK << 16 | 5;
@@ -612,7 +612,7 @@ int main(void) {
     regs[SMMU_S2CR(5) / 4] = 0x10004u;
     assert(!adreno8_secure_preflight() && writes == 0);
     assert(reads[SMMU_S2CR(5) / 4] == 1);
-    /* The GMU route the handover rides on: each variant below satisfies the
+    /* The GMU space's own route check: each variant below satisfies the
      * candidate-side conditions yet rejects the experiment with zero writes
      * because the GMU's own slot 1 route is absent, moved, or retyped. */
     reset(&space, false);

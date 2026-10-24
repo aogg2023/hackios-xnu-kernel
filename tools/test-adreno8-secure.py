@@ -158,7 +158,7 @@ int main(int argc, char **argv) {
     /* The production preflight reads the SMMU layout; seed the same register
      * picture the boot probe sees so the handover paths can run. The GMU
      * route seed is the stage-9 write for slot 1: the strict preflight
-     * requires it because the handover rides on that route. */
+     * requires it to still read back as configured. */
     regs[SMMU_IDR0 / 4] = 0x4c017e18;
     regs[SMMU_IDR1 / 4] = 0x40000015;
     regs[SMMU_IDR2 / 4] = 0x5511;

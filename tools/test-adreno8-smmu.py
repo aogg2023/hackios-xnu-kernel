@@ -52,6 +52,9 @@ static void adreno8_space_off(struct adreno8_gpu_space *, uint32_t);
 static bool adreno8_space_faulted(struct adreno8_gpu_space *);
 static uint32_t regs[0x40000 / 4];
 static unsigned writes, translations, ats_requests;
+struct write_record { uint32_t offset, value; };
+static struct write_record write_log[512];
+static unsigned write_log_count;
 static vm_offset_t cleaned[4096];
 static unsigned clean_count;
 static unsigned reads[0x40000 / 4];
@@ -123,6 +126,8 @@ static uint32_t adreno8_get(struct adreno8_block *b, const char *name, uint32_t 
 }
 static void adreno8_put(struct adreno8_block *b, const char *name, uint32_t offset, uint32_t value) {
     assert(offset < sizeof(regs));
+    assert(write_log_count < sizeof(write_log) / sizeof(write_log[0]));
+    write_log[write_log_count++] = (struct write_record){offset, value};
     writes++;
     if (offset == reject_offset && value == reject_value) return;
     if (offset == 0x22000 + SMMU_CB_SCTLR) value &= ~sctlr_raz_mask;
@@ -181,6 +186,7 @@ static void reset(struct adreno8_gpu_space *space, bool atos) {
     sctlr_raz_mask = 1u << 12;
     tcr2_read_xor = s2cr_trans_raz_mask = 0;
     writes = translations = ats_requests = 0;
+    write_log_count = 0;
     clean_count = 0;
     reject_offset = ~0u;
     alloc_fail_after = -1;
@@ -234,18 +240,51 @@ int main(void) {
         assert(reads[(0x22000 + SMMU_CB_TTBR1) / 4] == 1);
         assert(reads[(0x22000 + SMMU_CB_MAIR1) / 4] == 1);
     }
-    /* Occupancy pre-check: an enabled context bank, or any stream whose S2CR
-     * routes to the requested context (active or fault leftover field), blocks
-     * the takeover. All three rejections are reads only. */
-    for (unsigned probe = 0; probe < 3; probe++) {
-        reset(&space, false);
-        map_one(&space);
-        if (probe == 0) regs[(0x22000 + SMMU_CB_SCTLR) / 4] = 1u;
-        if (probe == 1) { regs[SMMU_SMR(5) / 4] = 0x80000003; regs[SMMU_S2CR(5) / 4] = 2u; }
-        if (probe == 2) { regs[SMMU_SMR(5) / 4] = 0x80000003; regs[SMMU_S2CR(5) / 4] = 0x20002u; }
-        assert(!adreno8_space_on(&space, 5, 1));
-        assert(!space.is_on && writes == 0);
-    }
+    /* Ordinary takeover keeps the conditions the step14b runs verified: an
+     * active route into the requested context blocks it (reads only); a
+     * fault leftover that only carries the context index does not block,
+     * and neither does a non-zero context SCTLR. */
+    reset(&space, false);
+    map_one(&space);
+    regs[SMMU_SMR(5) / 4] = 0x80000003;
+    regs[SMMU_S2CR(5) / 4] = 2u;
+    assert(!adreno8_space_on(&space, 5, 1) && writes == 0);
+    reset(&space, false);
+    map_one(&space);
+    regs[SMMU_SMR(5) / 4] = 0x80000003;
+    regs[SMMU_S2CR(5) / 4] = 0x20002u;
+    assert(adreno8_space_on(&space, 5, 1));
+    assert(space.is_on && translations == 1);
+    adreno8_space_off(&space, 1);
+    /* The device-read CB2 SCTLR 0x107c430c (enable bit clear, leftover TCR
+     * stage fields) is the run001 step 9 reading. Ordinary initialization
+     * must succeed with it and write exactly what the SCTLR=0 baseline
+     * writes. */
+    static struct write_record baseline[512];
+    reset(&space, false);
+    map_one(&space);
+    assert(adreno8_space_on(&space, 5, 1));
+    assert(space.is_on && write_log_count > 0);
+    unsigned baseline_writes = write_log_count;
+    memcpy(baseline, write_log, baseline_writes * sizeof(baseline[0]));
+    adreno8_space_off(&space, 1);
+    reset(&space, false);
+    regs[(0x22000 + SMMU_CB_SCTLR) / 4] = 0x107c430c;
+    map_one(&space);
+    assert(adreno8_space_on(&space, 5, 1));
+    assert(space.is_on && translations == 1);
+    assert(write_log_count == baseline_writes);
+    assert(memcmp(baseline, write_log, baseline_writes * sizeof(baseline[0])) == 0);
+    adreno8_space_off(&space, 1);
+    /* The reuse exception still requires a disabled context: the candidate
+     * match holding this exact stream with a fault route but SCTLR
+     * 0x107c430c rejects, reads only. */
+    reset(&space, false);
+    map_one(&space);
+    regs[SMMU_SMR(1) / 4] = 0x80000005;
+    regs[SMMU_S2CR(1) / 4] = 0x20300u;
+    regs[(0x22000 + SMMU_CB_SCTLR) / 4] = 0x107c430c;
+    assert(!adreno8_space_on(&space, 5, 1) && writes == 0);
     /* Routing to another context does not conflict, even while active. */
     reset(&space, false);
     map_one(&space);
@@ -419,9 +458,14 @@ int main(void) {
     assert(reads[(0x23000 + SMMU_CB_SCTLR) / 4] == 1);
     assert(reads[SMMU_SMR(2) / 4] == 1 && reads[SMMU_SMR(23) / 4] == 1);
     assert(reads[SMMU_S2CR(2) / 4] == 0);
-    reset(&space, false);
-    regs[(0x23000 + SMMU_CB_SCTLR) / 4] = 1u;
-    assert(!adreno8_secure_preflight() && writes == 0);
+    /* The device-read CB3 SCTLR 0x96cc51a is nonzero with the enable bit
+     * clear; strict preflight rejects any nonzero reading. */
+    const uint32_t cb3_leftovers[] = {1u, 0x96cc51au};
+    for (unsigned i = 0; i < 2; i++) {
+        reset(&space, false);
+        regs[(0x23000 + SMMU_CB_SCTLR) / 4] = cb3_leftovers[i];
+        assert(!adreno8_secure_preflight() && writes == 0);
+    }
     reset(&space, false);
     regs[SMMU_SMR(2) / 4] = 0x80000002;
     regs[SMMU_S2CR(2) / 4] = 3u;
@@ -435,6 +479,16 @@ int main(void) {
     regs[SMMU_SMR(5) / 4] = 0x80000004;
     regs[SMMU_S2CR(5) / 4] = 3u;
     assert(!adreno8_secure_preflight() && writes == 0);
+    /* Fault and bypass leftovers that route to context 3 from a slot whose
+     * SMR does not cover stream 2 still reject under strict rules; the
+     * ordinary path would let both through. */
+    const uint32_t cb3_route_leftovers[] = {0x20003u, 0x10003u};
+    for (unsigned i = 0; i < 2; i++) {
+        reset(&space, false);
+        regs[SMMU_SMR(5) / 4] = 0x80000004;
+        regs[SMMU_S2CR(5) / 4] = cb3_route_leftovers[i];
+        assert(!adreno8_secure_preflight() && writes == 0);
+    }
     reset(&space, false);
     regs[SMMU_SMR(5) / 4] = 0x80000004;
     regs[SMMU_S2CR(5) / 4] = 0x20004u;

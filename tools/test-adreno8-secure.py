@@ -156,11 +156,16 @@ int main(int argc, char **argv) {
     struct adreno8_gpu_space *space;
 
     /* The production preflight reads the SMMU layout; seed the same register
-     * picture the boot probe sees so the handover paths can run. */
+     * picture the boot probe sees so the handover paths can run. The GMU
+     * route seed is the stage-9 write for slot 1: the strict preflight
+     * requires it because the handover rides on that route. */
     regs[SMMU_IDR0 / 4] = 0x4c017e18;
     regs[SMMU_IDR1 / 4] = 0x40000015;
     regs[SMMU_IDR2 / 4] = 0x5511;
     regs[SMMU_SCR0 / 4] = 0x2e0406;
+    adreno8_gmu_space.is_on = true;
+    regs[SMMU_SMR(1) / 4] = SMR_VALID | SMR_MASK << 16 | 5;
+    regs[SMMU_S2CR(1) / 4] = SMMU_S2CR_SHCFG_NSH | GMU_CONTEXT;
     assert(adreno8_step_smmu_read());
 
     if (argc > 1 && strcmp(argv[1], "preflight") == 0) {

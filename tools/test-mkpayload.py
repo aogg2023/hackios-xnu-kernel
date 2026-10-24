@@ -159,6 +159,21 @@ with tempfile.TemporaryDirectory(prefix="mkpayload-test-") as directory:
     assert rc != 0 and msg.endswith("forbid-cmd: cmdline carries loader_return_after=1"), msg
     print("require-cmd and forbid-cmd messages unchanged: PASS")
 
+    # --forbid-cmd matches the exact key, bare or with =value; the help says so and
+    # a longer key merely starting with the token stays buildable.
+    rc, msg = run(["-o", str(d / "pfc2.bin"), f"kernel={kernel}",
+                   "--cmdline=debug=0x10e adreno8_keep=1", "--forbid-cmd", "adreno8"])
+    assert rc == 0, msg
+    rc, msg = run(["-o", str(d / "pfc3.bin"), f"kernel={kernel}",
+                   "--cmdline=debug=0x10e adreno8", "--forbid-cmd", "adreno8"])
+    assert rc != 0 and msg.endswith("forbid-cmd: cmdline carries adreno8"), msg
+    rc, msg = run(["-o", str(d / "pfc4.bin"), f"kernel={kernel}",
+                   "--cmdline=debug=0x10e adreno8_keep=1", "--forbid-cmd", "adreno8_keep"])
+    assert rc != 0 and msg.endswith("forbid-cmd: cmdline carries adreno8_keep=1"), msg
+    helptext = " ".join(subprocess.run([sys.executable, MK, "--help"], capture_output=True, text=True).stdout.split())
+    assert "exact boot-arg key" in helptext and "with this prefix" not in helptext
+    print("--forbid-cmd matches the exact key (bare or =value), prefix look-alikes build: PASS")
+
     # NUL in boot-arg strings is refused before any comparison.
     rc, msg, counts = run_nul(["-o", str(d / "pcnul.bin"), f"kernel={kernel}",
                                "--cmdline=debug=0x10e\x00cpus=1"])

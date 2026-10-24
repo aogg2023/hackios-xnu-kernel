@@ -46,6 +46,7 @@ __pycache__/
 !/xnuloader/efi.h
 !/xnuloader/identity.h
 !/xnuloader/loader.c
+!/xnuloader/loader_*.inc
 !/xnuloader/platform_private.h
 !/xnuloader/mkidentity.py
 !/xnuloader/mkpayload.py

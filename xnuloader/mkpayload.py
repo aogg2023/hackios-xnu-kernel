@@ -17,7 +17,7 @@ validated (1..15 ASCII bytes, no NUL, unique, not a flag-owned name) because
 struct.pack truncates char name[16] silently and the loader binds names with
 strcmp semantics: a stored NUL aliases the prefix and the last duplicate
 entry wins. --require-cmd demands an exact boot-arg token, --forbid-cmd
-rejects a boot-arg prefix, --exact-cmd demands the approved token set with
+rejects an exact boot-arg key (bare or with =value), --exact-cmd demands the approved token set with
 only the epoch value differing; while --exact-cmd is in use epoch values must
 be non-negative decimal, and no boot-arg string may contain NUL.
 --forbid-entry NAME (repeatable) refuses any payload entry, item- or
@@ -48,8 +48,8 @@ ap.add_argument('--require', action='append', default=[], metavar='NAME=SHA256',
                 help='refuse to build unless this input file hashes to this sha256')
 ap.add_argument('--require-cmd', action='append', default=[], metavar='TOKEN',
                 help='refuse to build unless the cmdline carries this exact token')
-ap.add_argument('--forbid-cmd', action='append', default=[], metavar='PREFIX',
-                help='refuse to build if the cmdline carries a token with this prefix')
+ap.add_argument('--forbid-cmd', action='append', default=[], metavar='TOKEN',
+                help='refuse to build if the cmdline carries this exact boot-arg key, bare or with =value; a key merely starting with TOKEN does not match')
 ap.add_argument('--exact-cmd', default='', metavar='CMDLINE',
                 help='refuse to build unless the cmdline is the approved string; only the epoch value may differ')
 ap.add_argument('--forbid-entry', action='append', default=[], metavar='NAME',

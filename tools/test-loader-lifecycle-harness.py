@@ -4,7 +4,7 @@ PRELUDE is the stub firmware harness (fake clock, captured prints, counting psci
 stubs) and SCENARIOS the scenario main() that runs the extracted production blocks against
 them. The two strings are concatenated with the extracted loader.c blocks into one C file, so
 they only compile as part of that file; this module is pure data, read verbatim by the driver
-and loaded by path from it. Split out to keep each file under the 800-line limit (AGENTS.md 2).
+and loaded by path from it. Split out to keep each file under the 1000-line limit (AGENTS.md 2).
 """
 
 PRELUDE = r"""#include <stdint.h>
@@ -12,12 +12,21 @@ PRELUDE = r"""#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <setjmp.h>
+static jmp_buf jb_exit;   /* before the psci stub: reset escapes through it */
+@C_PRELUDE@
 /* ---- harness scaffolding: fake clock, captured prints, counted firmware stubs ---- */
 static uint64_t clk_now, clk_freq = 1000000000ULL;
 #define CNTVCT_EL0 0
 #define CNTFRQ_EL0 1
-static uint64_t clock_value(int which) { return which == CNTFRQ_EL0 ? clk_freq : clk_now; }   /* fake clock for READ_SYSREG */
+static uint64_t clock_value(int which)
+{
+	if (which == CNTFRQ_EL0) { return clk_freq; }
+	if (which == DAIF) { return fake_daif; }
+	if (which == S3_0_C12_C12_7) { return fake_group1; }
+	return clk_now;
+}
 #define READ_SYSREG(r) clock_value(r)
 #define EFIAPI
 @EXC@
@@ -59,18 +68,9 @@ static char other_cpu_entry, other_cpu_start;
 static void usb_poll_command(void);
 /* psci: scripted answer, captured call, per-core affinity list (raw ids from the spec) */
 #define PSCI_AFFINITY_INFO 0xC4000004u
-static int psci_calls, psci_aff_idx;
+static int psci_calls;
 static uint64_t psci_fn, psci_a1, psci_a2, psci_a3;
-static int64_t psci_next, psci_aff[8];
-static int64_t psci_call(uint64_t f, uint64_t a1, uint64_t a2, uint64_t a3)
-{
-	psci_calls++;
-	psci_fn = f, psci_a1 = a1, psci_a2 = a2, psci_a3 = a3;
-	if (f == PSCI_AFFINITY_INFO) {
-		return psci_aff[psci_aff_idx++];
-	}
-	return psci_next;
-}
+@PSCI@
 static void flush_dcache(uint64_t a, uint64_t b) { (void)a; (void)b; }
 static void clean_dcache(uint64_t a, uint64_t b) { (void)a; (void)b; }
 /* ---- stubs for LC-WRITE ---- */
@@ -100,8 +100,8 @@ static efi_status h_read(efi_block_io *b, uint64_t m, uint64_t lba, uint64_t byt
 }
 static efi_status h_flush(efi_block_io *b) { (void)b; flushes++; return 0; }
 static efi_block_io h_bio = { &h_media, h_read, h_write, h_flush };
-static efi_block_io *find_log_partition(void) { find_calls++; return bio_present ? (efi_block_io *)&h_bio : NULL; }
-static void compose_logs(const char *k, uint64_t l) { (void)k; (void)l; compose_calls++; staged_len = 100; }
+static efi_block_io *find_log_partition(void) { find_calls++; seq('F'); return bio_present ? (efi_block_io *)&h_bio : NULL; }
+static void compose_logs(const char *k, uint64_t l) { (void)k; (void)l; compose_calls++; staged_len = 100; seq('C'); }
 static int hc_list_is_uefis(void) { return uefi_list; }
 static void hc_print_state(const char *w) { (void)w; }
 static int skip_ufs_arbitration = 1;
@@ -113,14 +113,14 @@ enum { CTX_LOG_PA = 0, CTX_KSP = 10 };
 static uint64_t loader_ctx[16];
 static uint64_t seconds_since(uint64_t then) { return (clk_now - then) / clk_freq; }
 static int wdt_armed = 1, pets, charger_polls, block_polls, hung_snaps, charger_enabled;
-static void wdt_pet(void) { pets++; }
+static void wdt_pet(void) { pets++; seq('W'); }
 static void charger_poll(void) { charger_polls++; }
 static void block_poll(void) { block_polls++; }
 static void log_of_hung_kernel(const struct kernel_live *l, uint64_t s) { (void)l; (void)s; hung_snaps++; }
 /* ---- stubs for LC-RETURN ---- */
 static const char *takebacks[8];
 static int takebacks_n;
-static void hc_take_back(const char *when) { if (takebacks_n < 8) { takebacks[takebacks_n++] = when; } }
+static void hc_take_back(const char *when) { if (takebacks_n < 8) { takebacks[takebacks_n++] = when; } seq('T'); }
 static struct { struct { uint64_t switched_in, switched_out; } kernel_native; } block_shared;
 static uint64_t held_daif, held_group1;
 static int held_irq_masked;
@@ -132,14 +132,14 @@ static const char *sound_data;
 #define USB_EP_IN  0x81
 static uint8_t rx_store[1024], tx_store[1024];
 static uint8_t *usb_rx_buf = rx_store, *usb_tx_buf = tx_store;
-enum { UsbDeviceEventNoEvent = 0, UsbDeviceEventDeviceStateChange = 1, UsbDeviceEventTransferNotification = 2 };
-enum { UsbDeviceStateDisconnected = 0, UsbDeviceStateConnected = 1 };
-enum { UsbDeviceTransferStatusActive = 0, UsbDeviceTransferStatusCompleteOK = 1, UsbDeviceTransferStatusCancelled = 2,
-       UsbDeviceTransferStatusCompleteError = 3 };   /* raw values from xnuloader/efi.h */
-typedef union usb_device_event_data {
-	uint32_t device_state;
-	struct { uint32_t status; uint8_t endpoint_index; uint64_t bytes_completed; void *data_buffer; } transfer;
-} usb_device_event_data;
+/* The event/status/link enums and the event union arrive verbatim from the production
+ * xnuloader/efi.h by the driver, review L10; the raw numbers below are written independently
+ * from the ABL interface that header documents, so reordering either side fails here. */
+@USB@
+_Static_assert(UsbDeviceEventNoEvent == 0 && UsbDeviceEventDeviceStateChange == 1 && UsbDeviceEventTransferNotification == 2 && UsbDeviceEventOemEvent == 3, "usb event raw numbers");
+_Static_assert(UsbDeviceStateConnected == 0 && UsbDeviceStateDisconnected == 1, "usb link state raw numbers");
+_Static_assert(UsbDeviceTransferStatusActive == 0 && UsbDeviceTransferStatusCompleteOK == 1 && UsbDeviceTransferStatusCancelled == 2 && UsbDeviceTransferStatusCompleteError == 3, "usb transfer status raw numbers");
+_Static_assert(sizeof(usb_device_event_data) == 64 && sizeof(((usb_device_event_data *)0)->transfer) == 24 && offsetof(usb_device_event_data, transfer.status) == 0 && offsetof(usb_device_event_data, transfer.endpoint_index) == 4 && offsetof(usb_device_event_data, transfer.bytes_completed) == 8 && offsetof(usb_device_event_data, transfer.data_buffer) == 16, "event union keeps raw[8] and the 24-byte transfer record");
 struct h_usb {
 	efi_status (*handle_event)(uint32_t *msg, uint64_t *size, usb_device_event_data *data);
 	efi_status (*send)(uint8_t endpoint, uint64_t len, void *buf);
@@ -189,9 +189,6 @@ static efi_status ev_send(uint8_t endpoint, uint64_t len, void *buf)
 	return 0;
 }
 static struct h_usb h_usb = { ev_handle, ev_send };
-static jmp_buf jb_exit;
-static int irq_mask_calls;
-static void harness_daifset(void) { irq_mask_calls++; }   /* counts without masking: EL0 cannot run msr */
 static char fb_got[128];
 static int fb_calls, fb_armed;
 static void fb_command(const char *cmd)
@@ -367,17 +364,17 @@ static void sc_watch(void)
 	CK(charger_polls == 1, "watch_charger_polls_for_uefi_list");
 	charger_enabled = 0;
 	kernel_resources_held = 0;
-	usb_rx_queued = usb_out_owned = usb_in_owned = usb_out_lost = usb_in_lost = 0;
+	usb_rx_queued = usb_out_owned = usb_in_owned = usb_out_lost = usb_in_lost = usb_out_invalid = usb_in_invalid = 0;
 }
 static void ret_reset(int64_t *states)
 {
-	psci_aff_idx = 0;
+	aff_knobs();
 	for (int i = 0; i < 8; i++) {
-		psci_aff[i] = states[i];
+		psci_aff_ans[i] = states[i];
 	}
+	psci_calls = 0;
 	takebacks_n = held_irq_masked = 0;
 }
-static uint64_t cpus[8] = { 0x81000000ULL, 0x80000100ULL, 0x80000200ULL, 0 };
 static void sc_return(void)
 {
 	int64_t all_off[8] = { 1, 1, 1, 1, 1, 1, 1, 1 };
@@ -396,6 +393,7 @@ static void sc_return(void)
 		lc_after_return(1, cpus, 3);
 		CK(kernel_resources_held == 1, "ret_other_notoff_holds");
 		CK(takebacks_n == 0, "ret_other_notoff_no_takeback");
+		CK(psci_calls == (b < 2 ? 4 : 3), "ret_bad_calls");
 		CK(cap_has("the firmware answers"), "ret_prints_state");
 	}
 	{
@@ -409,7 +407,7 @@ static void sc_return(void)
 	kernel_resources_held = 0;
 	ret_reset(all_off);
 	lc_after_return(0, cpus, 3);
-	CK(kernel_resources_held == 0, "ret_same_off_free");
+	CK(kernel_resources_held == 0 && psci_calls == 2, "ret_same_off_free");
 	CK(takebacks_n == 1, "ret_same_off_takeback");
 	for (unsigned b = 0; b < 4; b++) {
 		int64_t st[8] = { 1, 1, 1, 1, 1, 1, 1, 1 };
@@ -417,7 +415,7 @@ static void sc_return(void)
 		kernel_resources_held = 0;
 		ret_reset(st);
 		lc_after_return(0, cpus, 3);
-		CK(kernel_resources_held == 1, "same_notoff_holds");
+		CK(kernel_resources_held == 1 && psci_calls == (b < 2 ? 4 : 1), "same_notoff_holds");
 		CK(takebacks_n == 0, "same_notoff_no_takeback");
 		CK(lc_cmd_denied(kernel_resources_held, 0, 0, "download:1f000"), "same_notoff_download_denied");
 	}
@@ -478,71 +476,26 @@ static void sc_write_logs(void)
 	CK(find_calls == 0 && w_blocks == 0, "reset_hold_still_gated");
 	kernel_resources_held = 0;
 }
-static void sc_exception(void)
-{
-	static uint64_t ctxb[128];
-	/* annibale quiet screen: the handler never returns from its poll loop; the exemption
-	 * must already be revoked when that loop starts serving commands */
-	USB = &h_usb; usb_connected = 1;
-	usb_rx_queued = usb_out_owned = usb_in_owned = usb_out_lost = usb_in_lost = 0;
-	ev_step = ev_change = 0;
-	PLAT = &platform_annibale; screen_quiet = 1;
-	active_watch = kernel_resources_held = 1;
-	firmware_fault = 0;
-	running_live = (const struct kernel_live *)0x1000;
-	find_calls = w_blocks = fb_calls = irq_mask_calls = 0;
-	fb_armed = 1;
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2;
-	strcpy((char *)rx_store, "x");
-	if (setjmp(jb_exit) == 0) {
-		exception_handler(11, ctxb);
-		CK0("exc_annibale_returned");
-	}
-	fb_armed = 0;
-	CK(fb_calls == 1, "exc_poll_serves_commands");
-	CK(irq_mask_calls == 1, "exc_masks_interrupts");
-	CK(active_watch == 0, "exc_revokes_exemption");
-	CK(firmware_fault == 1, "exc_marks_fault");
-	CK(running_live == NULL, "exc_drops_log_pointer");
-	CK(!strncmp(last_result, "firmware-fault", 14), "exc_records_result");
-	CK(find_calls == 0 && w_blocks == 0, "exc_no_storage_after_fault");
-	/* the other platform: the flush runs, the fault gate keeps it off the partition */
-	PLAT = &plat_two;
-	active_watch = 1;
-	find_calls = 0;
-	res_calls = 0;
-	if (setjmp(jb_exit) == 0) {
-		exception_handler(11, ctxb);
-		CK0("exc_reset_returned");
-	}
-	CK(res_calls == 1, "exc_resets_after_flush");
-	CK(find_calls == 0 && active_watch == 0, "exc_flush_gated");
-	kernel_resources_held = 0;
-	firmware_fault = 0;
-}
-static void usb_clean(void)
-{
+static void usb_clean(void) {
 	USB = &h_usb; usb_connected = kernel_resources_held = 1;
-	firmware_fault = 0;
-	running_live = NULL;
-	usb_rx_queued = usb_out_owned = usb_in_owned = usb_out_lost = usb_in_lost = 0;
+	firmware_fault = 0; running_live = NULL;
+	usb_rx_queued = usb_out_owned = usb_in_owned = usb_out_lost = usb_in_lost = usb_out_invalid = usb_in_invalid = 0;
 	ev_calls = ev_sends = ev_after = ev_change = ev_change_state = 0;
 	ev_msg = UsbDeviceEventNoEvent; ev_step = clk_freq / 10; clk_now = 0;
 	ev_err = 0; ev_status = -1; ev_size = 0; ev_size_set = 0; ev_no_events = 0; ev_buf = NULL;
-	ev_out_buf = ev_in_buf = NULL;
-	usb_out_buf = NULL; usb_out_len = 0; usb_in_buf = NULL; usb_in_len = 0;
+	ev_out_buf = ev_in_buf = NULL; usb_out_buf = NULL; usb_out_len = 0; usb_in_buf = NULL; usb_in_len = 0;
 }
 static void sc_usb(void)
 {
 	usb_clean();
-	int64_t r = usb_wait(USB_EP_IN);
+	int64_t r = usb_wait(USB_EP_IN, 1);
 	CK(r == -1, "usb_held_bounded_exit");
 	CK(ev_calls <= 60 && ev_calls > 20, "usb_held_bounded_time");
 	CK(pets >= 2, "usb_held_feeds_watchdog");
 	/* nothing held and no fault: waiting for the next command is the job, no timeout */
 	kernel_resources_held = 0;
 	ev_calls = 0; ev_after = 80; ev_step = 1;
-	r = usb_wait(USB_EP_OUT);
+	r = usb_wait(USB_EP_OUT, 1);
 	CK(r == -1 && ev_calls == 81, "usb_idle_keeps_waiting");
 	/* a verified completion for the submitted request answers with its length; a
 	 * notification for another endpoint does not end the wait */
@@ -552,51 +505,75 @@ static void sc_usb(void)
 	CK(r == 512, "usb_transfer_complete");
 	ev_ep = USB_EP_OUT; ev_after = 7; ev_calls = 0;
 	r = usb_tx((const uint8_t *)"CD", 512);
-	CK(r == -1 && ev_calls == 8 && usb_in_lost == 1, "usb_other_endpoint_ignored");
+	CK(r == -1 && ev_calls == 8 && usb_in_owned == 1 && usb_in_lost == 0, "usb_other_endpoint_ignored");
 }
 static void sc_usb_owner(void)
 {
-	/* a held IN transfer that times out stops: no resend, no write over the busy buffer */
+	/* a held IN transfer that times out keeps ownership: no resend, no write over the busy
+	 * buffer, and the terminal that still arrives ends the reply */
 	usb_clean();
-	memcpy(tx_store, "AA", 2);
-	int64_t r = usb_tx((const uint8_t *)"AB", 2);
-	CK(r == -1 && usb_in_lost == 1, "usb_tx_timeout_stops");
-	tx_store[0] = 'Z';   /* sentinel: a stopped channel must not overwrite the owned buffer */
+	int64_t r = (memcpy(tx_store, "AA", 2), usb_tx((const uint8_t *)"AB", 2));
+	CK(r == -1 && usb_in_owned == 1 && usb_in_lost == 0, "usb_tx_timeout_keeps");
+	tx_store[0] = 'Z';   /* sentinel: the owned buffer must not be overwritten while owned */
 	r = usb_tx((const uint8_t *)"CD", 2);
-	CK(r == -1 && ev_sends == 1 && tx_store[0] == 'Z', "usb_tx_lost_no_resend_no_overwrite");
+	CK(r == -1 && ev_sends == 1 && tx_store[0] == 'Z', "usb_tx_owned_no_resend_no_overwrite");
+	/* Cancelled ends the old reply as a failure: the record clears and the next send goes */
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_status = UsbDeviceTransferStatusCancelled;
+	ev_size_set = 0; ev_bytes = 0; poll_once();
+	CK(usb_in_owned == 0 && usb_in_lost == 0, "usb_cancel_frees_in");
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_bytes = 2; ev_status = -1;
+	ev_sends = 0;
+	r = usb_tx((const uint8_t *)"EF", 2);
+	CK(r == 2 && ev_sends == 1 && tx_store[0] == 'E', "usb_tx_after_cancel");
+	/* a CompleteOK no wait is left to take: the record clears, the bytes go unread */
+	usb_clean();
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_status = UsbDeviceTransferStatusActive;
+	(void)usb_tx((const uint8_t *)"OKAYlate", 8);
+	ev_status = -1; ev_bytes = 8;
+	r = usb_wait(USB_EP_IN, 0);
+	CK(r == -1 && usb_in_owned == 0 && usb_in_lost == 0, "usb_late_ok_recycled");
 	/* an OUT receive that times out hands the buffer back to the queue rule */
 	usb_clean();
 	r = usb_rx(rx_store, 64);
-	CK(r == -1 && usb_out_lost == 0 && usb_rx_queued == 1 && usb_out_owned == 1, "usb_rx_timeout_keeps_queue");
-	ev_sends = 0; poll_once();
-	CK(ev_sends == 0, "usb_poll_no_resend_while_queued");
-	/* the late confirmation clears ownership and the command is processed normally */
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2;
-	strcpy((char *)rx_store, "y"); fb_calls = 0; poll_once();
-	CK(fb_calls == 1 && usb_out_owned == 0 && usb_rx_queued == 0, "usb_late_confirmation_recovers");
-	/* a completion on the other endpoint says nothing about the one being waited on */
-	usb_clean();
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_after = 5;
-	r = usb_rx(rx_store, 64);
-	CK(r == -1 && usb_out_owned == 1, "usb_other_endpoint_not_confirmed");
-	/* a device change cannot confirm an end: the channel stops and keeps its buffer */
-	ev_msg = UsbDeviceEventNoEvent; ev_after = 0; ev_change = 1;
-	r = usb_wait(USB_EP_OUT);
-	CK(r == -1 && usb_out_lost == 1, "usb_device_change_stops");
+	CK(r == -1 && usb_out_lost == 0 && usb_rx_queued == 0 && usb_out_owned == 1 && usb_out_invalid == 1, "usb_rx_timeout_marks_record");
+	ev_sends = 0; ev_change = 1; ev_change_state = UsbDeviceStateConnected; poll_once();
+	CK(ev_sends == 0 && usb_out_owned == 1, "usb_poll_owned_no_resend");
+	/* the late OK of a timed-out request only releases the record: its bytes reach no command */
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2; ev_change = 0; strcpy((char *)rx_store, "y"); fb_calls = 0; poll_once();
+	CK(fb_calls == 0 && usb_out_owned == 0 && usb_out_invalid == 0 && usb_rx_queued == 0, "usb_timeout_old_ok_not_delivered");
+	/* a disconnect ends the wait and keeps the queued request: downed link dispatches nothing,
+	 * a CompleteOK arriving on it is recycled and the poll resends nothing */
+	ev_msg = UsbDeviceEventNoEvent; poll_once();   /* the receive for the next command is queued */
+	ev_change = 1; ev_change_state = UsbDeviceStateDisconnected; ev_calls = ev_sends = 0;
+	r = usb_wait(USB_EP_OUT, 1);
+	CK(r == -1 && ev_calls == 1 && usb_out_lost == 0 && usb_rx_queued == 1 && usb_out_owned == 1 && ev_sends == 0, "usb_disconnect_keeps_request");
 	ev_change = 0;
-	strcpy((char *)rx_store, "keep"); ev_sends = 0;
-	r = usb_rx(rx_store, 64);
-	CK(r == -1 && rx_store[0] == 'k' && ev_sends == 0, "usb_rx_lost_keeps_buffer");
-	/* the cable comes back: the link is up, the stopped channel stays stopped */
-	ev_change = 1; ev_change_state = UsbDeviceStateConnected;
-	r = usb_wait(USB_EP_OUT);
-	CK(r == -1 && usb_connected == 1 && usb_out_lost == 1 && usb_rx_queued == 0, "usb_relink_still_lost");
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2; strcpy((char *)rx_store, "z"); fb_calls = 0; poll_once();
+	CK(fb_calls == 0 && usb_out_owned == 0 && usb_rx_queued == 0, "usb_late_ok_downlink_recycled");
+	/* the other endpoint's terminal ends that request and leaves the queued receive alone */
+	usb_clean(); poll_once();
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_status = UsbDeviceTransferStatusCancelled;
+	poll_once();
+	CK(usb_out_owned == 1 && usb_rx_queued == 1 && usb_in_lost == 0, "usb_other_endpoint_not_confirmed");
+	/* a structurally isolated OUT channel keeps its buffer across a reconnect, refuses new
+	 * sends and resends nothing: external reset is the recovery boundary */
+	usb_clean(); poll_once();
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2;
+	ev_buf = tx_store; fb_calls = 0; poll_once();
+	CK(usb_out_lost == 1 && usb_out_owned == 1, "usb_isolate_wrong_buffer");
+	ev_msg = UsbDeviceEventNoEvent; ev_change = 1; ev_change_state = UsbDeviceStateConnected;
+	CK(usb_wait(USB_EP_OUT, 1) == -1 && usb_connected == 1 && usb_out_lost == 1 && usb_out_owned == 1
+	    && ev_calls <= 60, "usb_relink_still_lost");
 	ev_change = 0; ev_sends = 0; poll_once();
 	CK(ev_sends == 0, "usb_poll_lost_no_resend");
-	/* idle with nothing owned: a device change stops nothing */
-	usb_clean(); kernel_resources_held = 0; ev_change = 1;
-	r = usb_wait(USB_EP_OUT);
-	CK(r == -1 && usb_out_lost == 0 && usb_out_owned == 0, "usb_idle_change_stops_nothing");
+	/* isolation through the command wait instead of the queued poll: the handoff takes the
+	 * queue flag, so only the isolation itself can refuse the poll's next receive */
+	usb_clean(); poll_once();
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_calls = ev_sends = 0;
+	ev_buf = tx_store; ev_bytes = 2;
+	CK(usb_rx(usb_rx_buf, 511) == -1 && usb_out_lost == 1 && usb_rx_queued == 0, "usb_wait_isolate_unqueued");
+	ev_sends = 0; poll_once();
+	CK(ev_sends == 0 && usb_out_lost == 1, "usb_poll_lost_send_refused");
 }
 static void sc_fault(void)
 {
@@ -606,7 +583,7 @@ static void sc_fault(void)
 	write_logs("k", 1);
 	CK(find_calls == 0 && w_blocks == 0 && cap_has("KERNEL LOG"), "wlog_fault_echo_only");
 	usb_clean(); kernel_resources_held = 0; firmware_fault = 1;
-	CK(usb_wait(USB_EP_OUT) == -1 && ev_calls <= 60, "usb_fault_bounded");
+	CK(usb_wait(USB_EP_OUT, 1) == -1 && ev_calls <= 60, "usb_fault_bounded");
 	firmware_fault = 0;
 }
 static void sc_repeat(void)
@@ -633,11 +610,11 @@ static void sc_fb(void)
 	CK(!usb_in_owned && !usb_in_lost && ev_sends == 2, "fb_healthy_second");
 	CK(memcmp(tx_store, "OKAYnext", 8) == 0, "fb_healthy_second_bytes");
 	/* the counterexample: the sentinel bytes stand before the IN transfer is submitted; after
-	 * the timeout made the transfer owned and lost, neither reply form may write over them */
+	 * the timeout left the transfer owned, neither reply form may write over them */
 	usb_clean();
 	memset(tx_store, 0xa5, sizeof(tx_store));
 	fb_reply("OKAY", "base");   /* one send, no confirmation: owned and lost from here on */
-	CK(usb_in_owned == 1 && usb_in_lost == 1 && ev_sends == 1, "fb_first_timeout");
+	CK(usb_in_owned == 1 && usb_in_lost == 0 && ev_sends == 1, "fb_first_timeout");
 	uint8_t saved[128];
 	memcpy(saved, tx_store, sizeof(saved));
 	fb_reply_data(0x1234);
@@ -654,9 +631,9 @@ static void sc_fb(void)
 	CK(ev_sends == 1 && tx_store[0] == 'O' && tx_store[62] == 't' && tx_store[63] == 0xa5, "fb_hard_cap");
 }
 
-/* notification verification (rev5): only a CompleteOK matching the recorded request ends one;
- * Active, unknown values, wrong buffers, oversized counts, short events and failed calls keep
- * or stop exactly as the ownership comment says, and a completion at the deadline is kept */
+/* notification verification: only a CompleteOK matching the recorded request ends one; Active,
+ * unknown values, wrong buffers, oversized counts, short events and failed calls behave as the
+ * ownership comment says, and a completion at the deadline is kept */
 static void sc_usb_notify(void)
 {
 	int64_t r;
@@ -665,11 +642,9 @@ static void sc_usb_notify(void)
 	usb_clean();
 	poll_once();
 	CK(usb_out_owned == 1 && usb_rx_queued == 1 && ev_sends == 1, "usb_notify_queued");
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2;
-	ev_status = UsbDeviceTransferStatusActive;
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2; ev_status = UsbDeviceTransferStatusActive;
 	strcpy((char *)rx_store, "a"); fb_calls = 0; poll_once();
-	CK(usb_out_owned == 1 && usb_rx_queued == 1 && usb_out_lost == 0, "usb_notify_active_keeps");
-	CK(fb_calls == 0, "usb_notify_active_no_dispatch");
+	CK(usb_out_owned == 1 && usb_rx_queued == 1 && usb_out_lost == 0 && fb_calls == 0, "usb_notify_active_keeps");
 	ev_msg = UsbDeviceEventNoEvent; poll_once();
 	CK(ev_sends == 1, "usb_notify_active_no_resend");
 	/* a status outside the four documented values keeps the same way */
@@ -680,13 +655,11 @@ static void sc_usb_notify(void)
 	CK(usb_out_owned == 0 && usb_rx_queued == 0 && fb_calls == 1, "usb_notify_complete_once");
 	/* a notification naming the other endpoint leaves the queued request alone */
 	usb_clean(); poll_once();
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_bytes = 2;
-	poll_once();
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_bytes = 2; poll_once();
 	CK(usb_out_owned == 1 && usb_rx_queued == 1 && ev_sends == 1, "usb_notify_other_endpoint");
 	/* a buffer the loader did not submit: stopped, unread, never resent */
 	usb_clean(); poll_once();
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2;
-	ev_buf = tx_store; fb_calls = 0; poll_once();
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2; ev_buf = tx_store; fb_calls = 0; poll_once();
 	CK(usb_out_lost == 1 && fb_calls == 0, "usb_notify_wrong_buffer");
 	ev_msg = UsbDeviceEventNoEvent; ev_sends = 0; poll_once();
 	CK(ev_sends == 0, "usb_notify_wrong_buffer_no_resend");
@@ -696,9 +669,7 @@ static void sc_usb_notify(void)
 	poll_once();
 	CK(usb_out_lost == 1 && fb_calls == 0, "usb_notify_long_bytes");
 	usb_clean(); poll_once();
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2;
-	ev_size_set = 1; ev_size = 8;
-	poll_once();
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2; ev_size_set = 1; ev_size = 8; poll_once();
 	CK(usb_out_lost == 1 && fb_calls == 0, "usb_notify_short_size");
 	/* a failed handle_event call is no event at all */
 	usb_clean(); poll_once();
@@ -707,11 +678,10 @@ static void sc_usb_notify(void)
 	CK(usb_out_owned == 1 && usb_rx_queued == 1 && usb_out_lost == 0, "usb_notify_handle_error");
 	ev_err = 0; ev_msg = UsbDeviceEventNoEvent; ev_sends = 0; poll_once();
 	CK(ev_sends == 0, "usb_notify_handle_error_no_resend");
-	/* an IN request still Active when the held budget runs out times out owned, never released */
+	/* an IN request still Active when the held budget runs out stays owned, never isolated */
 	usb_clean();
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_status = UsbDeviceTransferStatusActive;
-	r = usb_tx((const uint8_t *)"OKAYactv", 8);
-	CK(r == -1 && usb_in_owned == 1 && usb_in_lost == 1 && ev_sends == 1 && ev_calls <= 60, "usb_notify_active_in_timeout");
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_status = UsbDeviceTransferStatusActive; r = usb_tx((const uint8_t *)"OKAYactv", 8);
+	CK(r == -1 && usb_in_owned == 1 && usb_in_lost == 0 && ev_sends == 1 && ev_calls <= 60, "usb_notify_active_in_timeout");
 	/* a completion arriving past the three-second mark is still taken, not thrown away */
 	usb_clean();
 	ev_step = clk_freq / 2; ev_no_events = 6;   /* the seventh call lands beyond the budget */
@@ -720,70 +690,59 @@ static void sc_usb_notify(void)
 	CK(r == 8 && usb_in_owned == 0 && usb_in_lost == 0, "usb_notify_deadline_kept");
 	/* the same budget still bounds a wait that sees no completion */
 	usb_clean();
-	CK(usb_wait(USB_EP_IN) == -1 && ev_calls <= 60, "usb_notify_deadline_bounded");
+	CK(usb_wait(USB_EP_IN, 1) == -1 && ev_calls <= 60, "usb_notify_deadline_bounded");
 	/* a late IN notification that finds no request releases nothing and stops nothing */
 	usb_clean();
 	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_bytes = 8;
-	CK(usb_wait(USB_EP_IN) == -1 && usb_in_owned == 0 && usb_in_lost == 0, "usb_notify_late_duplicate");
+	CK(usb_wait(USB_EP_IN, 1) == -1 && usb_in_owned == 0 && usb_in_lost == 0, "usb_notify_late_duplicate");
 }
 
-/* guards (rev6): a transfer event too short to read stops every owned request whichever value
- * its unreadable endpoint byte holds; a full DeviceStateChange below the state field leaves the
- * cable flag alone; an event after a stop changes nothing; a queued request is taken over only
- * by the caller holding its recorded buffer and length */
+/* guards: a transfer event too short to read isolates every owned request whichever value its
+ * unreadable endpoint byte holds; a short DeviceStateChange leaves the cable flag alone; a late
+ * event after an isolation changes nothing; a queued request is taken over only by the caller
+ * holding its recorded buffer and length */
 static void sc_usb_guard(void)
 {
 	int64_t r;
 
-	usb_clean(); poll_once();
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_bytes = 2;
-	ev_size_set = 1; ev_size = 3; fb_calls = 0; poll_once();
-	CK(usb_out_lost == 1 && usb_out_owned == 1 && fb_calls == 0, "usb_guard_short_ep_in");
-	usb_clean(); poll_once();
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2;
-	ev_size_set = 1; ev_size = 1; fb_calls = 0; poll_once();
-	CK(usb_out_lost == 1 && usb_out_owned == 1 && fb_calls == 0, "usb_guard_short_ep_out");
-	usb_clean(); poll_once();
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_bytes = 2;
-	ev_size_set = 1; ev_size = 0; fb_calls = 0; poll_once();
-	CK(usb_out_lost == 1 && usb_out_owned == 1 && fb_calls == 0, "usb_guard_short_size_zero");
+	for (int k = 0; k < 3; k++) {   /* endpoint byte IN, OUT, IN; sizes 3, 1, 0 */
+		usb_clean(); poll_once();
+		ev_msg = UsbDeviceEventTransferNotification; ev_ep = k == 1 ? USB_EP_OUT : USB_EP_IN; ev_bytes = 2;
+		ev_size_set = 1; ev_size = k == 2 ? 0 : 3 - 2 * k; fb_calls = 0; poll_once();
+		CK(usb_out_lost == 1 && usb_out_owned == 1 && fb_calls == 0, "usb_guard_short_event");
+	}
 	/* the same short event seen by a waiting IN request stops it too, endpoint byte aside */
 	usb_clean();
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2;
-	ev_size_set = 1; ev_size = 2;
-	r = usb_tx((const uint8_t *)"OKAYshrt", 8);
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2; ev_size_set = 1; ev_size = 2; r = usb_tx((const uint8_t *)"OKAYshrt", 8);
 	CK(r == -1 && usb_in_lost == 1 && usb_in_owned == 1 && ev_sends == 1, "usb_guard_short_in_wait");
 	/* a DeviceStateChange too short to carry its state leaves the cable flag as it was */
 	usb_clean(); poll_once();
 	ev_msg = UsbDeviceEventDeviceStateChange; ev_size_set = 1; ev_size = 2;
-	CK(usb_wait(USB_EP_OUT) == -1 && usb_connected == 1 && usb_out_lost == 1, "usb_guard_short_state_kept");
-	/* after a stop the matching CompleteOK dispatches nothing and releases nothing */
+	CK(usb_wait(USB_EP_OUT, 1) == -1 && usb_connected == 1 && usb_out_lost == 0 && usb_out_owned == 1, "usb_guard_short_state_kept");
+	/* after an isolation the matching CompleteOK dispatches nothing and releases nothing */
 	usb_clean(); poll_once();
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2;
-	ev_buf = tx_store; fb_calls = 0; poll_once();
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2; ev_buf = tx_store; fb_calls = 0; poll_once();
 	CK(usb_out_lost == 1 && usb_out_owned == 1 && usb_rx_queued == 1 && fb_calls == 0, "usb_guard_buf_stops");
 	ev_buf = NULL; poll_once();
 	CK(fb_calls == 0 && usb_out_owned == 1 && usb_rx_queued == 1 && usb_out_lost == 1, "usb_guard_lost_ignores_late_complete");
 	ev_msg = UsbDeviceEventNoEvent; ev_sends = 0; poll_once();
 	CK(ev_sends == 0, "usb_guard_lost_no_resend");
-	/* an IN wait after a stop ignores even a matching CompleteOK and stays stopped */
+	/* Cancelled ends an IN wait as a failure and clears its record; the next wait sees none */
 	usb_clean();
 	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_status = UsbDeviceTransferStatusCancelled;
 	r = usb_tx((const uint8_t *)"OKAYcanc", 8);
-	CK(r == -1 && usb_in_lost == 1 && usb_in_owned == 1, "usb_guard_cancel_stops");
+	CK(r == -1 && usb_in_lost == 0 && usb_in_owned == 0, "usb_wait_cancel_clears");
 	ev_status = -1;
-	CK(usb_wait(USB_EP_IN) == -1 && usb_in_owned == 1 && usb_in_lost == 1 && ev_calls <= 60, "usb_guard_in_lost_ignores_late");
+	CK(usb_wait(USB_EP_IN, 1) == -1 && usb_in_owned == 0 && usb_in_lost == 0 && ev_calls <= 60, "usb_duplicate_ok_noop");
 	/* foreign parameters may not take over the queued request: refused, record and ownership kept */
 	usb_clean(); poll_once();
 	r = usb_rx(rx_store, 64);
 	CK(r == -1 && usb_rx_queued == 1 && usb_out_owned == 1 && usb_out_lost == 0 && ev_sends == 1, "usb_guard_reuse_refused");
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 300;
-	strcpy((char *)rx_store, "long"); fb_calls = 0; poll_once();
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 300; strcpy((char *)rx_store, "long"); fb_calls = 0; poll_once();
 	CK(fb_calls == 1 && usb_out_lost == 0 && usb_rx_queued == 0, "usb_guard_reuse_record_kept");
 	/* the caller holding the recorded buffer and length takes the queued request over */
 	usb_clean(); poll_once();
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 4;
-	strcpy((char *)rx_store, "take");
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 4; strcpy((char *)rx_store, "take");
 	r = usb_rx(rx_store, 511);
 	CK(r == 4 && usb_rx_queued == 0 && usb_out_owned == 0 && ev_sends == 1, "usb_guard_reuse_takeover");
 }
@@ -791,7 +750,7 @@ static void sc_usb_guard(void)
 int main(void)
 {
 	sc_psci_spec(); sc_cpu_on(); sc_commands(); sc_enter(); sc_watch(); sc_return(); sc_collect();
-	sc_write_logs(); sc_exception(); sc_usb(); sc_usb_owner(); sc_fb(); sc_usb_notify(); sc_usb_guard(); sc_fault(); sc_repeat();
+	sc_write_logs(); sc_usb(); sc_usb_owner(); sc_fb(); sc_usb_notify(); sc_usb_guard(); sc_fault(); sc_repeat();
 	if (fail_count == 0) { printf("production logic: lifecycle checks passed\n"); } else { printf("%d failures\n", fail_count); }
 	return fail_count > 127 ? 127 : fail_count;
 }

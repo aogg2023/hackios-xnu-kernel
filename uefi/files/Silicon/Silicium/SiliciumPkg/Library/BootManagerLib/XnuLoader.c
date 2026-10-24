@@ -58,12 +58,18 @@ StartPayloadLoader ()
   UINTN              PaddedSize;
 
   //
-  // Header->Size is the only length source, so every later bound derives from
-  // it and is compared by subtraction (remaining minus header size) instead
-  // of pointer addition, which could overflow on a bogus size. The fixed base
-  // being readable is a boot-shim contract this function cannot verify.
+  // Header->Size declares the body length only: the container including this
+  // 8-byte header may span at most XNU_PAYLOAD_MAX_SIZE of the reserved
+  // window, so the cap subtracts the header and End below stays inside the
+  // window, below the panic-log tail. Every later bound derives from Size by
+  // subtraction (remaining minus entry header) instead of pointer addition,
+  // which could overflow on a bogus size. This function can only bound what
+  // the container declares: that the shim really wrote the declared bytes
+  // inside the reserved window, and that the declared body matches the real
+  // decompressed source length, are premises checked offline by the packer
+  // and by the shim's own copy cap, not here.
   //
-  if ((Header->Magic != XNU_PAYLOAD_MAGIC) || (Header->Size > XNU_PAYLOAD_MAX_SIZE)) {
+  if ((Header->Magic != XNU_PAYLOAD_MAGIC) || (Header->Size > XNU_PAYLOAD_MAX_SIZE - sizeof (XNU_PAYLOAD_HEADER))) {
     return;
   }
 

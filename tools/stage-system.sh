@@ -4,15 +4,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 [ "$#" -eq 0 ] || { echo "usage: tools/stage-system.sh" >&2; exit 2; }
 exec python3 - <<'PYTHON'
+import os
 import pathlib
 import subprocess
 import sys
 
-image = pathlib.Path('userland/system.apfs')
+image = pathlib.Path(os.environ.get('STAGE_SYSTEM_IMAGE', 'userland/system.apfs'))
 serial = 'xnuloader'
+fastboot_cmd = os.environ.get('STAGE_SYSTEM_FASTBOOT', 'fastboot')
 
 def fastboot(*args, seconds=10):
-    result = subprocess.run(['fastboot', '-s', serial, *args],
+    result = subprocess.run([fastboot_cmd, '-s', serial, *args],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, timeout=seconds)
     print(result.stdout, end='', flush=True)
@@ -23,15 +25,21 @@ def fastboot(*args, seconds=10):
 try:
     if not image.is_file() or image.stat().st_size == 0:
         raise RuntimeError(f'missing or empty image: {image}')
-    devices = subprocess.run(['fastboot', 'devices'], check=True,
+    devices = subprocess.run([fastboot_cmd, 'devices'], check=True,
                              capture_output=True, text=True, timeout=5).stdout
     if not any(line.split()[:1] == [serial] for line in devices.splitlines()):
         raise RuntimeError('xnuloader is not connected; boot the resident loader first')
     if 'product: xnuloader' not in fastboot('getvar', 'product'):
         raise RuntimeError('unexpected fastboot product')
     state = fastboot('getvar', 'result')
-    if 'result:' not in state or any(word in state for word in ('running', 'hung', 'no-such-core')):
-        raise RuntimeError('kernel state does not allow replacing its system image')
+    # Any held state (kernel or loader keeps the cores and resources) and a
+    # firmware fault refuse staging; the loader would only answer a generic
+    # error later. Words match the set_result strings in xnuloader/loader.c.
+    if ('result:' not in state
+            or any(word in state for word in ('running', 'hung', 'no-such-core', '-held', 'firmware-fault'))):
+        first = state.strip().splitlines()
+        raise RuntimeError('kernel state does not allow replacing its system image: '
+                           + (first[0] if first else '(empty response)'))
     fastboot('oem', 'ramdisk')
     fastboot('stage', str(image), seconds=180)
     print(f'Transferred {image.stat().st_size} bytes into loader RAM.')

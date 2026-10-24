@@ -82,9 +82,12 @@ def build_c(src, bid_expect):
     blocks = [_base.extract(src, name) for name in ("LC-STR", "LC", "LC-USB", "LC-FB", "LC-BID")]
     prelude = PRELUDE
     exc = re.search(r"enum \{ EXC_CTX_.*?\};", _base.read(EFIH), re.S).group(0)
-    for token, value in (("@START@", _base.macro_value(src, "START_SECONDS")), ("@SILENCE@", _base.macro_value(src, "SILENCE_SECONDS")),
+    usb = re.search(r"enum \{ UsbDeviceEventNoEvent.*?\} usb_device_event_data;", _base.read(EFIH), re.S).group(0)
+    for token, value in (("@C_PRELUDE@", _base._harness3.C_PRELUDE),
+                         ("@START@", _base.macro_value(src, "START_SECONDS")), ("@SILENCE@", _base.macro_value(src, "SILENCE_SECONDS")),
                          ("@SELFTEST@", _base.macro_value(src, "CHECKPOINT_SELFTEST")), ("@MAGIC2@", _base.macro_value(src, "KERNEL_LIVE_MAGIC2")),
-                         ("@LIVE@", _base.struct_copy(src, "kernel_live")), ("@EXC@", exc)):
+                         ("@LIVE@", _base.struct_copy(src, "kernel_live")), ("@EXC@", exc), ("@USB@", usb),
+                         ("@PSCI@", _base._harness2.PSCI_STUB)):
         prelude = prelude.replace(token, value)
     return (prelude + "\n" + "\n".join(blocks) + "\n" + BID_SCENARIOS + "\n").replace("@BID@", bid_expect)
 
@@ -157,7 +160,7 @@ def compile_run_extra(c_text, name, extra_flags):
 
 
 def main():
-    src = _base.read(LOADER)
+    src = _base.read_tu(LOADER)
     fails = []
 
     def ck(cond, name):

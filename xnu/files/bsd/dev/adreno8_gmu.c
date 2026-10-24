@@ -76,7 +76,11 @@ adreno8_block_new(struct adreno8_gpu_block *b, const char *name, uint32_t addres
 void
 adreno8_settle(void)
 {
-	__asm__ volatile ("dsb sy");
+	/* dsb sy orders every earlier access of this PE, at all shareability
+	 * levels, before every later one. The memory clobber keeps the
+	 * compiler from moving C-level loads and stores across the barrier;
+	 * the asm alone fixes only the barrier's own position. */
+	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
 /* Push what this processor has written to a stretch of memory out of its cache, and forget it: the GMU reads memory. */
@@ -84,8 +88,21 @@ adreno8_settle(void)
 void
 adreno8_to_memory(vm_offset_t start, vm_size_t size)
 {
+	/* The order the GMU or the secure world needs to read a buffer this
+	 * kernel just built: the CPU stores the content, dc civac pushes each
+	 * dirty 64-byte line out to the point a GPU- or secure-side read
+	 * observes (outer shareable; the GMU sits outside the CPU clusters),
+	 * the trailing dsb sy waits for those cleanups to complete, and only
+	 * then may the SMC call tell the other side to read. The memory
+	 * clobber on each line tells the compiler the cache operation touches
+	 * memory it cannot track, so a store of buffer content stays above
+	 * the line that cleans its address instead of being sunk into or past
+	 * the loop. The host test mocks run on ordinary memory and prove
+	 * nothing about this order; the claim rests on the instruction
+	 * semantics, confirmed only by target compilation here and by a
+	 * device run end to end. */
 	for (vm_offset_t line = start & ~(vm_offset_t)63; line < start + size; line += 64) {
-		__asm__ volatile ("dc civac, %0" : : "r" (line));
+		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
 	}
 	adreno8_settle();
 }

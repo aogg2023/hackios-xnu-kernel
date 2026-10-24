@@ -90,17 +90,13 @@ adreno8_to_memory(vm_offset_t start, vm_size_t size)
 {
 	/* The order the GMU or the secure world needs to read a buffer this
 	 * kernel just built: the CPU stores the content, dc civac pushes each
-	 * dirty 64-byte line out to the point a GPU- or secure-side read
-	 * observes (outer shareable; the GMU sits outside the CPU clusters),
-	 * the trailing dsb sy waits for those cleanups to complete, and only
-	 * then may the SMC call tell the other side to read. The memory
-	 * clobber on each line tells the compiler the cache operation touches
-	 * memory it cannot track, so a store of buffer content stays above
-	 * the line that cleans its address instead of being sunk into or past
-	 * the loop. The host test mocks run on ordinary memory and prove
-	 * nothing about this order; the claim rests on the instruction
-	 * semantics, confirmed only by target compilation here and by a
-	 * device run end to end. */
+	 * dirty 64-byte line out to its point of coherence, and the trailing
+	 * dsb sy waits for those cache maintenance operations to complete;
+	 * only then may the SMC call tell the other side to read. The memory
+	 * clobber on each line constrains the compiler: a store of buffer
+	 * content stays above the line that cleans its address instead of
+	 * being sunk into or past the loop. The host test mocks run on
+	 * ordinary memory and prove nothing about this order. */
 	for (vm_offset_t line = start & ~(vm_offset_t)63; line < start + size; line += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
 	}

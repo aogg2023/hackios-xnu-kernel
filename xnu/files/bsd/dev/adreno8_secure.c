@@ -366,12 +366,18 @@ adreno8_secure_xfer(struct adreno8_gpu_space *space, const struct adreno8_memory
 	if (adreno8_xfer_state != SECURE_XFER_NOT_STARTED) {
 		return false;
 	}
-	/* Input rules enforced here rather than assumed from the single caller:
-	 * the buffer must exist, the secure context must still be disabled for
-	 * the experiment, and the table cursor must point inside the table list.
-	 * buffer->size is a uint32, so rounding it up in uint64 cannot overflow. */
+	/* The rules this path can prove from its arguments alone: the buffer
+	 * must exist, the secure context must still be disabled for the
+	 * experiment, and the table list must be non-empty, inside the array
+	 * the space carries, and have an unprocessed tail. buffer and space
+	 * are caller-owned structures that the allocation path dereferences
+	 * before calling, so neither may be NULL; table contents are proven
+	 * page by page in adreno8_assign_tables_check. buffer->size is a
+	 * uint32, so rounding it up in uint64 cannot overflow. */
 	if (buffer->memory == 0 || buffer->size == 0 || space->is_on ||
-	    space->table_count == 0 || space->secure_tables > space->table_count) {
+	    space->table_count == 0 ||
+	    space->table_count > sizeof(space->tables) / sizeof(space->tables[0]) ||
+	    space->secure_tables > space->table_count) {
 		printf("adreno8: secure handover input rejected: buffer %#llx size %u, space %u tables cursor %u on %d\n",
 		    (uint64_t)buffer->memory, buffer->size, space->table_count,
 		    space->secure_tables, space->is_on);

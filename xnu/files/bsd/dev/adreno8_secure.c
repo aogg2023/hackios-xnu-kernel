@@ -35,12 +35,6 @@ struct assign_perm {
 #define ASSIGN_EXTENDED     640u       /* four little-endian argument words */
 #define ASSIGN_USED         (ASSIGN_EXTENDED + 4 * sizeof(uint64_t))
 
-/* Pre-call trace budget. The current 1.2 MiB kind-5 request needs 312 region
- * lines at 4 KiB pages even with every page scattered; the 64 MiB block
- * ceiling would need 16384, past what the serial log should carry, so
- * per-region lines stop at this cap while every batch header still prints. */
-#define ASSIGN_TRACE_REGIONS 1024u
-
 /* The layout above is the TrustZone-side ABI: record sizes come from the
  * vendor wire format and every byte must stay inside the one argument page. */
 _Static_assert(sizeof(struct assign_region) == 16, "MP_ASSIGN region record must be 16 bytes");
@@ -52,10 +46,8 @@ static struct {
 	uint64_t page_phys;
 	bool lost;
 	unsigned attempts;               /* top-level SCM calls actually made, EBUSY
-	                                  * retries included; the TrustZone-side A6
-	                                  * continuations behind one SMC stay hidden */
-	struct assign_region plan[ASSIGN_TRACE_REGIONS];
-	unsigned plan_regions, plan_saved;
+	                                  * retries included; the A6 interrupted
+	                                  * continuation SMCs stay hidden */
 } adreno8_assign;
 
 bool
@@ -160,11 +152,13 @@ adreno8_assign_call(uint64_t regions_bytes, uint64_t perms_bytes, uint64_t *answ
 /* The caller has staged `count` region entries in @regions. A failed batch can
  * have been applied to TZ partially and the HLOS cannot tell which regions
  * landed, so every page of this operation stays assigned where it is until
- * cold reset; nothing here rolls back or frees. `role` and `batch` label the
- * trace lines so a table-batch failure reads apart from a data-batch one. */
+ * cold reset; nothing here rolls back or frees. `role`, `perm_note` and `batch` label
+ * the lines printed from the staged batch itself, so a table-batch failure
+ * reads apart from a data-batch one and the log matches what the SMC gets. */
 static bool
 adreno8_assign_flush(const struct assign_region *regions, unsigned count,
-    const struct assign_perm *perms, unsigned perm_count, const char *role, unsigned batch)
+    const struct assign_perm *perms, unsigned perm_count, const char *role,
+    const char *perm_note, unsigned batch)
 {
 	struct assign_region *slots = (struct assign_region *)adreno8_assign.page;
 	struct assign_perm *perm_slots = (struct assign_perm *)(adreno8_assign.page + ASSIGN_PERMS);
@@ -177,11 +171,18 @@ adreno8_assign_flush(const struct assign_region *regions, unsigned count,
 	for (unsigned i = 0; i < perm_count; i++) {
 		perm_slots[i] = perms[i];
 	}
+	printf("adreno8: MP_ASSIGN plan: batch %u %s, permissions %s, argument page %#llx, %u regions\n",
+	    batch, role, perm_note, (unsigned long long)adreno8_assign.page_phys, count);
+	for (unsigned i = 0; i < count; i++) {
+		printf("adreno8: MP_ASSIGN plan: batch %u region %u addr %#llx len %llu\n",
+		    batch, i, (unsigned long long)regions[i].address,
+		    (unsigned long long)regions[i].size);
+	}
 	printf("adreno8: MP_ASSIGN batch %u %s: %u regions, %u permission records, %u top-level SCM calls before\n",
 	    batch, role, count, perm_count, adreno8_assign.attempts);
 	status = adreno8_assign_call((uint64_t)count * sizeof(struct assign_region),
 	    (uint64_t)perm_count * sizeof(struct assign_perm), &answer);
-	printf("adreno8: MP_ASSIGN batch %u %s returned %d, answer %#llx, %u top-level SCM calls (TrustZone-side A6 continuations not counted)\n",
+	printf("adreno8: MP_ASSIGN batch %u %s returned %d, answer %#llx, %u top-level SCM calls (A6 interrupted continuation SMCs not counted)\n",
 	    batch, role, status, (unsigned long long)answer, adreno8_assign.attempts);
 	if (status == 0 && answer == 0) {
 		return true;
@@ -193,7 +194,7 @@ adreno8_assign_flush(const struct assign_region *regions, unsigned count,
 
 /* Stage and flush the buffer's data pages to CP_PIXEL read/write. The caller has
  * passed the preflight and opened the argument page; `batch_base` is the count
- * of table batches, so batch numbers match the pre-call trace. */
+ * of table batches, so table and data batch numbers continue one sequence. */
 static bool
 adreno8_assign_data(const struct adreno8_memory *buffer, unsigned batch_base)
 {
@@ -229,13 +230,15 @@ adreno8_assign_data(const struct adreno8_memory *buffer, unsigned batch_base)
 		batch_regions[filled++] = (struct assign_region){ phys, run };
 		at += run;
 		if (filled == ASSIGN_SECTIONS) {
-			if (!adreno8_assign_flush(batch_regions, filled, perms, 1, "data", batch++)) {
+			if (!adreno8_assign_flush(batch_regions, filled, perms, 1, "data",
+			    "CP_PIXEL read/write", batch++)) {
 				return false;
 			}
 			filled = 0;
 		}
 	}
-	if (filled != 0 && !adreno8_assign_flush(batch_regions, filled, perms, 1, "data", batch)) {
+	if (filled != 0 && !adreno8_assign_flush(batch_regions, filled, perms, 1, "data",
+	    "CP_PIXEL read/write", batch)) {
 		return false;
 	}
 	printf("adreno8: secure buffer %s: %llu KiB owned by CP_PIXEL\n",
@@ -293,13 +296,15 @@ adreno8_assign_tables(struct adreno8_gpu_space *space)
 		adreno8_to_memory(space->tables[i].table, PAGE_SIZE);
 		batch_regions[filled++] = (struct assign_region){ phys, PAGE_SIZE };
 		if (filled == ASSIGN_SECTIONS) {
-			if (!adreno8_assign_flush(batch_regions, filled, perms, 2, "table", batch++)) {
+			if (!adreno8_assign_flush(batch_regions, filled, perms, 2, "table",
+			    "HLOS read/write and CP_PIXEL read", batch++)) {
 				return false;
 			}
 			filled = 0;
 		}
 	}
-	if (filled != 0 && !adreno8_assign_flush(batch_regions, filled, perms, 2, "table", batch)) {
+	if (filled != 0 && !adreno8_assign_flush(batch_regions, filled, perms, 2, "table",
+	    "HLOS read/write and CP_PIXEL read", batch)) {
 		return false;
 	}
 	return true;
@@ -307,10 +312,7 @@ adreno8_assign_tables(struct adreno8_gpu_space *space)
 
 /* Count the data pages and merge runs into region entries without staging, so
  * an experiment can print its batch plan before any MP_ASSIGN. The counts come
- * from the real PAGE_SIZE and the merge rule adreno8_assign_data uses. Merged
- * entries are also kept up to the trace cap so the pre-call trace reports the
- * same regions the flush walk will stage; the flush walk re-derives them and
- * stays the authority on what goes to TZ. */
+ * from the real PAGE_SIZE and the merge rule adreno8_assign_data uses. */
 static bool
 adreno8_assign_plan(const struct adreno8_memory *buffer, unsigned *pages, unsigned *regions)
 {
@@ -318,8 +320,6 @@ adreno8_assign_plan(const struct adreno8_memory *buffer, unsigned *pages, unsign
 
 	*pages = 0;
 	*regions = 0;
-	adreno8_assign.plan_regions = 0;
-	adreno8_assign.plan_saved = 0;
 	for (uint64_t at = 0; at < bytes; ) {
 		uint64_t phys, next;
 
@@ -332,56 +332,11 @@ adreno8_assign_plan(const struct adreno8_memory *buffer, unsigned *pages, unsign
 		    adreno8_assign_page_phys(buffer->memory + at + run, &next) && next == phys + run) {
 			run += PAGE_SIZE;
 		}
-		if (*regions < ASSIGN_TRACE_REGIONS) {
-			adreno8_assign.plan[adreno8_assign.plan_saved++] =
-			    (struct assign_region){ phys, run };
-		}
 		*pages += (unsigned)(run / PAGE_SIZE);
 		*regions += 1;
 		at += run;
 	}
-	adreno8_assign.plan_regions = *regions;
 	return true;
-}
-
-/* Print every logical batch before the first MP_ASSIGN so the serial log keeps
- * the region addresses as HLOS saw them while every page was still ours: role
- * and global batch number, the permissions the batch asks for, the shared
- * argument page, and per-region physical start and length up to the trace cap.
- * Table addresses come from the mapper records adreno8_assign_tables_check has
- * just proven; data addresses from the plan walk above. The trace reads
- * bookkeeping only, never buffer contents, and a failed handover can be read
- * apart as table-batch or data-batch from the batch labels. */
-static void
-adreno8_assign_trace(const struct adreno8_gpu_space *space, unsigned data_regions,
-    unsigned table_batches)
-{
-	printf("adreno8: MP_ASSIGN plan: argument page %#llx, %u table batches then %u data batches\n",
-	    adreno8_assign.page_phys, table_batches,
-	    (data_regions + ASSIGN_SECTIONS - 1) / ASSIGN_SECTIONS);
-	for (unsigned i = space->secure_tables, n = 0; i < space->table_count; i++, n++) {
-		if (n % ASSIGN_SECTIONS == 0) {
-			printf("adreno8: MP_ASSIGN plan: batch %u table, permissions HLOS read/write and CP_PIXEL read\n",
-			    n / ASSIGN_SECTIONS);
-		}
-		printf("adreno8: MP_ASSIGN plan: batch %u region %u addr %#llx len %llu\n",
-		    n / ASSIGN_SECTIONS, n % ASSIGN_SECTIONS,
-		    (unsigned long long)space->tables[i].phys, (unsigned long long)PAGE_SIZE);
-	}
-	if (adreno8_assign.plan_regions > ASSIGN_TRACE_REGIONS) {
-		printf("adreno8: MP_ASSIGN plan: %u data regions exceed the %u-entry trace cap, region lines omitted\n",
-		    adreno8_assign.plan_regions, ASSIGN_TRACE_REGIONS);
-	}
-	for (unsigned n = 0; n < adreno8_assign.plan_saved; n++) {
-		if (n % ASSIGN_SECTIONS == 0) {
-			printf("adreno8: MP_ASSIGN plan: batch %u data, permissions CP_PIXEL read/write\n",
-			    table_batches + n / ASSIGN_SECTIONS);
-		}
-		printf("adreno8: MP_ASSIGN plan: batch %u region %u addr %#llx len %llu\n",
-		    table_batches + n / ASSIGN_SECTIONS, n % ASSIGN_SECTIONS,
-		    (unsigned long long)adreno8_assign.plan[n].address,
-		    (unsigned long long)adreno8_assign.plan[n].size);
-	}
 }
 
 /*
@@ -460,14 +415,13 @@ adreno8_secure_xfer(struct adreno8_gpu_space *space, const struct adreno8_memory
 	batches = (regions + ASSIGN_SECTIONS - 1) / ASSIGN_SECTIONS + table_batches;
 	printf("adreno8: secure handover attempted: %u pages merge into %u data regions plus %u table pages, %u logical MP_ASSIGN batches\n",
 	    pages, regions, space->table_count - space->secure_tables, batches);
-	adreno8_assign_trace(space, regions, table_batches);
 	if (!adreno8_assign_tables(space) || !adreno8_assign_data(buffer, table_batches)) {
 		adreno8_xfer_state = SECURE_XFER_TERMINAL;
 		return false;
 	}
 	space->secure_tables = space->table_count;
 	adreno8_xfer_state = SECURE_XFER_TERMINAL;
-	printf("adreno8: secure handover complete: %u pages owned by CP_PIXEL after %u top-level MP_ASSIGN SCM calls, TrustZone-side A6 continuations not counted, retained until cold reset; no MEM_ALLOC reply\n",
+	printf("adreno8: secure handover complete: %u pages owned by CP_PIXEL after %u top-level MP_ASSIGN SCM calls, A6 interrupted continuation SMCs not counted, retained until cold reset; no MEM_ALLOC reply\n",
 	    pages, adreno8_assign.attempts);
 	return true;
 }

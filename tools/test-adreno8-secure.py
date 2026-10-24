@@ -2,6 +2,7 @@
 """Drive the one-shot adreno8_secure_xfer entry against scripted SCM outcomes."""
 from pathlib import Path
 import runpy
+import re
 import subprocess
 import tempfile
 
@@ -215,17 +216,32 @@ int main(int argc, char **argv) {
         puts("MP_ASSIGN nonzero answer retained through the handover: PASS");
         return 0;
     }
-    if (argc > 1 && strcmp(argv[1], "waitq") == 0) {
-        /* A positive status is a definite failure: no EBUSY-style retry, the
-         * handover stays terminal and one-shot. */
-        script(2, 0);
+    if (argc > 1 && strncmp(argv[1], "waitq", 5) == 0) {
+        /* A positive status leaves the request unfinished and ends the
+         * experiment: no EBUSY-style retry, the handover stays terminal and
+         * one-shot. Status 2 and 3 both take this path. */
+        int32_t pending = argv[1][5] == '3' ? 3 : 2;
+        script(pending, 0);
         buffer = make_buffer(1);
         space = secure_space(1);
         assert(!run_xfer(space, &buffer));
         assert(call_count == 1 && sleeps == 0 && adreno8_secure_lost());
         assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
         assert(!run_xfer(space, &buffer) && call_count == 1);
-        puts("MP_ASSIGN WAITQ status retained without continuation: PASS");
+        printf("MP_ASSIGN WAITQ status %d retained without continuation: PASS\n", (int)pending);
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "regions1025") == 0) {
+        /* Past the earlier 1024-entry logging budget: the driver keeps no
+         * region cache, so all 1025 regions plus the table page are staged,
+         * printed from the staged batch, and handed over in full. */
+        script(0, 0);
+        buffer = make_buffer(1025);
+        space = secure_space(1);
+        assert(run_xfer(space, &buffer));
+        assert(call_count == 1 + (1025 + 31) / 32 && !adreno8_secure_lost());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        puts("1025 regions hand over fully with no region cache: PASS");
         return 0;
     }
     if (argc > 1 && strcmp(argv[1], "poison") == 0) {
@@ -500,7 +516,8 @@ if __name__ == "__main__":
                          ("guards",), ("contig",), ("regions31",), ("regions32",),
                          ("regions33",), ("mixed31",), ("mixed32",), ("mixed33",),
                          ("unaligned",), ("unaligned-table",), ("table-align",),
-                         ("va-unaligned",), ("parange-table",)):
+                         ("va-unaligned",), ("waitq3",), ("regions1025",),
+                         ("parange-table",)):
                 result = subprocess.run([str(binary), *mode], check=True,
                                         capture_output=True, text=True)
                 if mode == ():
@@ -511,16 +528,43 @@ if __name__ == "__main__":
                             "4 logical MP_ASSIGN batches")
                     assert want in result.stdout, (want, result.stdout)
                     assert ("secure handover complete: 70 pages owned by CP_PIXEL "
-                            "after 4 top-level MP_ASSIGN SCM calls, TrustZone-side A6 "
-                            "continuations not counted") in result.stdout
+                            "after 4 top-level MP_ASSIGN SCM calls, A6 interrupted "
+                            "continuation SMCs not counted") in result.stdout
                     assert "no MEM_ALLOC reply" in result.stdout
                 if mode == ("ebusy",):
                     # The log tells logical batches apart from real SCM attempts:
                     # the EBUSY retry makes three attempts for two batches.
                     assert "2 logical MP_ASSIGN batches" in result.stdout
                     assert ("secure handover complete: 3 pages owned by CP_PIXEL "
-                            "after 3 top-level MP_ASSIGN SCM calls, TrustZone-side A6 "
-                            "continuations not counted") in result.stdout
+                            "after 3 top-level MP_ASSIGN SCM calls, A6 interrupted "
+                            "continuation SMCs not counted") in result.stdout
+                if mode in ((), ("contig",), ("regions31",), ("regions32",),
+                            ("regions33",), ("mixed31",), ("mixed32",),
+                            ("mixed33",), ("regions1025",), ("ebusy",)):
+                    # Region lines come from the staged batch: their count,
+                    # per-batch numbering, and total length must match the
+                    # plan line the same run printed.
+                    plan = re.search(r"(\d+) pages merge into (\d+) data regions "
+                                     r"plus (\d+) table pages", result.stdout)
+                    assert plan, result.stdout
+                    data_regions, table_regions = int(plan.group(2)), int(plan.group(3))
+                    lines = re.findall(r"MP_ASSIGN plan: batch (\d+) region (\d+) addr ([0-9a-fx]+) len (\d+)",
+                                       result.stdout)
+                    assert len(lines) == data_regions + table_regions, (mode, len(lines))
+                    seen: dict[int, list[int]] = {}
+                    for batch, index, _addr, length in lines:
+                        seen.setdefault(int(batch), []).append(int(index))
+                        assert int(length) % page_size == 0
+                    for indices in seen.values():
+                        assert indices == list(range(len(indices)))
+                    # Table regions carry one native page each, so the total
+                    # length covers data pages plus table pages.
+                    assert sum(int(length) for _b, _i, _a, length in lines) \
+                        == (int(plan.group(1)) + table_regions) * page_size
+                    headers = re.findall(r"MP_ASSIGN plan: batch \d+ (?:table|data), permissions",
+                                         result.stdout)
+                    assert len(headers) == (table_regions + 31) // 32 \
+                        + (data_regions + 31) // 32
                 abort_modes = {("argfail",), ("poison",), ("unaligned",),
                                ("unaligned-table",), ("table-align",)}
                 if page_size == 16384:

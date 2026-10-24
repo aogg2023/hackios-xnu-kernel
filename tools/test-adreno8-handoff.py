@@ -20,11 +20,22 @@ fixture = runpy.run_path(str(ROOT / "tools/test-adreno8-smmu.py"))
 stub = fixture["stub"].replace("assert(size == 4096);", "assert(size != 0);")
 stub = stub.replace("static int adreno8_say", r'''
 uint32_t adreno8_gpu8_secure_mode;
+static uint64_t *physical_table(uint64_t pa);
 static unsigned scm_calls, scm_sleeps, scm_fail_at = 999999u, scm_ebusy;
 int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
     uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *answer) {
     assert(function == 0x42000c16ull && arginfo == 0x1117ull);
     scm_calls++;
+    /* Snapshot the region records exactly as staged in the argument page at
+     * call time, one stderr line each, for the log-versus-SCM comparison. */
+    {
+        const uint64_t *live = (const uint64_t *)(uintptr_t)physical_table(argument0);
+        for (unsigned i = 0; i < argument1 / 16; i++) {
+            fprintf(stderr, "scmsnap call %u region %u addr %#llx len %llu\n",
+                scm_calls - 1, i, (unsigned long long)live[2 * i],
+                (unsigned long long)live[2 * i + 1]);
+        }
+    }
     if (scm_ebusy) {
         *answer = 12;
         return -12;
@@ -224,6 +235,29 @@ int main(int argc, char **argv) {
         puts("data batch failure through the real pump: lost, retained, zero reply: PASS");
         return 0;
     }
+    if (strcmp(which, "tablefail") == 0) {
+        /* The very first batch, the tables, fails: no data batch runs after
+         * it and nothing later appears in the log. */
+        scm_fail_at = 1;
+        boot();
+        assert(scm_calls == 1 && adreno8_secure_lost());
+        assert(adreno8_memory_failed && adreno8_memory_retained());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        request_refused(5, 0x1007);
+        puts("table batch failure through the real pump: no later batch, zero reply: PASS");
+        return 0;
+    }
+    if (strcmp(which, "data2fail") == 0) {
+        /* Tables and the first data batch land; the second data batch fails:
+         * the run stops there with no third data batch call. */
+        scm_fail_at = 3;
+        boot();
+        assert(scm_calls == 3 && adreno8_secure_lost());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        request_refused(5, 0x1007);
+        puts("second data batch failure through the real pump: run stops at the failed batch: PASS");
+        return 0;
+    }
     if (strcmp(which, "ebusy") == 0) {
         /* The firmware answers MP_ASSIGN with EBUSY forever: the vendor retry
          * bound runs out inside the first batch and the boot is retained. */
@@ -291,10 +325,12 @@ with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
         subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}",
                         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                         str(target / "check.c"), "-o", str(binary)], check=True)
-        for mode in ((), ("off",), ("preflight",), ("batchfail",), ("ebusy",), ("argfail",)):
+        for mode in ((), ("off",), ("preflight",), ("batchfail",), ("tablefail",),
+                     ("data2fail",), ("ebusy",), ("argfail",)):
             result = subprocess.run([str(binary), *mode], check=True,
                                     capture_output=True, text=True)
             out = result.stdout
+            err = result.stderr
             assert "START resource request 20 failed (11 words)" in out, (mode, out)
             if mode == ():
                 pages = 0x138000 // page_size
@@ -302,12 +338,40 @@ with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
                         f"{(pages + 31) // 32 + 1} logical MP_ASSIGN batches")
                 assert want in out, (want, out)
                 assert "secure handover complete" in out
-                # The pre-call trace carries the shared argument page, both batch
-                # roles, and it precedes the first call line for batch 0.
-                assert "MP_ASSIGN plan: argument page" in out
+                # Every batch header names its role, permissions, shared
+                # argument page, and region count before that batch's call line.
+                assert re.search(
+                    r"MP_ASSIGN plan: batch 0 table, permissions HLOS read/write and "
+                    r"CP_PIXEL read, argument page 0x[0-9a-f]+, 3 regions", out), out
                 assert "MP_ASSIGN plan: batch 0 table, permissions HLOS read/write" in out
                 assert ("MP_ASSIGN plan: batch 1 data, permissions CP_PIXEL read/write" in out)
                 assert out.find("MP_ASSIGN plan:") < out.find("MP_ASSIGN batch 0 table:")
+                # Log regions equal the SCM snapshots in batch and region order.
+                batches, headers = {}, []
+                for line in out.splitlines():
+                    m = re.match(r"adreno8: MP_ASSIGN plan: batch (\d+) (table|data), permissions "
+                                 r"(.+?), argument page ([0-9a-fx]+), (\d+) regions$", line)
+                    if m:
+                        headers.append((int(m.group(1)), m.group(2), m.group(3), m.group(4),
+                                        int(m.group(5))))
+                        continue
+                    m = re.match(r"adreno8: MP_ASSIGN plan: batch (\d+) region (\d+) addr "
+                                 r"([0-9a-fx]+) len (\d+)$", line)
+                    if m:
+                        batches.setdefault(int(m.group(1)), []).append(
+                            (m.group(3), int(m.group(4))))
+                snaps = {}
+                for c, _i, addr, length in re.findall(
+                        r"scmsnap call (\d+) region (\d+) addr ([0-9a-fx]+) len (\d+)", err):
+                    snaps.setdefault(int(c), []).append((addr, int(length)))
+                assert [b for b, _ in sorted(batches.items())] == list(range(len(batches)))
+                assert len(headers) == len(snaps) == len(batches)
+                for batch, role, perm, _arg, count in headers:
+                    assert batches[batch] and len(batches[batch]) == count
+                    expected = ("HLOS read/write and CP_PIXEL read" if role == "table"
+                                else "CP_PIXEL read/write")
+                    assert perm == expected, (role, perm)
+                    assert snaps[batch] == batches[batch], batch
                 assert "no MEM_ALLOC reply is built" in out
                 assert "the secure handover experiment ended" in out
             if mode in (("off",), ("preflight",)):
@@ -325,6 +389,29 @@ with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
                 assert "secure handover attempted" in out
                 assert out.count("returned -12") == 1
                 assert "secure pages retained until cold reset" in out
+            if mode in (("tablefail",), ("data2fail",)):
+                if mode == ("tablefail",):
+                    assert "MP_ASSIGN plan: batch 0 table," in out
+                    assert "MP_ASSIGN batch 0 table returned -5" in out
+                    assert "MP_ASSIGN batch 1 data" not in out
+                else:
+                    assert "MP_ASSIGN plan: batch 2 data," in out
+                    assert "MP_ASSIGN batch 2 data returned -5" in out
+                    assert "MP_ASSIGN batch 3 data" not in out
+            if mode == ("ebusy",):
+                # The 20 EBUSY retries reuse one staged batch: the region log
+                # for batch 0 appears once and every snapshot matches it.
+                batches = {}
+                for b, i, addr, length in re.findall(
+                        r"MP_ASSIGN plan: batch (\d+) region (\d+) addr ([0-9a-fx]+) len (\d+)", out):
+                    batches.setdefault(int(b), []).append((addr, int(length)))
+                snaps = {}
+                for c, i, addr, length in re.findall(
+                        r"scmsnap call (\d+) region (\d+) addr ([0-9a-fx]+) len (\d+)", err):
+                    snaps.setdefault(int(c), []).append((addr, int(length)))
+                assert set(batches) == {0} and len(batches[0]) == 3, out
+                assert len(snaps) == 20 and all(v == batches[0] for v in snaps.values())
+                assert out.count("MP_ASSIGN batch 0 table:") == 1
             if mode == ("argfail",):
                 assert "ends before any MP_ASSIGN; no page transferred" in out
                 assert "MP_ASSIGN batch" not in out

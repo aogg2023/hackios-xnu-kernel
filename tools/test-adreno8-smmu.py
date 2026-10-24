@@ -455,6 +455,13 @@ int main(void) {
     regs[SMMU_S2CR(5) / 4] = 0x10004u;
     assert(!adreno8_secure_preflight() && writes == 0);
     assert(reads[SMMU_SMR(5) / 4] == 1 && reads[SMMU_S2CR(5) / 4] == 1);
+    /* An exact match on stream 2 sitting on a non-candidate slot rejects
+     * while routing to context 4: the stream is taken either way. */
+    reset(&space, false);
+    regs[SMMU_SMR(5) / 4] = 0x80000002;
+    regs[SMMU_S2CR(5) / 4] = 0x10004u;
+    assert(!adreno8_secure_preflight() && writes == 0);
+    assert(reads[SMMU_S2CR(5) / 4] == 1);
     /* Candidate slot beyond the SMR count: rejected with no MMIO read at all. */
     reset(&space, false);
     regs[SMMU_IDR0 / 4] = 0x4c017e02;

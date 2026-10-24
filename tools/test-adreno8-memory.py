@@ -455,7 +455,7 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
                 assert "no MEM_ALLOC reply is built" in result.stdout
             if mode == ("xfer-open-fail",) or mode == ("xfer-parange",):
                 assert "ends before any MP_ASSIGN; no page transferred" in result.stdout
-                assert "MP_ASSIGN returned" not in result.stdout
+                assert "MP_ASSIGN batch" not in result.stdout
             if mode == ("xfer-gmu-changed",):
                 assert "GMU route context changed" in result.stdout
                 assert "secure handover attempted" not in result.stdout

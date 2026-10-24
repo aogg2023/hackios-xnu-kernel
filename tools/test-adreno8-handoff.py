@@ -302,6 +302,12 @@ with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
                         f"{(pages + 31) // 32 + 1} logical MP_ASSIGN batches")
                 assert want in out, (want, out)
                 assert "secure handover complete" in out
+                # The pre-call trace carries the shared argument page, both batch
+                # roles, and it precedes the first call line for batch 0.
+                assert "MP_ASSIGN plan: argument page" in out
+                assert "MP_ASSIGN plan: batch 0 table, permissions HLOS read/write" in out
+                assert ("MP_ASSIGN plan: batch 1 data, permissions CP_PIXEL read/write" in out)
+                assert out.find("MP_ASSIGN plan:") < out.find("MP_ASSIGN batch 0 table:")
                 assert "no MEM_ALLOC reply is built" in out
                 assert "the secure handover experiment ended" in out
             if mode in (("off",), ("preflight",)):
@@ -313,15 +319,16 @@ with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
                 assert "secure handover attempted" not in out
             if mode == ("batchfail",):
                 assert "secure handover attempted" in out
-                assert "MP_ASSIGN returned" in out
+                assert "MP_ASSIGN batch 1 data returned -5, answer 0x5, 2 top-level SCM calls" in out
                 assert "secure allocation failed; retain GPU memory until cold reset" in out
             if mode == ("ebusy",):
                 assert "secure handover attempted" in out
-                assert out.count("MP_ASSIGN returned -12") == 1
+                assert out.count("returned -12") == 1
                 assert "secure pages retained until cold reset" in out
             if mode == ("argfail",):
                 assert "ends before any MP_ASSIGN; no page transferred" in out
-                assert "MP_ASSIGN returned" not in out
+                assert "MP_ASSIGN batch" not in out
+                assert "MP_ASSIGN plan" not in out
             if mode != ("off",) and mode != ("preflight",):
                 assert "the secure handover experiment ended" in out
         print(f"XNU PAGE_SIZE={page_size}: PASS")

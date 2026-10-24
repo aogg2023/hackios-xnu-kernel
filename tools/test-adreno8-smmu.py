@@ -101,12 +101,33 @@ static void kmem_free(int map, vm_offset_t va, size_t size) {
     }
     assert(false);
 }
+/* Flat physical layouts for the MP_ASSIGN batch tests: pa_flat makes pages of
+ * one allocation physically adjacent, gap_every inserts a 1 MiB gap every
+ * gap_every pages, pa_offset shifts the whole flat map, and skew_all splits
+ * every page at its 4 KiB subboundary. The *_va knobs target one page: shift_va
+ * moves that page's physical start, skew_va splits it at the 4 KiB subboundary.
+ * Default (all off) keeps every page on a 128 KiB stride, never adjacent. */
+static bool pa_flat, skew_all;
+static unsigned gap_every;
+static uint64_t pa_offset, skew_delta, shift_delta;
+static vm_offset_t skew_va, shift_va;
 static uint64_t kvtophys(vm_offset_t va) {
     for (unsigned i = 0; i < allocation_count; i++) {
         struct allocation a = allocations[i];
         if (a.va && va >= a.va && va - a.va < a.size) {
             uint64_t delta = va - a.va;
-            return a.pa + delta / PAGE_SIZE * 0x20000 + delta % PAGE_SIZE;
+            uint64_t page = delta / PAGE_SIZE, off = delta % PAGE_SIZE;
+            if (!pa_flat) {
+                return a.pa + page * 0x20000 + off;
+            }
+            uint64_t pa = a.pa + pa_offset + page * PAGE_SIZE +
+                (gap_every ? page / gap_every * 0x100000 : 0) + off;
+            if (((skew_all || (skew_va && va >= skew_va && va < skew_va + PAGE_SIZE)) &&
+                 off >= SMMU_GRANULE) ||
+                (shift_va && va >= shift_va && va < shift_va + PAGE_SIZE)) {
+                pa += skew_delta + shift_delta;
+            }
+            return pa;
         }
     }
     assert(false);
@@ -203,6 +224,10 @@ static void reset(struct adreno8_gpu_space *space, bool atos) {
     clean_count = 0;
     reject_offset = ~0u;
     alloc_fail_after = -1;
+    pa_flat = skew_all = false;
+    gap_every = 0;
+    pa_offset = skew_delta = shift_delta = 0;
+    skew_va = shift_va = 0;
 }
 static void map_one(struct adreno8_gpu_space *space) {
     assert(adreno8_space_new_table(space, 0, 0));

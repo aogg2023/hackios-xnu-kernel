@@ -179,6 +179,11 @@ struct adreno8_gpu_space {
 #define GMU_RBBM_INT_UNMASKED   GMU(0x23b15)
 #define GMU_BLOCKS              12
 #define GMU_BLOCK_CAP           0x01000000      /* a demand of up to 16M (the gen8 cache memory is 16M - 16K) */
+/* The SMMU uses 4 KiB granules independently of the XNU allocation page size.
+ * MP_ASSIGN shares the granule and physical-range rules, so they live here. */
+#define SMMU_GRANULE            4096u
+#define SMMU_GRANULE_MASK       (SMMU_GRANULE - 1)
+#define SMMU_PHYS_LIMIT         (1ULL << 36) /* TCR2.PASIZE = 1; IDR2 on SM8750 reports 36 bits. */
 #define SMMU_SCR0               0x000
 #define SMMU_IDR0               0x020           /* [7:0] stream match registers */
 #define SMMU_IDR1               0x024           /* bit 31: 64K pages, [30:28] log2(pages)-1, [7:0] translation contexts */

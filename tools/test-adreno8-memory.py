@@ -160,6 +160,57 @@ int main(int argc, char **argv) {
         puts("secure handover ends before any MP_ASSIGN when the argument page is missing: PASS");
         return 0;
     }
+    if (argc > 1 && (strcmp(argv[1], "xfer-subpage") == 0 || strcmp(argv[1], "xfer-skew") == 0)) {
+        /* A 16 KiB kernel page can sit on four separate 4 KiB SMMU leaves: the
+         * handover refuses pages whose whole native span is not proven. The
+         * subpage variant misaligns every physical start by 4 KiB, the skew
+         * variant splits every page at its 4 KiB subboundary. With 4 KiB
+         * pages the defect cannot exist and the flat layout merges the buffer
+         * into one data region, so the whole chain completes in two calls. */
+        bool skew = argv[1][8] == 's';
+        request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 27,
+            .size = 0x138000, .align = (12 << 8) | 16};
+        adreno8_gpu8_secure_mode = SECURE_MODE_HANDOVER;
+        pa_flat = true;
+        if (skew) {
+            skew_all = true;
+            skew_delta = 4096;
+        } else {
+            pa_offset = 4096;
+        }
+        assert(!adreno8_hwsched_alloc(&request, &result));
+        assert(!adreno8_secure_lost() && adreno8_memory_retained());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        if (PAGE_SIZE == 4096) {
+            assert(scm_calls == 2 && !adreno8_memory_failed);
+            assert(adreno8_memory_entries[0].secure && adreno8_memory_entries[0].complete &&
+                   adreno8_memory_entries[0].terminal);
+            assert(adreno8_secure_space.secure_tables == adreno8_secure_space.table_count);
+        } else {
+            assert(scm_calls == 0 && adreno8_memory_failed && adreno8_memory_count == 1);
+            assert(!adreno8_memory_entries[0].complete && !adreno8_memory_entries[0].terminal);
+            assert(adreno8_secure_space.secure_tables == 0);
+        }
+        printf("native page span %s the handover through the hwsched chain: PASS\n",
+            PAGE_SIZE == 4096 ? "completes" : "blocks");
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "xfer-parange") == 0) {
+        /* Allocations start one granule below the 36-bit translation limit:
+         * the buffer page lands past it and the mapping refuses the region
+         * before any MP_ASSIGN goes out. */
+        request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 29,
+            .size = 4096, .align = (12 << 8) | 16};
+        adreno8_gpu8_secure_mode = SECURE_MODE_HANDOVER;
+        next_pa = SMMU_PHYS_LIMIT - SMMU_GRANULE;
+        assert(!adreno8_hwsched_alloc(&request, &result));
+        assert(scm_calls == 0 && !adreno8_secure_lost());
+        assert(adreno8_memory_failed && adreno8_memory_retained());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        assert(!adreno8_memory_entries[0].complete);
+        puts("pages past the translation limit end before any MP_ASSIGN: PASS");
+        return 0;
+    }
     assert(!adreno8_memory_retained() && !adreno8_gpu_memory_ready());
     struct adreno8_memory *sqe = adreno8_gpu_alloc("sqe", 111472, 4096,
         ADRENO8_MEM_READ | ADRENO8_MEM_EXEC);
@@ -308,7 +359,8 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
         subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}",
                         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                         str(target / "check.c"), "-o", str(binary)], check=True)
-        for mode in ((), ("gated",), ("xfer",), ("xfer-fail",), ("xfer-open-fail",)):
+        for mode in ((), ("gated",), ("xfer",), ("xfer-fail",), ("xfer-open-fail",),
+                     ("xfer-subpage",), ("xfer-skew",), ("xfer-parange",)):
             result = subprocess.run([str(binary), *mode], check=True, capture_output=True, text=True)
             if mode == ("xfer",):
                 # The plan line prints from the real PAGE_SIZE and merge rule:
@@ -319,7 +371,17 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
                 assert want in result.stdout, (want, result.stdout)
                 assert "secure handover complete" in result.stdout
                 assert "no MEM_ALLOC reply is built" in result.stdout
-            if mode == ("xfer-open-fail",):
+            if mode == ("xfer-open-fail",) or mode == ("xfer-parange",):
                 assert "ends before any MP_ASSIGN; no page transferred" in result.stdout
                 assert "MP_ASSIGN returned" not in result.stdout
+            if mode in (("xfer-subpage",), ("xfer-skew",)):
+                if page_size == 4096:
+                    want = ("312 pages merge into 1 data regions plus 3 table pages, "
+                            "2 logical MP_ASSIGN batches")
+                    assert want in result.stdout, (want, result.stdout)
+                    assert "secure handover complete" in result.stdout
+                else:
+                    assert "unusable for MP_ASSIGN" in result.stdout
+                    assert "ends before any MP_ASSIGN; no page transferred" in result.stdout
+                    assert "secure handover attempted" not in result.stdout
         print(f"XNU PAGE_SIZE={page_size}: PASS")

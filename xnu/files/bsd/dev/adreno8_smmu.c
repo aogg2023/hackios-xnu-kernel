@@ -84,10 +84,8 @@ adreno8_step_smmu_read(void)
 	return true;
 }
 
-/* The SMMU uses 4 KiB granules independently of the XNU allocation page size. */
-#define SMMU_GRANULE            4096u
-#define SMMU_GRANULE_MASK       (SMMU_GRANULE - 1)
-#define SMMU_PHYS_LIMIT         (1ULL << 36) /* TCR2.PASIZE = 1; IDR2 on SM8750 reports 36 bits. */
+/* The 4 KiB granule and physical-range constants live in adreno8_private.h so
+ * the MP_ASSIGN path checks pages against the same rules the mapper uses. */
 #define SMMU_CB_MAIR1            0x3c
 #define SMMU_CB_PAR              0x50
 #define SMMU_CB_ATS1PR           0x800

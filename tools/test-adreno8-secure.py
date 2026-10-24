@@ -282,6 +282,155 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (argc > 1 && strcmp(argv[1], "guards") == 0) {
+        /* Rejected inputs change no state and issue no SCM call; the same
+         * entry still succeeds afterwards, so a guard never consumes the
+         * one-shot. */
+        struct adreno8_memory zero = { .name = "test" };
+        struct adreno8_gpu_space nospace = { .name = "secure", .context = SECURE_CONTEXT };
+        struct adreno8_memory empty;
+        script(0, 0);
+        script(0, 0);
+        buffer = make_buffer(1);
+        space = secure_space(1);
+        assert(!adreno8_secure_xfer(space, &zero));
+        empty = buffer;
+        empty.size = 0;
+        assert(!adreno8_secure_xfer(space, &empty));
+        assert(!adreno8_secure_xfer(&nospace, &buffer));
+        space->secure_tables = space->table_count + 1;
+        assert(!adreno8_secure_xfer(space, &buffer));
+        space->secure_tables = space->table_count;
+        space->is_on = true;
+        assert(!adreno8_secure_xfer(space, &buffer));
+        space->is_on = false;
+        space->secure_tables = 0;
+        assert(call_count == 0 && !adreno8_secure_lost());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_NOT_STARTED);
+        assert(adreno8_secure_preflight() && adreno8_secure_xfer(space, &buffer));
+        assert(call_count == 2 && adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        puts("input guards reject without consuming the one-shot: PASS");
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "contig") == 0) {
+        /* Physically adjacent pages merge into one region while the separate
+         * table allocations stay three single-page regions: the table plan and
+         * the data plan differ in one handover. */
+        script(0, 0);
+        script(0, 0);
+        pa_flat = true;
+        buffer = make_buffer(70);
+        space = secure_space(3);
+        assert(run_xfer(space, &buffer));
+        assert(call_count == 2 && !adreno8_secure_lost());
+        check_table_call(0, space, 3);
+        check_envelope(1, 1);
+        assert(snap[1][0].address == kvtophys(buffer.memory) &&
+               snap[1][0].size == 70 * PAGE_SIZE);
+        assert(perm_snap[1][0].vmid == 10 && perm_snap[1][0].perm == 6);
+        assert(ext_snap[1][2] == 24);
+        assert(space->secure_tables == 3);
+        puts("adjacent pages merge into one region, table pages stay separate: PASS");
+        return 0;
+    }
+    if (argc > 1 && (strncmp(argv[1], "regions", 7) == 0 || strncmp(argv[1], "mixed", 5) == 0)) {
+        /* Region counts around the 32-entry batch boundary: regions31/32 fit
+         * one data call, regions33 needs 32 + 1. The mixed variants merge two
+         * adjacent pages per region so multi-page entries cross the boundary
+         * too. */
+        bool mixed = argv[1][0] == 'm';
+        unsigned regions = (unsigned)atoi(argv[1] + (mixed ? 5 : 7));
+        assert(regions == 31 || regions == 32 || regions == 33);
+        unsigned pages = mixed ? 2 * regions : regions, span = mixed ? 2 : 1;
+        unsigned data_calls = (regions + ASSIGN_SECTIONS - 1) / ASSIGN_SECTIONS;
+        for (unsigned i = 0; i < data_calls + 1; i++) script(0, 0);
+        pa_flat = true;
+        gap_every = span;
+        buffer = make_buffer(pages);
+        space = secure_space(3);
+        assert(run_xfer(space, &buffer));
+        assert(call_count == 1 + data_calls && !adreno8_secure_lost());
+        check_table_call(0, space, 3);
+        unsigned first_page = 0, left = regions;
+        for (unsigned c = 1; c <= data_calls; c++) {
+            unsigned entries = left < ASSIGN_SECTIONS ? left : ASSIGN_SECTIONS;
+            check_envelope(c, entries);
+            for (unsigned i = 0; i < entries; i++) {
+                assert(snap[c][i].address ==
+                       kvtophys(buffer.memory + (first_page + i * span) * PAGE_SIZE));
+                assert(snap[c][i].size == span * PAGE_SIZE);
+            }
+            first_page += entries * span;
+            left -= entries;
+        }
+        assert(first_page == pages);
+        assert(space->secure_tables == 3);
+        printf("%u %s regions split into %u data calls: PASS\n",
+            regions, mixed ? "two-page" : "single-page", data_calls);
+        return 0;
+    }
+    if (argc > 1 && (strcmp(argv[1], "unaligned") == 0 || strcmp(argv[1], "unaligned-table") == 0)) {
+        /* A 2 KiB physical shift breaks granule alignment. The data variant
+         * fails in the planning walk, the table variant in the pre-SCM table
+         * check while the data plan passes: both end with zero SCM calls and
+         * no page lost. */
+        bool on_table = argv[1][8] == 't';
+        pa_flat = true;
+        space = secure_space(1);
+        buffer = make_buffer(2);
+        shift_va = on_table ? space->tables[0].table : buffer.memory;
+        shift_delta = 2048;
+        assert(!run_xfer(space, &buffer));
+        assert(call_count == 0 && !adreno8_secure_lost());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        assert(space->secure_tables == 0);
+        printf("unaligned %s page ends the handover before any MP_ASSIGN: PASS\n",
+            on_table ? "table" : "data");
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "table-align") == 0) {
+        /* A 4 KiB shift keeps the table page granule-aligned but leaves it
+         * misaligned to the native page size on 16 KiB kernels, and the
+         * read-back no longer matches the address the mapper recorded: the
+         * handover rejects it on every page size. */
+        pa_flat = true;
+        script(0, 0);
+        script(0, 0);
+        space = secure_space(1);
+        buffer = make_buffer(1);
+        shift_va = space->tables[0].table;
+        shift_delta = SMMU_GRANULE;
+        assert(!run_xfer(space, &buffer));
+        assert(call_count == 0 && !adreno8_secure_lost());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        puts("native alignment and read-back gate table pages: PASS");
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "parange-table") == 0) {
+        /* A table page ending exactly at the 36-bit limit is inside the
+         * translatable range at 4 KiB granularity and ends past the limit when
+         * the native page is 16 KiB: the check runs before the first MP_ASSIGN
+         * either way. */
+        script(0, 0);
+        script(0, 0);
+        buffer = make_buffer(1);
+        next_pa = SMMU_PHYS_LIMIT - SMMU_GRANULE;
+        space = secure_space(1);
+        /* Only the table page sits at the boundary; the argument page must
+         * stay inside the range or the argument page check ends the handover
+         * first. */
+        next_pa = 0x80000000 + 0x8000000;
+        if (PAGE_SIZE > 4096) {
+            assert(!run_xfer(space, &buffer));
+            assert(call_count == 0 && adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        } else {
+            assert(run_xfer(space, &buffer));
+            assert(call_count == 2 && space->secure_tables == 1);
+        }
+        puts("table page physical range checked against the SMMU limit: PASS");
+        return 0;
+    }
+
     /* Success path, one handover: table pages first with {HLOS read/write,
      * CP_PIXEL read}, then 70 non-adjacent data pages in 32 + 32 + 6 region
      * entries with CP_PIXEL read/write, the cursor commits, the state closes,
@@ -321,7 +470,11 @@ if __name__ == "__main__":
             subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}", "-fsanitize=address,undefined",
                             "-fno-omit-frame-pointer", str(target / "check.c"), "-o", str(binary)], check=True)
             for mode in ((), ("argfail",), ("preflight",), ("answer",), ("waitq",),
-                         ("poison",), ("batchfail",), ("ebusy",), ("exhaust",)):
+                         ("poison",), ("batchfail",), ("ebusy",), ("exhaust",),
+                         ("guards",), ("contig",), ("regions31",), ("regions32",),
+                         ("regions33",), ("mixed31",), ("mixed32",), ("mixed33",),
+                         ("unaligned",), ("unaligned-table",), ("table-align",),
+                         ("parange-table",)):
                 result = subprocess.run([str(binary), *mode], check=True,
                                         capture_output=True, text=True)
                 if mode == ():
@@ -340,8 +493,27 @@ if __name__ == "__main__":
                     assert "2 logical MP_ASSIGN batches" in result.stdout
                     assert ("secure handover complete: 3 pages owned by CP_PIXEL "
                             "after 3 MP_ASSIGN attempts") in result.stdout
-                if mode == ("argfail",) or mode == ("poison",):
+                abort_modes = {("argfail",), ("poison",), ("unaligned",),
+                               ("unaligned-table",), ("table-align",)}
+                if mode in abort_modes or (mode == ("parange-table",) and page_size == 16384):
                     assert "ends before any MP_ASSIGN; no page transferred" in result.stdout
                     assert "secure handover attempted" not in result.stdout
                     assert "MP_ASSIGN returned" not in result.stdout
+                if mode in (("contig",), ("regions31",), ("regions32",), ("regions33",),
+                            ("mixed31",), ("mixed32",), ("mixed33",)):
+                    # The plan line prints merged region counts, so the batch
+                    # split is auditable from the serial log.
+                    pages, regions = {
+                        ("contig",): (70, 1), ("regions31",): (31, 31),
+                        ("regions32",): (32, 32), ("regions33",): (33, 33),
+                        ("mixed31",): (62, 31), ("mixed32",): (64, 32),
+                        ("mixed33",): (66, 33),
+                    }[mode]
+                    want = (f"{pages} pages merge into {regions} data regions plus "
+                            f"3 table pages, {(regions + 31) // 32 + 1} "
+                            "logical MP_ASSIGN batches")
+                    assert want in result.stdout, (want, result.stdout)
+                if mode == ("guards",):
+                    assert "input rejected" in result.stdout
+                    assert "secure handover complete: 1 pages owned by CP_PIXEL" in result.stdout
             print(f"XNU PAGE_SIZE={page_size}: PASS")

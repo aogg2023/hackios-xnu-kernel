@@ -18,7 +18,6 @@
 #define PERM_READ            4u
 #define PERM_WRITE           2u
 #define PERM_EXEC            1u
-#define PT_LEAF_GRANULE      4096u     /* adreno8_smmu.c maps leaves at 4 KiB */
 
 /* Little-endian wire records; this kernel is arm64-only, so plain stores match
  * the vendor's cpu_to_le64 layout exactly. */
@@ -55,11 +54,29 @@ adreno8_secure_lost(void)
 	return adreno8_assign.lost;
 }
 
-/* One physically contiguous, zeroed argument page; kvtophys is verified across
- * the whole page like the zap metadata buffer. A page that fails verification
- * here is freed and retried on the next call instead of marking `lost`: the
- * argument page is a plain HLOS page never handed to the secure world, so its
- * ownership is never in doubt. */
+/* Prove one kernel page is wholly ours and mappable: a real physical start,
+ * aligned to the SMMU granule and to this kernel's page size, covering the
+ * whole page contiguously (a 16 KiB kernel page may sit on four separate 4 KiB
+ * SMMU leaves), and ending inside the range the SMMU can translate. Every page
+ * that reaches MP_ASSIGN passes through here, including the argument page. */
+static bool
+adreno8_assign_page_phys(vm_offset_t va, uint64_t *phys)
+{
+	uint64_t first = kvtophys(va);
+
+	*phys = first;
+	if (first == 0 || (first & SMMU_GRANULE_MASK) || (first & (PAGE_SIZE - 1)) ||
+	    kvtophys(va + PAGE_SIZE - 1) != first + PAGE_SIZE - 1 ||
+	    first + PAGE_SIZE > SMMU_PHYS_LIMIT) {
+		return false;
+	}
+	return true;
+}
+
+/* One physically contiguous, zeroed argument page. A page that fails
+ * verification here is freed and retried on the next call instead of marking
+ * `lost`: the argument page is a plain HLOS page never handed to the secure
+ * world, so its ownership is never in doubt. */
 static bool
 adreno8_assign_open(void)
 {
@@ -76,9 +93,7 @@ adreno8_assign_open(void)
 		adreno8_assign.page = 0;
 		return false;
 	}
-	first = kvtophys(adreno8_assign.page);
-	if (first == 0 || (first & PAGE_MASK) ||
-	    kvtophys(adreno8_assign.page + PAGE_SIZE - 1) != first + PAGE_SIZE - 1) {
+	if (!adreno8_assign_page_phys(adreno8_assign.page, &first)) {
 		kmem_free(kernel_map, adreno8_assign.page, PAGE_SIZE);
 		adreno8_assign.page = 0;
 		return false;
@@ -164,9 +179,9 @@ adreno8_assign_data(const struct adreno8_memory *buffer)
 	unsigned filled = 0;
 
 	for (uint64_t at = 0; at < bytes; ) {
-		uint64_t phys = kvtophys(buffer->memory + at), run = PAGE_SIZE;
+		uint64_t phys, next;
 
-		if (phys == 0 || (phys & PAGE_MASK)) {
+		if (!adreno8_assign_page_phys(buffer->memory + at, &phys)) {
 			/*
 			 * A page whose physical start cannot be proven closes the secure path for
 			 * the whole boot, whether or not an earlier batch already ran. Before the
@@ -182,7 +197,9 @@ adreno8_assign_data(const struct adreno8_memory *buffer)
 			printf("adreno8: secure pages retained until cold reset\n");
 			return false;
 		}
-		while (at + run < bytes && kvtophys(buffer->memory + at + run) == phys + run) {
+		uint64_t run = PAGE_SIZE;
+		while (at + run < bytes &&
+		    adreno8_assign_page_phys(buffer->memory + at + run, &next) && next == phys + run) {
 			run += PAGE_SIZE;
 		}
 		batch[filled++] = (struct assign_region){ phys, run };
@@ -202,8 +219,29 @@ adreno8_assign_data(const struct adreno8_memory *buffer)
 	return true;
 }
 
+/* Check every page-table page past the cursor before the first MP_ASSIGN:
+ * whole-page physical provenance per adreno8_assign_page_phys and agreement
+ * with the address the mapper recorded. A pass lets adreno8_assign_tables
+ * stage and flush without reaching the retention path. */
+static bool
+adreno8_assign_tables_check(const struct adreno8_gpu_space *space)
+{
+	for (unsigned i = space->secure_tables; i < space->table_count; i++) {
+		uint64_t phys = space->tables[i].table;
+
+		if (space->tables[i].table == 0 ||
+		    !adreno8_assign_page_phys(space->tables[i].table, &phys) ||
+		    phys != space->tables[i].phys) {
+			printf("adreno8: secure table page %#llx unusable for MP_ASSIGN\n", phys);
+			return false;
+		}
+	}
+	return true;
+}
+
 /* Assign page-table pages past the cursor to {HLOS read/write, CP_PIXEL read}.
- * The caller opened the argument page; committing the cursor is the caller's. */
+ * The caller ran adreno8_assign_tables_check and opened the argument page;
+ * committing the cursor is the caller's. */
 static bool
 adreno8_assign_tables(struct adreno8_gpu_space *space)
 {
@@ -215,16 +253,21 @@ adreno8_assign_tables(struct adreno8_gpu_space *space)
 	unsigned filled = 0;
 
 	for (unsigned i = space->secure_tables; i < space->table_count; i++) {
-		if (space->tables[i].table == 0 || space->tables[i].phys == 0) {
+		uint64_t phys;
+
+		if (!adreno8_assign_page_phys(space->tables[i].table, &phys) ||
+		    phys != space->tables[i].phys) {
 			/* Same conservative rule as adreno8_assign_data: an unproven page ends
 			 * the secure path for the boot and every table page stays reserved. */
 			adreno8_assign.lost = true;
 			printf("adreno8: secure pages retained until cold reset\n");
 			return false;
 		}
-		/* The walker only consumes the first 4 KiB; the whole kernel page is ours. */
-		adreno8_to_memory(space->tables[i].table, PT_LEAF_GRANULE);
-		batch[filled++] = (struct assign_region){ space->tables[i].phys, PAGE_SIZE };
+		/* Clean the whole kernel page: the SMMU walker only consumes the first
+		 * 4 KiB, but MP_ASSIGN transfers the native page, which is 16 KiB when
+		 * XNU runs with 16 KiB pages. */
+		adreno8_to_memory(space->tables[i].table, PAGE_SIZE);
+		batch[filled++] = (struct assign_region){ phys, PAGE_SIZE };
 		if (filled == ASSIGN_SECTIONS) {
 			if (!adreno8_assign_flush(batch, filled, perms, 2)) {
 				return false;
@@ -249,13 +292,15 @@ adreno8_assign_plan(const struct adreno8_memory *buffer, unsigned *pages, unsign
 	*pages = 0;
 	*regions = 0;
 	for (uint64_t at = 0; at < bytes; ) {
-		uint64_t phys = kvtophys(buffer->memory + at), run = PAGE_SIZE;
+		uint64_t phys, next;
 
-		if (phys == 0 || (phys & PAGE_MASK)) {
+		if (!adreno8_assign_page_phys(buffer->memory + at, &phys)) {
 			printf("adreno8: secure page %#llx unusable for MP_ASSIGN\n", phys);
 			return false;
 		}
-		while (at + run < bytes && kvtophys(buffer->memory + at + run) == phys + run) {
+		uint64_t run = PAGE_SIZE;
+		while (at + run < bytes &&
+		    adreno8_assign_page_phys(buffer->memory + at + run, &next) && next == phys + run) {
 			run += PAGE_SIZE;
 		}
 		*pages += (unsigned)(run / PAGE_SIZE);
@@ -310,10 +355,22 @@ adreno8_secure_xfer(struct adreno8_gpu_space *space, const struct adreno8_memory
 {
 	unsigned pages, regions, batches;
 
-	if (adreno8_xfer_state != SECURE_XFER_NOT_STARTED || buffer->memory == 0) {
+	if (adreno8_xfer_state != SECURE_XFER_NOT_STARTED) {
 		return false;
 	}
-	if (!adreno8_assign_plan(buffer, &pages, &regions) || !adreno8_assign_open()) {
+	/* Input rules enforced here rather than assumed from the single caller:
+	 * the buffer must exist, the secure context must still be disabled for
+	 * the experiment, and the table cursor must point inside the table list.
+	 * buffer->size is a uint32, so rounding it up in uint64 cannot overflow. */
+	if (buffer->memory == 0 || buffer->size == 0 || space->is_on ||
+	    space->table_count == 0 || space->secure_tables > space->table_count) {
+		printf("adreno8: secure handover input rejected: buffer %#llx size %u, space %u tables cursor %u on %d\n",
+		    (uint64_t)buffer->memory, buffer->size, space->table_count,
+		    space->secure_tables, space->is_on);
+		return false;
+	}
+	if (!adreno8_assign_plan(buffer, &pages, &regions) ||
+	    !adreno8_assign_tables_check(space) || !adreno8_assign_open()) {
 		adreno8_secure_xfer_abort();
 		return false;
 	}

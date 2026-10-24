@@ -3,6 +3,9 @@
 from pathlib import Path
 import runpy
 import re
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import adreno8_logcheck as logcheck
 import subprocess
 import tempfile
 
@@ -58,6 +61,11 @@ static uint64_t *staged_extended(uint64_t page_phys) {
 static uint32_t *staged_sources(uint64_t page_phys) {
     return (uint32_t *)((uintptr_t)physical_table(page_phys) + 512);
 }
+
+static uint64_t *logcheck_snap_ext(uint64_t page_phys) {
+    return (uint64_t *)((uintptr_t)physical_table(page_phys) + 640);
+}
+
 int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
     uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *answer)
 {
@@ -78,6 +86,36 @@ int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0
     }
     for (unsigned i = 0; i < 4; i++) {
         ext_snap[call_count][i] = staged_extended(argument0)[i];
+    }
+
+
+    /* Logcheck snapshot: wire records as this SCM entry sees them. */
+    printf("scmsnap call %u argpage %#llx regions_bytes %llu sources %#llx "
+        "extended %#llx ext %#llx %#llx %#llx %#llx\n", (unsigned)call_count,
+        (unsigned long long)argument0,
+        (unsigned long long)argument1, (unsigned long long)argument2,
+        (unsigned long long)argument3,
+        (unsigned long long)logcheck_snap_ext(argument0)[0],
+        (unsigned long long)logcheck_snap_ext(argument0)[1],
+        (unsigned long long)logcheck_snap_ext(argument0)[2],
+        (unsigned long long)logcheck_snap_ext(argument0)[3]);
+    for (unsigned i = 0; i < argument1 / 16; i++) {
+        uint64_t *live = (uint64_t *)(uintptr_t)physical_table(argument0);
+        printf("scmsnap call %u region %u addr %#llx len %llu\n", (unsigned)call_count, i,
+            (unsigned long long)live[2 * i], (unsigned long long)live[2 * i + 1]);
+    }
+    for (unsigned i = 0; i < logcheck_snap_ext(argument0)[2] / 24; i++) {
+        char *perm = (char *)(uintptr_t)physical_table(argument0) + 576
+            + 24 * (unsigned long long)i;
+        uint32_t vmid, bits, ctx_size, unused;
+        uint64_t context;
+        memcpy(&vmid, perm, 4);
+        memcpy(&bits, perm + 4, 4);
+        memcpy(&context, perm + 8, 8);
+        memcpy(&ctx_size, perm + 16, 4);
+        memcpy(&unused, perm + 20, 4);
+        printf("scmsnap call %u perm %u vmid %u perm %u ctx %llu ctxsize %u unused %u\n",
+            (unsigned)call_count, i, vmid, bits, (unsigned long long)context, ctx_size, unused);
     }
     unsigned pick = outcome_next < outcome_count ? outcome_next : outcome_count - 1;
     *answer = outcome_answers[pick];
@@ -229,6 +267,20 @@ int main(int argc, char **argv) {
         assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
         assert(!run_xfer(space, &buffer) && call_count == 1);
         printf("MP_ASSIGN WAITQ status %d retained without continuation: PASS\n", (int)pending);
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "failsecond") == 0) {
+        /* The table batch lands and the first data batch fails: the failed
+         * batch was fully staged and printed, so its wire snapshot must match
+         * its log lines, and no later batch may appear at all. */
+        script(0, 0);
+        script(5, 5);
+        buffer = make_buffer(3);
+        space = secure_space(3);
+        assert(!run_xfer(space, &buffer));
+        assert(call_count == 2 && adreno8_secure_lost());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        puts("second batch failure keeps the failed batch fully logged: PASS");
         return 0;
     }
     if (argc > 1 && strcmp(argv[1], "regions1025") == 0) {
@@ -517,7 +569,7 @@ if __name__ == "__main__":
                          ("regions33",), ("mixed31",), ("mixed32",), ("mixed33",),
                          ("unaligned",), ("unaligned-table",), ("table-align",),
                          ("va-unaligned",), ("waitq3",), ("regions1025",),
-                         ("parange-table",)):
+                         ("failsecond",), ("parange-table",)):
                 result = subprocess.run([str(binary), *mode], check=True,
                                         capture_output=True, text=True)
                 if mode == ():
@@ -565,17 +617,30 @@ if __name__ == "__main__":
                                          result.stdout)
                     assert len(headers) == (table_regions + 31) // 32 \
                         + (data_regions + 31) // 32
+                    # Same-stream snapshots: every printed region, permission,
+                    # and argument page must equal what the SCM entry read.
+                    logcheck.check(result.stdout, page_size)
                 abort_modes = {("argfail",), ("poison",), ("unaligned",),
                                ("unaligned-table",), ("table-align",)}
                 if page_size == 16384:
                     # At 4 KiB there is no start between the native page and
                     # the granule, so only the 16 KiB build rejects a page.
                     abort_modes.add(("va-unaligned",))
+                if mode == ("failsecond",):
+                    # The parser asserts the whole stream: batch numbers,
+                    # per-batch ordering, wire comparison for the landed table
+                    # batch and the failed data batch, and that no event of
+                    # any kind (plan, region, before, returned) follows the
+                    # failed batch under any prefix.
+                    batches, calls, failed = logcheck.check(result.stdout, page_size)
+                    assert failed == 1 and sorted(batches) == [0, 1], (failed, sorted(batches))
+                    assert len(calls) == 2 and batches[1]["failed"]
                 if mode in abort_modes or (mode == ("parange-table",) and page_size == 16384):
                     assert "ends before any MP_ASSIGN; no page transferred" in result.stdout
                     assert "secure handover attempted" not in result.stdout
                     assert "MP_ASSIGN batch" not in result.stdout
                     assert "MP_ASSIGN plan" not in result.stdout
+                    assert "scmsnap call" not in result.stdout
                 if mode in (("contig",), ("regions31",), ("regions32",), ("regions33",),
                             ("mixed31",), ("mixed32",), ("mixed33",)):
                     # The plan line prints merged region counts, so the batch

@@ -12,6 +12,9 @@ from pathlib import Path
 import re
 import runpy
 import subprocess
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import adreno8_logcheck as logcheck
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,20 +24,43 @@ stub = fixture["stub"].replace("assert(size == 4096);", "assert(size != 0);")
 stub = stub.replace("static int adreno8_say", r'''
 uint32_t adreno8_gpu8_secure_mode;
 static uint64_t *physical_table(uint64_t pa);
+
+static uint64_t *logcheck_snap_ext(uint64_t page_phys) {
+    return (uint64_t *)((uintptr_t)physical_table(page_phys) + 640);
+}
 static unsigned scm_calls, scm_sleeps, scm_fail_at = 999999u, scm_ebusy;
 int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
     uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *answer) {
     assert(function == 0x42000c16ull && arginfo == 0x1117ull);
     scm_calls++;
-    /* Snapshot the region records exactly as staged in the argument page at
-     * call time, one stderr line each, for the log-versus-SCM comparison. */
-    {
-        const uint64_t *live = (const uint64_t *)(uintptr_t)physical_table(argument0);
-        for (unsigned i = 0; i < argument1 / 16; i++) {
-            fprintf(stderr, "scmsnap call %u region %u addr %#llx len %llu\n",
-                scm_calls - 1, i, (unsigned long long)live[2 * i],
-                (unsigned long long)live[2 * i + 1]);
-        }
+
+    /* Logcheck snapshot: wire records as this SCM entry sees them. */
+    printf("scmsnap call %u argpage %#llx regions_bytes %llu sources %#llx "
+        "extended %#llx ext %#llx %#llx %#llx %#llx\n", (unsigned)scm_calls - 1,
+        (unsigned long long)argument0,
+        (unsigned long long)argument1, (unsigned long long)argument2,
+        (unsigned long long)argument3,
+        (unsigned long long)logcheck_snap_ext(argument0)[0],
+        (unsigned long long)logcheck_snap_ext(argument0)[1],
+        (unsigned long long)logcheck_snap_ext(argument0)[2],
+        (unsigned long long)logcheck_snap_ext(argument0)[3]);
+    for (unsigned i = 0; i < argument1 / 16; i++) {
+        uint64_t *live = (uint64_t *)(uintptr_t)physical_table(argument0);
+        printf("scmsnap call %u region %u addr %#llx len %llu\n", (unsigned)scm_calls - 1, i,
+            (unsigned long long)live[2 * i], (unsigned long long)live[2 * i + 1]);
+    }
+    for (unsigned i = 0; i < logcheck_snap_ext(argument0)[2] / 24; i++) {
+        char *perm = (char *)(uintptr_t)physical_table(argument0) + 576
+            + 24 * (unsigned long long)i;
+        uint32_t vmid, bits, ctx_size, unused;
+        uint64_t context;
+        memcpy(&vmid, perm, 4);
+        memcpy(&bits, perm + 4, 4);
+        memcpy(&context, perm + 8, 8);
+        memcpy(&ctx_size, perm + 16, 4);
+        memcpy(&unused, perm + 20, 4);
+        printf("scmsnap call %u perm %u vmid %u perm %u ctx %llu ctxsize %u unused %u\n",
+            (unsigned)scm_calls - 1, i, vmid, bits, (unsigned long long)context, ctx_size, unused);
     }
     if (scm_ebusy) {
         *answer = 12;
@@ -330,7 +356,6 @@ with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
             result = subprocess.run([str(binary), *mode], check=True,
                                     capture_output=True, text=True)
             out = result.stdout
-            err = result.stderr
             assert "START resource request 20 failed (11 words)" in out, (mode, out)
             if mode == ():
                 pages = 0x138000 // page_size
@@ -346,32 +371,12 @@ with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
                 assert "MP_ASSIGN plan: batch 0 table, permissions HLOS read/write" in out
                 assert ("MP_ASSIGN plan: batch 1 data, permissions CP_PIXEL read/write" in out)
                 assert out.find("MP_ASSIGN plan:") < out.find("MP_ASSIGN batch 0 table:")
-                # Log regions equal the SCM snapshots in batch and region order.
-                batches, headers = {}, []
-                for line in out.splitlines():
-                    m = re.match(r"adreno8: MP_ASSIGN plan: batch (\d+) (table|data), permissions "
-                                 r"(.+?), argument page ([0-9a-fx]+), (\d+) regions$", line)
-                    if m:
-                        headers.append((int(m.group(1)), m.group(2), m.group(3), m.group(4),
-                                        int(m.group(5))))
-                        continue
-                    m = re.match(r"adreno8: MP_ASSIGN plan: batch (\d+) region (\d+) addr "
-                                 r"([0-9a-fx]+) len (\d+)$", line)
-                    if m:
-                        batches.setdefault(int(m.group(1)), []).append(
-                            (m.group(3), int(m.group(4))))
-                snaps = {}
-                for c, _i, addr, length in re.findall(
-                        r"scmsnap call (\d+) region (\d+) addr ([0-9a-fx]+) len (\d+)", err):
-                    snaps.setdefault(int(c), []).append((addr, int(length)))
-                assert [b for b, _ in sorted(batches.items())] == list(range(len(batches)))
-                assert len(headers) == len(snaps) == len(batches)
-                for batch, role, perm, _arg, count in headers:
-                    assert batches[batch] and len(batches[batch]) == count
-                    expected = ("HLOS read/write and CP_PIXEL read" if role == "table"
-                                else "CP_PIXEL read/write")
-                    assert perm == expected, (role, perm)
-                    assert snaps[batch] == batches[batch], batch
+                # Shared parser: stream order plus wire comparison of every
+                # region, permission record, and argument page.
+                batches, calls, failed = logcheck.check(out, page_size)
+                assert failed is None and batches[0]["role"] == "table"
+                expected = (pages + 31) // 32 + 1
+                assert sorted(batches) == list(range(expected)) and len(calls) == expected
                 assert "no MEM_ALLOC reply is built" in out
                 assert "the secure handover experiment ended" in out
             if mode in (("off",), ("preflight",)):
@@ -381,41 +386,40 @@ with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
             if mode == ("preflight",):
                 assert "secure preflight-only mode: START stops here" in out
                 assert "secure handover attempted" not in out
+            if mode in (("off",), ("preflight",)):
+                assert "scmsnap call" not in out
             if mode == ("batchfail",):
                 assert "secure handover attempted" in out
                 assert "MP_ASSIGN batch 1 data returned -5, answer 0x5, 2 top-level SCM calls" in out
                 assert "secure allocation failed; retain GPU memory until cold reset" in out
+                batches, calls, failed = logcheck.check(out, page_size)
+                assert failed == 1 and sorted(batches) == [0, 1] and len(calls) == 2
             if mode == ("ebusy",):
                 assert "secure handover attempted" in out
                 assert out.count("returned -12") == 1
                 assert "secure pages retained until cold reset" in out
-            if mode in (("tablefail",), ("data2fail",)):
-                if mode == ("tablefail",):
-                    assert "MP_ASSIGN plan: batch 0 table," in out
-                    assert "MP_ASSIGN batch 0 table returned -5" in out
-                    assert "MP_ASSIGN batch 1 data" not in out
-                else:
-                    assert "MP_ASSIGN plan: batch 2 data," in out
-                    assert "MP_ASSIGN batch 2 data returned -5" in out
-                    assert "MP_ASSIGN batch 3 data" not in out
-            if mode == ("ebusy",):
                 # The 20 EBUSY retries reuse one staged batch: the region log
-                # for batch 0 appears once and every snapshot matches it.
-                batches = {}
-                for b, i, addr, length in re.findall(
-                        r"MP_ASSIGN plan: batch (\d+) region (\d+) addr ([0-9a-fx]+) len (\d+)", out):
-                    batches.setdefault(int(b), []).append((addr, int(length)))
-                snaps = {}
-                for c, i, addr, length in re.findall(
-                        r"scmsnap call (\d+) region (\d+) addr ([0-9a-fx]+) len (\d+)", err):
-                    snaps.setdefault(int(c), []).append((addr, int(length)))
-                assert set(batches) == {0} and len(batches[0]) == 3, out
-                assert len(snaps) == 20 and all(v == batches[0] for v in snaps.values())
-                assert out.count("MP_ASSIGN batch 0 table:") == 1
+                # for batch 0 prints once and all 20 snapshots match it.
+                batches, calls, failed = logcheck.check(out, page_size)
+                assert failed == 0 and sorted(batches) == [0] and len(calls) == 20
+                assert len(batches[0]["regions"]) == 3
+            if mode in (("tablefail",), ("data2fail",)):
+                # The parser compares the failed batch's printed regions and
+                # permissions with its snapshot item by item; nothing from a
+                # later batch may appear under any prefix.
+                stop = 0 if mode == ("tablefail",) else 2
+                batches, calls, failed = logcheck.check(out, page_size)
+                assert failed == stop and sorted(batches) == list(range(stop + 1))
+                assert len(calls) == stop + 1
+                role = "table" if stop == 0 else "data"
+                assert f"MP_ASSIGN batch {stop} {role} returned -5" in out
+                assert f"MP_ASSIGN batch {stop + 1}" not in out
+                assert f"MP_ASSIGN plan: batch {stop + 1}" not in out
             if mode == ("argfail",):
                 assert "ends before any MP_ASSIGN; no page transferred" in out
                 assert "MP_ASSIGN batch" not in out
                 assert "MP_ASSIGN plan" not in out
+                assert "scmsnap call" not in out
             if mode != ("off",) and mode != ("preflight",):
                 assert "the secure handover experiment ended" in out
         print(f"XNU PAGE_SIZE={page_size}: PASS")

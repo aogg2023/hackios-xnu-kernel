@@ -14,7 +14,8 @@ typedef struct {
   UINT32 Size;
 } XNU_PAYLOAD_HEADER;
 
-// The header is followed by entries; an empty name ends the list.
+// The header is followed by entries; an empty name ends the list. An entry
+// whose padded data does not fit in the remaining container bytes is invalid.
 typedef struct {
   CHAR8  Name[16];
   UINT32 Size;
@@ -22,11 +23,11 @@ typedef struct {
   // UINT8 Data[Size], padded to 16 bytes
 } XNU_PAYLOAD_ENTRY;
 
-// Raw GPT partition that receives the text log (read back from Android).
-#define XNU_LOG_PARTITION  L"logdump"
-
-#define XNU_MARKER_MAGIC  0x584E5521 // "XNU!"
-
+//
+// Starts loader.efi from the payload region. Does not return: every outcome
+// ends in the local halt defined in XnuLoader.c.
+//
+__attribute__((noreturn))
 VOID
 XnuLoaderMain ();
 

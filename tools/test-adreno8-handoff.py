@@ -25,43 +25,13 @@ stub = stub.replace("static int adreno8_say", r'''
 uint32_t adreno8_gpu8_secure_mode;
 static uint64_t *physical_table(uint64_t pa);
 
-static uint64_t *logcheck_snap_ext(uint64_t page_phys) {
-    return (uint64_t *)((uintptr_t)physical_table(page_phys) + 640);
-}
-static unsigned scm_calls, scm_sleeps, scm_fail_at = 999999u, scm_ebusy;
+@@SNAPHELP@@static unsigned scm_calls, scm_sleeps, scm_fail_at = 999999u, scm_ebusy;
 int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
     uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *answer) {
     assert(function == 0x42000c16ull && arginfo == 0x1117ull);
     scm_calls++;
 
-    /* Logcheck snapshot: wire records as this SCM entry sees them. */
-    printf("scmsnap call %u argpage %#llx regions_bytes %llu sources %#llx "
-        "extended %#llx ext %#llx %#llx %#llx %#llx\n", (unsigned)scm_calls - 1,
-        (unsigned long long)argument0,
-        (unsigned long long)argument1, (unsigned long long)argument2,
-        (unsigned long long)argument3,
-        (unsigned long long)logcheck_snap_ext(argument0)[0],
-        (unsigned long long)logcheck_snap_ext(argument0)[1],
-        (unsigned long long)logcheck_snap_ext(argument0)[2],
-        (unsigned long long)logcheck_snap_ext(argument0)[3]);
-    for (unsigned i = 0; i < argument1 / 16; i++) {
-        uint64_t *live = (uint64_t *)(uintptr_t)physical_table(argument0);
-        printf("scmsnap call %u region %u addr %#llx len %llu\n", (unsigned)scm_calls - 1, i,
-            (unsigned long long)live[2 * i], (unsigned long long)live[2 * i + 1]);
-    }
-    for (unsigned i = 0; i < logcheck_snap_ext(argument0)[2] / 24; i++) {
-        char *perm = (char *)(uintptr_t)physical_table(argument0) + 576
-            + 24 * (unsigned long long)i;
-        uint32_t vmid, bits, ctx_size, unused;
-        uint64_t context;
-        memcpy(&vmid, perm, 4);
-        memcpy(&bits, perm + 4, 4);
-        memcpy(&context, perm + 8, 8);
-        memcpy(&ctx_size, perm + 16, 4);
-        memcpy(&unused, perm + 20, 4);
-        printf("scmsnap call %u perm %u vmid %u perm %u ctx %llu ctxsize %u unused %u\n",
-            (unsigned)scm_calls - 1, i, vmid, bits, (unsigned long long)context, ctx_size, unused);
-    }
+@@SNAP@@
     if (scm_ebusy) {
         *answer = 12;
         return -12;
@@ -71,6 +41,9 @@ int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0
 }
 void adreno8_sleep_ms(uint32_t ms) { scm_sleeps++; (void)ms; }
 static int adreno8_say''', 1)
+stub = stub.replace("@@SNAPHELP@@", logcheck.SNAP_HELPERS_C).replace(
+    "@@SNAP@@", logcheck.snap_c("scm_calls - 1"))
+assert "@@SNAP" not in stub
 driver = (DEV / "adreno8_memory.c").read_text()
 driver, replaced = re.subn(
     r'static void\nadreno8_memory_invalidate\(.*?\n}',
@@ -371,11 +344,14 @@ with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
                 assert "MP_ASSIGN plan: batch 0 table, permissions HLOS read/write" in out
                 assert ("MP_ASSIGN plan: batch 1 data, permissions CP_PIXEL read/write" in out)
                 assert out.find("MP_ASSIGN plan:") < out.find("MP_ASSIGN batch 0 table:")
-                # Shared parser: stream order plus wire comparison of every
-                # region, permission record, and argument page.
-                batches, calls, failed = logcheck.check(out, page_size)
-                assert failed is None and batches[0]["role"] == "table"
+                # Shared parser: single-pass stream order plus wire
+                # comparison of every region, permission record, and
+                # argument page. The role sequence comes from this scenario
+                # (3 table pages then 32-region data batches), not the log.
                 expected = (pages + 31) // 32 + 1
+                roles = ["table"] + ["data"] * ((pages + 31) // 32)
+                batches, calls, failed = logcheck.check(out, page_size, roles)
+                assert failed is None
                 assert sorted(batches) == list(range(expected)) and len(calls) == expected
                 assert "no MEM_ALLOC reply is built" in out
                 assert "the secure handover experiment ended" in out
@@ -392,7 +368,8 @@ with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
                 assert "secure handover attempted" in out
                 assert "MP_ASSIGN batch 1 data returned -5, answer 0x5, 2 top-level SCM calls" in out
                 assert "secure allocation failed; retain GPU memory until cold reset" in out
-                batches, calls, failed = logcheck.check(out, page_size)
+                batches, calls, failed = logcheck.check(out, page_size,
+                                                        ["table", "data"])
                 assert failed == 1 and sorted(batches) == [0, 1] and len(calls) == 2
             if mode == ("ebusy",):
                 assert "secure handover attempted" in out
@@ -400,7 +377,7 @@ with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
                 assert "secure pages retained until cold reset" in out
                 # The 20 EBUSY retries reuse one staged batch: the region log
                 # for batch 0 prints once and all 20 snapshots match it.
-                batches, calls, failed = logcheck.check(out, page_size)
+                batches, calls, failed = logcheck.check(out, page_size, ["table"])
                 assert failed == 0 and sorted(batches) == [0] and len(calls) == 20
                 assert len(batches[0]["regions"]) == 3
             if mode in (("tablefail",), ("data2fail",)):
@@ -408,7 +385,8 @@ with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
                 # permissions with its snapshot item by item; nothing from a
                 # later batch may appear under any prefix.
                 stop = 0 if mode == ("tablefail",) else 2
-                batches, calls, failed = logcheck.check(out, page_size)
+                roles = ["table"] + ["data"] * stop
+                batches, calls, failed = logcheck.check(out, page_size, roles)
                 assert failed == stop and sorted(batches) == list(range(stop + 1))
                 assert len(calls) == stop + 1
                 role = "table" if stop == 0 else "data"

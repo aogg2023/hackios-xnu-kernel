@@ -62,10 +62,7 @@ static uint32_t *staged_sources(uint64_t page_phys) {
     return (uint32_t *)((uintptr_t)physical_table(page_phys) + 512);
 }
 
-static uint64_t *logcheck_snap_ext(uint64_t page_phys) {
-    return (uint64_t *)((uintptr_t)physical_table(page_phys) + 640);
-}
-
+@@SNAPHELP@@
 int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
     uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *answer)
 {
@@ -89,34 +86,7 @@ int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0
     }
 
 
-    /* Logcheck snapshot: wire records as this SCM entry sees them. */
-    printf("scmsnap call %u argpage %#llx regions_bytes %llu sources %#llx "
-        "extended %#llx ext %#llx %#llx %#llx %#llx\n", (unsigned)call_count,
-        (unsigned long long)argument0,
-        (unsigned long long)argument1, (unsigned long long)argument2,
-        (unsigned long long)argument3,
-        (unsigned long long)logcheck_snap_ext(argument0)[0],
-        (unsigned long long)logcheck_snap_ext(argument0)[1],
-        (unsigned long long)logcheck_snap_ext(argument0)[2],
-        (unsigned long long)logcheck_snap_ext(argument0)[3]);
-    for (unsigned i = 0; i < argument1 / 16; i++) {
-        uint64_t *live = (uint64_t *)(uintptr_t)physical_table(argument0);
-        printf("scmsnap call %u region %u addr %#llx len %llu\n", (unsigned)call_count, i,
-            (unsigned long long)live[2 * i], (unsigned long long)live[2 * i + 1]);
-    }
-    for (unsigned i = 0; i < logcheck_snap_ext(argument0)[2] / 24; i++) {
-        char *perm = (char *)(uintptr_t)physical_table(argument0) + 576
-            + 24 * (unsigned long long)i;
-        uint32_t vmid, bits, ctx_size, unused;
-        uint64_t context;
-        memcpy(&vmid, perm, 4);
-        memcpy(&bits, perm + 4, 4);
-        memcpy(&context, perm + 8, 8);
-        memcpy(&ctx_size, perm + 16, 4);
-        memcpy(&unused, perm + 20, 4);
-        printf("scmsnap call %u perm %u vmid %u perm %u ctx %llu ctxsize %u unused %u\n",
-            (unsigned)call_count, i, vmid, bits, (unsigned long long)context, ctx_size, unused);
-    }
+@@SNAP@@
     unsigned pick = outcome_next < outcome_count ? outcome_next : outcome_count - 1;
     *answer = outcome_answers[pick];
     int32_t status = outcomes[pick][0];
@@ -135,6 +105,9 @@ static void check_envelope(unsigned call, unsigned regions) {
     assert(clean_at_call[call] >= 1); /* the page was cleaned before this call */
 }
 '''
+fakes = fakes.replace("@@SNAPHELP@@", logcheck.SNAP_HELPERS_C).replace(
+    "@@SNAP@@", logcheck.snap_c("call_count"))
+assert "@@SNAP" not in fakes
 tests = r'''
 static struct adreno8_memory make_buffer(unsigned pages) {
     struct adreno8_memory buffer;
@@ -617,24 +590,47 @@ if __name__ == "__main__":
                                          result.stdout)
                     assert len(headers) == (table_regions + 31) // 32 \
                         + (data_regions + 31) // 32
+                    # Scenario side, independent of the log: how many table
+                    # pages and merged data regions this mode staged. Batch
+                    # roles in the stream must equal this declared sequence.
+                    pages, merged = {
+                        (): (70, 70), ("ebusy",): (3, 3), ("regions1025",): (1025, 1025),
+                        ("contig",): (70, 1), ("regions31",): (31, 31),
+                        ("regions32",): (32, 32), ("regions33",): (33, 33),
+                        ("mixed31",): (62, 31), ("mixed32",): (64, 32),
+                        ("mixed33",): (66, 33),
+                    }[mode]
+                    tables = 1 if mode == ("regions1025",) else 3
+                    assert (data_regions, table_regions) == (merged, tables)
+                    roles = (["table"] * ((tables + 31) // 32)
+                             + ["data"] * ((merged + 31) // 32))
                     # Same-stream snapshots: every printed region, permission,
                     # and argument page must equal what the SCM entry read.
-                    logcheck.check(result.stdout, page_size)
+                    logcheck.check(result.stdout, page_size, roles)
                 abort_modes = {("argfail",), ("poison",), ("unaligned",),
                                ("unaligned-table",), ("table-align",)}
                 if page_size == 16384:
                     # At 4 KiB there is no start between the native page and
                     # the granule, so only the 16 KiB build rejects a page.
                     abort_modes.add(("va-unaligned",))
-                if mode == ("failsecond",):
+                if mode in (("failsecond",), ("answer",)):
                     # The parser asserts the whole stream: batch numbers,
                     # per-batch ordering, wire comparison for the landed table
                     # batch and the failed data batch, and that no event of
                     # any kind (plan, region, before, returned) follows the
-                    # failed batch under any prefix.
-                    batches, calls, failed = logcheck.check(result.stdout, page_size)
+                    # failed batch under any prefix. Roles come from the
+                    # scenario: one table batch, then one data batch.
+                    batches, calls, failed = logcheck.check(result.stdout, page_size,
+                                                            ["table", "data"])
                     assert failed == 1 and sorted(batches) == [0, 1], (failed, sorted(batches))
                     assert len(calls) == 2 and batches[1]["failed"]
+                if mode in (("waitq",), ("waitq3",)):
+                    # The WAITQ status ends the handover on the table batch;
+                    # the full stream is one failed batch and one SCM group.
+                    batches, calls, failed = logcheck.check(result.stdout, page_size,
+                                                            ["table"])
+                    assert failed == 0 and sorted(batches) == [0], (failed, sorted(batches))
+                    assert len(calls) == 1
                 if mode in abort_modes or (mode == ("parange-table",) and page_size == 16384):
                     assert "ends before any MP_ASSIGN; no page transferred" in result.stdout
                     assert "secure handover attempted" not in result.stdout

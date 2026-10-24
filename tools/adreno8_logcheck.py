@@ -3,7 +3,10 @@
 The production flush prints the plan header, one line per staged region, the
 before/after call lines, and the retain line; the test fakes print one
 `scmsnap` group per SCM entry to the SAME stdout stream, so the observed
-interleaving is the true event order and this module may assert it directly.
+interleaving is the true event order. check() walks the stream once and
+updates the open-batch / open-snapshot state line by line: it never defers
+ordering to a final pass. Every line carrying a controlled prefix must match
+its full pattern; a malformed or unknown controlled line fails immediately.
 Coverage is the host fixture only: no real kernel, no real SMC, no hardware
 cache visibility.
 """
@@ -19,12 +22,19 @@ AFTER_RE = re.compile(r"^adreno8: MP_ASSIGN batch (\d+) (table|data) returned (-
                       r"answer ([0-9a-fx]+), (\d+) top-level SCM calls "
                       r"\(A6 interrupted continuation SMCs not counted\)$")
 SNAP_HEAD_RE = re.compile(r"^scmsnap call (\d+) argpage ([0-9a-fx]+) regions_bytes (\d+) "
-                          r"sources ([0-9a-fx]+) extended ([0-9a-fx]+) ext ([0-9a-fx]+) "
-                          r"([0-9a-fx]+) ([0-9a-fx]+) ([0-9a-fx]+)$")
+                          r"sources ([0-9a-fx]+) sources0 (\d+) extended ([0-9a-fx]+) "
+                          r"ext ([0-9a-fx]+) ([0-9a-fx]+) ([0-9a-fx]+) ([0-9a-fx]+)$")
 SNAP_REGION_RE = re.compile(r"^scmsnap call (\d+) region (\d+) addr ([0-9a-fx]+) len (\d+)$")
 SNAP_PERM_RE = re.compile(r"^scmsnap call (\d+) perm (\d+) vmid (\d+) perm (\d+) ctx (\d+) "
                           r"ctxsize (\d+) unused (\d+)$")
-RETAIN = "adreno8: secure pages retained until cold reset"
+
+# Any line whose text begins with one of these prefixes is controlled: it must
+# fully match one of the patterns above or the whole check fails. Lines with
+# other driver logging pass through untouched.
+CONTROLLED_PREFIXES = ("adreno8: MP_ASSIGN plan:", "adreno8: MP_ASSIGN batch ", "scmsnap ")
+PATTERNS = (("plan", PLAN_RE), ("region", REGION_RE), ("before", BEFORE_RE),
+            ("after", AFTER_RE), ("snap_head", SNAP_HEAD_RE),
+            ("snap_region", SNAP_REGION_RE), ("snap_perm", SNAP_PERM_RE))
 
 # C template both test fixtures insert into their fake SCM. It prints the wire
 # records as seen at call entry, from the mapped argument page, to stdout: the
@@ -32,10 +42,11 @@ RETAIN = "adreno8: secure pages retained until cold reset"
 # interleaving. {call} is the fixture's current-call expression.
 SNAP_C = '''
     /* Logcheck snapshot: wire records as this SCM entry sees them. */
-    printf("scmsnap call %u argpage %#llx regions_bytes %llu sources %#llx "
+    printf("scmsnap call %u argpage %#llx regions_bytes %llu sources %#llx sources0 %u "
         "extended %#llx ext %#llx %#llx %#llx %#llx\\n", (unsigned){call},
         (unsigned long long)argument0,
         (unsigned long long)argument1, (unsigned long long)argument2,
+        (unsigned)logcheck_snap_sources(argument0),
         (unsigned long long)argument3,
         (unsigned long long)logcheck_snap_ext(argument0)[0],
         (unsigned long long)logcheck_snap_ext(argument0)[1],
@@ -65,135 +76,170 @@ SNAP_HELPERS_C = '''
 static uint64_t *logcheck_snap_ext(uint64_t page_phys) {
     return (uint64_t *)((uintptr_t)physical_table(page_phys) + 640);
 }
+static uint32_t logcheck_snap_sources(uint64_t page_phys) {
+    uint32_t first;
+    memcpy(&first, (char *)(uintptr_t)physical_table(page_phys) + 512, 4);
+    return first;
+}
 '''
+
+
+def snap_c(call_expr):
+    """Render the shared snapshot template for one fixture's call-index expression."""
+    return SNAP_C.replace("{call}", call_expr)
+
 
 # Production constants: VMID_HLOS 3, VMID_CP_PIXEL 0xA, PERM_READ 4, PERM_WRITE 2.
 PERM_NOTE = {"table": "HLOS read/write and CP_PIXEL read", "data": "CP_PIXEL read/write"}
 WIRE_PERM = {"table": [(3, 6), (10, 4)], "data": [(10, 6)]}
 
 
-def parse(text):
-    """Return (events, batches, calls): ordered event kinds, per-batch records, per-call snapshots."""
-    events, batches, calls = [], {}, {}
-    for line in text.splitlines():
-        if line == RETAIN:
-            events.append(("retain",))
-            continue
-        m = PLAN_RE.match(line)
-        if m:
-            batch = int(m.group(1))
-            assert batch not in batches, f"duplicate plan header for batch {batch}"
-            assert batch == len(batches), f"batch numbers must ascend from 0: got {batch}"
-            batches[batch] = {"role": m.group(2), "perm_note": m.group(3),
-                              "argpage": int(m.group(4), 16), "count": int(m.group(5)),
-                              "regions": [], "snaps": [], "failed": False}
-            events.append(("plan", batch))
-            continue
-        m = REGION_RE.match(line)
-        if m:
-            batch = int(m.group(1))
-            assert batch in batches, f"region line before its plan header: {line}"
-            batches[batch]["regions"].append((m.group(3), int(m.group(4))))
-            events.append(("region", batch))
-            continue
-        m = BEFORE_RE.match(line)
-        if m:
-            batch = int(m.group(1))
-            b = batches.get(batch)
-            assert b is not None, f"before line before its plan header: {line}"
-            assert b.get("before") is None, f"duplicate before line for batch {batch}"
-            b["before"] = {"regions": int(m.group(3)), "perms": int(m.group(4)),
-                           "calls": int(m.group(5))}
-            assert m.group(2) == b["role"] and int(m.group(3)) == b["count"], line
-            events.append(("before", batch))
-            continue
-        m = AFTER_RE.match(line)
-        if m:
-            batch = int(m.group(1))
-            b = batches.get(batch)
-            assert b is not None, f"after line before its plan header: {line}"
-            b["after"] = {"status": int(m.group(3)), "answer": int(m.group(4), 16),
-                          "calls": int(m.group(5))}
-            assert m.group(2) == b["role"], line
-            b["failed"] = b["after"]["status"] != 0 or b["after"]["answer"] != 0
-            events.append(("after", batch))
-            continue
-        m = SNAP_HEAD_RE.match(line)
-        if m:
-            call = {"argpage": int(m.group(2), 16), "regions_bytes": int(m.group(3)),
-                    "sources": int(m.group(4), 16), "extended": int(m.group(5), 16),
-                    "ext": tuple(int(g, 16) for g in m.groups()[5:]), "regions": [], "perms": []}
-            index = int(m.group(1))
-            assert index not in calls, f"duplicate snapshot for call {index}"
-            calls[index] = call
-            events.append(("snap", index))
-            continue
-        m = SNAP_REGION_RE.match(line)
-        if m:
-            calls[int(m.group(1))]["regions"].append((m.group(3), int(m.group(4))))
-            continue
-        m = SNAP_PERM_RE.match(line)
-        if m:
-            c = calls[int(m.group(1))]
-            c["perms"].append((int(m.group(3)), int(m.group(4)), int(m.group(5)),
-                               int(m.group(6)), int(m.group(7))))
-            continue
-    return events, batches, calls
+def _classify(line):
+    for kind, pattern in PATTERNS:
+        match = pattern.match(line)
+        if match:
+            return kind, match
+    return None, None
 
 
-def check(out, page_size=None):
-    """Assert the stream order and compare every printed region/permission with the SCM snapshot."""
-    events, batches, calls = parse(out)
-    assert len(calls) == max(calls, default=-1) + 1 and set(calls) == set(range(len(calls))), \
-        "snapshot call numbers must be dense and monotonic"
-    open_batch, failed = None, None
-    for event in events:
-        kind = event[0]
-        if kind == "retain":
+def check(out, page_size=None, roles=None):
+    """Single pass over the stream; returns (batches, calls, failed_batch_or_None).
+
+    Order enforced line by line: plan -> exactly `count` consecutively indexed
+    region lines -> before -> one or more complete snapshot groups (head, then
+    all region records, then all permission records) -> after. A group must
+    finish before the next head or the after line; the after line closes the
+    batch. After a failed batch no further controlled line is accepted. When
+    `roles` is given, batch roles must equal the caller-supplied sequence, so
+    the table-before-data ordering is asserted from the scenario, not from
+    the log itself.
+    """
+    batches, calls, failed = {}, {}, None
+    cur = None                       # batch id currently open, else None
+    phase = None                     # 'regions' | 'snaps' while cur is open
+    next_region = 0                  # expected index of the next log region line
+    done_groups = 0                  # completed snapshot groups, stream-wide
+    open_call = None                 # snapshot group currently filling
+    snap_phase, snap_regions, snap_perms = None, 0, 0
+    for line in out.splitlines():
+        if not line.startswith(CONTROLLED_PREFIXES):
             continue
-        batch = batches[open_batch] if kind == "snap" else batches[event[1]]
-        if kind in ("plan", "region", "before", "after"):
-            assert failed is None, f"event {kind} for batch {event[1]} after failed batch {failed}"
-            if kind == "plan":
-                assert open_batch is None, \
-                    f"plan for batch {event[1]} while batch {open_batch} is open"
-            else:
-                assert event[1] == open_batch, \
-                    f"{kind} for batch {event[1]} while batch {open_batch} is open"
+        kind, m = _classify(line)
+        assert kind is not None, f"unrecognized controlled line: {line}"
+        assert failed is None, f"{kind} event for batch {m.group(1)} after failed batch {failed}"
         if kind == "plan":
-            open_batch = event[1]
-            assert batch["perm_note"] == PERM_NOTE[batch["role"]], batch
-        elif kind == "after":
-            assert batch["before"] is not None, f"after without before in batch {event[1]}"
-            made = len(batch["snaps"])
-            assert batch["after"]["calls"] - batch["before"]["calls"] == made, \
-                f"batch {event[1]}: after-before calls must equal its snapshot groups"
+            assert cur is None, f"plan for batch {m.group(1)} while batch {cur} is open"
+            batch = int(m.group(1))
+            assert batch == len(batches), f"batch numbers must ascend from 0: got {batch}"
+            role = m.group(2)
+            assert m.group(3) == PERM_NOTE[role], line
+            argpage = int(m.group(4), 16)
+            if page_size is not None:
+                assert argpage % page_size == 0, line
+            batches[batch] = {"role": role, "perm_note": m.group(3), "argpage": argpage,
+                              "count": int(m.group(5)), "regions": [], "snaps": [],
+                              "failed": False}
+            cur, phase, next_region = batch, "regions", 0
+        elif kind == "region":
+            assert cur is not None and phase == "regions", f"region line outside its plan: {line}"
+            assert int(m.group(1)) == cur, f"region line for batch {m.group(1)} in batch {cur}"
+            batch = batches[cur]
+            index = int(m.group(2))
+            assert index == next_region and next_region < batch["count"], \
+                f"batch {cur}: region index {index} breaks dense 0..{batch['count'] - 1}"
+            length = int(m.group(4))
+            if page_size is not None:
+                assert length % page_size == 0, (cur, length)
+            batch["regions"].append((m.group(3), length))
+            next_region += 1
+        elif kind == "before":
+            assert cur is not None and phase == "regions", \
+                f"before line outside its region block: {line}"
+            assert int(m.group(1)) == cur, f"before line for batch {m.group(1)} in batch {cur}"
+            batch = batches[cur]
+            assert next_region == batch["count"], \
+                f"batch {cur}: before after only {next_region} of {batch['count']} regions"
+            assert m.group(2) == batch["role"], line
+            assert int(m.group(3)) == batch["count"] and \
+                int(m.group(4)) == len(WIRE_PERM[batch["role"]]), line
+            assert int(m.group(5)) == done_groups, \
+                f"batch {cur}: before says {m.group(5)} calls, {done_groups} completed"
+            batch["before"] = {"regions": int(m.group(3)), "perms": int(m.group(4)),
+                               "calls": int(m.group(5))}
+            phase = "snaps"
+        elif kind == "snap_head":
+            assert cur is not None and phase == "snaps" and open_call is None, \
+                f"snapshot head outside an open batch with a finished group: {line}"
+            index = int(m.group(1))
+            assert index == done_groups, f"snapshot call {index} out of order at {done_groups}"
+            batch = batches[cur]
+            argpage = int(m.group(2), 16)
+            ext = tuple(int(g, 16) for g in m.groups()[6:])
+            assert argpage == batch["argpage"], f"call {index}: argument page differs from plan"
+            assert int(m.group(3)) == batch["count"] * 16, f"call {index}: regions_bytes {m.group(3)}"
+            assert int(m.group(4), 16) == argpage + 512 and int(m.group(5)) == 3, \
+                f"call {index}: sources {m.group(4)} value {m.group(5)}"
+            assert int(m.group(6), 16) == argpage + 640, f"call {index}: extended pointer"
+            perm_bytes = len(WIRE_PERM[batch["role"]]) * 24
+            assert ext == (4, argpage + 576, perm_bytes, 0), f"call {index}: ext {ext}"
+            assert batch["before"]["perms"] * 24 == perm_bytes
+            calls[index] = {"argpage": argpage, "regions_bytes": int(m.group(3)),
+                            "regions": [], "perms": []}
+            open_call, snap_phase, snap_regions, snap_perms = index, "regions", 0, 0
+        elif kind == "snap_region":
+            assert open_call is not None and snap_phase == "regions", \
+                f"snapshot region record outside its region block: {line}"
+            assert int(m.group(1)) == open_call, f"region record for call {m.group(1)}"
+            index = int(m.group(2))
+            batch = batches[cur]
+            assert index == snap_regions and snap_regions < batch["count"], \
+                f"call {open_call}: snapshot region index {index} breaks dense order"
+            pair = (m.group(3), int(m.group(4)))
+            assert pair == batch["regions"][index], \
+                f"call {open_call}: region {index} wire {pair} differs from log"
+            calls[open_call]["regions"].append(pair)
+            snap_regions += 1
+            if snap_regions == batch["count"]:
+                snap_phase = "perms"
+        elif kind == "snap_perm":
+            assert open_call is not None and snap_phase == "perms", \
+                f"snapshot permission record outside its permission block: {line}"
+            assert int(m.group(1)) == open_call, f"permission record for call {m.group(1)}"
+            batch = batches[cur]
+            index = int(m.group(2))
+            want = WIRE_PERM[batch["role"]]
+            assert index == snap_perms and snap_perms < len(want), \
+                f"call {open_call}: snapshot perm index {index} breaks dense order"
+            record = (int(m.group(3)), int(m.group(4)), int(m.group(5)),
+                      int(m.group(6)), int(m.group(7)))
+            assert (record[0], record[1]) == want[index] and record[2:] == (0, 0, 0), \
+                f"call {open_call}: perm {index} wire {record} differs from expected {want}"
+            calls[open_call]["perms"].append(record)
+            snap_perms += 1
+            if snap_perms == len(want):
+                batch["snaps"].append(open_call)
+                done_groups += 1
+                open_call, snap_phase = None, None
+        else:  # after
+            assert cur is not None and phase == "snaps" and open_call is None, \
+                f"returned line without a finished snapshot group: {line}"
+            assert int(m.group(1)) == cur, f"returned line for batch {m.group(1)} in batch {cur}"
+            batch = batches[cur]
+            assert m.group(2) == batch["role"], line
+            assert len(batch["snaps"]) >= 1, f"batch {cur}: returned without any SCM call"
+            assert int(m.group(5)) == done_groups and \
+                int(m.group(5)) - batch["before"]["calls"] == len(batch["snaps"]), \
+                f"batch {cur}: call accounting {m.group(5)} vs before " \
+                f"{batch['before']['calls']} and {len(batch['snaps'])} groups"
+            batch["after"] = {"status": int(m.group(3)), "answer": int(m.group(4), 16),
+                              "calls": int(m.group(5))}
+            batch["failed"] = batch["after"]["status"] != 0 or batch["after"]["answer"] != 0
             if batch["failed"]:
-                failed = event[1]
-            open_batch = None
-        elif kind == "snap":
-            assert open_batch is not None, "snapshot outside an open batch"
-            assert batch["before"] is not None, "snapshot before its before line"
-            batch["snaps"].append(event[1])
-    for index in sorted(calls):
-        call = calls[index]
-        batch = next(b for b in batches.values() if index in b["snaps"])
-        assert call["regions_bytes"] == len(call["regions"]) * 16, call
-        assert [call["regions_bytes"]] == [batch["count"] * 16], "SCM region bytes must match log"
-        assert call["regions"] == batch["regions"], f"call {index} wire regions differ from log"
-        assert call["argpage"] == batch["argpage"], "SCM argument page differs from log header"
-        assert call["sources"] == call["argpage"] + 512, call
-        assert call["extended"] == call["argpage"] + 640, call
-        perm_bytes = len(WIRE_PERM[batch["role"]]) * 24
-        assert call["ext"] == (4, call["argpage"] + 576, perm_bytes, 0), call
-        assert call["ext"] == (4, call["argpage"] + 576,
-                               batch["before"]["perms"] * 24, 0)
-        assert [(p[0], p[1]) for p in call["perms"]] == WIRE_PERM[batch["role"]], call
-        assert all(p[2:] == (0, 0, 0) for p in call["perms"]), call
-    for batch, b in sorted(batches.items()):
-        assert [i for i, _ in enumerate(b["regions"])] == list(range(b["count"])), batch
-        assert b["after"] is not None or failed == batch, "open batch without after line"
-        if page_size is not None:
-            for _addr, length in b["regions"]:
-                assert length % page_size == 0, (batch, length)
+                failed = cur
+            cur, phase = None, None
+    assert open_call is None, "stream ended inside an unfinished snapshot group"
+    assert cur is None, "stream ended with a batch before its returned line"
+    if roles is not None:
+        assert [batches[b]["role"] for b in sorted(batches)] == list(roles), \
+            f"log roles differ from scenario roles {list(roles)}"
     return batches, calls, failed

@@ -507,7 +507,7 @@ int main(void) {
     reset(&space, false);
     regs[(0x23000 + SMMU_CB_SCTLR) / 4] = 0x96cc51au;
     regs[SMMU_SMR(6) / 4] = 0x80000005;
-    regs[SMMU_S2CR(6) / 4] = 0x300002u;
+    regs[SMMU_S2CR(6) / 4] = 0x302u;   /* SHCFG_NSH | context 2, the exact value stage 9 writes */
     assert(!adreno8_secure_preflight() && writes == 0);
     for (unsigned j = 0; j < 24; j++) {
         assert(reads[SMMU_SMR(j) / 4] == 1 &&
@@ -606,7 +606,7 @@ if __name__ == "__main__":
             assert all(rejects[2] < i < stands[2] for i in entries if "match 2 smr" in lines[i] or "match 5" in lines[i])
             assert "match 2 smr 0x80000002 s2cr 0x3" in "\n".join(lines)
             assert "match 5 smr 0x80020000 s2cr 0x10003" in "\n".join(lines)
-            assert "match 6 smr 0x80000005 s2cr 0x300002" in "\n".join(lines)
+            assert "match 6 smr 0x80000005 s2cr 0x302" in "\n".join(lines)
             assert "\n".join(lines).count("match 2 smr 0 invalid; s2cr not read") == 3
             for k, want in ((0, "scanned 24, valid 0, 0 on"), (1, "scanned 24, valid 0, 0 on"),
                             (2, "scanned 24, valid 2, 2 on"), (3, "scanned 24, valid 1, 0 on")):

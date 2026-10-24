@@ -160,6 +160,25 @@ int main(int argc, char **argv) {
         puts("secure handover ends before any MP_ASSIGN when the argument page is missing: PASS");
         return 0;
     }
+    if (argc > 1 && strcmp(argv[1], "xfer-gmu-changed") == 0) {
+        /* The GMU route drifts after stage 9 wrote it: the strict preflight
+         * rejects the kind-5 request before any table page, before any SCM
+         * call, and before any retention, and the one-shot state stays
+         * unconsumed; the non-secure path keeps working. */
+        request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 31,
+            .size = 0x138000, .align = (12 << 8) | 16};
+        adreno8_gpu8_secure_mode = SECURE_MODE_HANDOVER;
+        regs[SMMU_S2CR(1) / 4] = 0x304u;   /* translate into context 4 */
+        assert(!adreno8_hwsched_alloc(&request, &result));
+        assert(scm_calls == 0 && !adreno8_memory_failed && !adreno8_memory_retained());
+        assert(adreno8_memory_count == 0 && adreno8_secure_space.table_count == 0);
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_NOT_STARTED);
+        request.kind = 4;
+        request.flags = 0x007;
+        assert(adreno8_hwsched_alloc(&request, &again) && !again.secure);
+        puts("secure handover rejects a changed GMU route before any table work: PASS");
+        return 0;
+    }
     if (argc > 1 && (strcmp(argv[1], "xfer-subpage") == 0 || strcmp(argv[1], "xfer-skew") == 0)) {
         /* A 16 KiB kernel page can sit on four separate 4 KiB SMMU leaves: the
          * handover refuses pages whose whole native span is not proven. The
@@ -360,7 +379,7 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
                         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                         str(target / "check.c"), "-o", str(binary)], check=True)
         for mode in ((), ("gated",), ("xfer",), ("xfer-fail",), ("xfer-open-fail",),
-                     ("xfer-subpage",), ("xfer-skew",), ("xfer-parange",)):
+                     ("xfer-gmu-changed",), ("xfer-subpage",), ("xfer-skew",), ("xfer-parange",)):
             result = subprocess.run([str(binary), *mode], check=True, capture_output=True, text=True)
             if mode == ("xfer",):
                 # The plan line prints from the real PAGE_SIZE and merge rule:
@@ -374,6 +393,9 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
             if mode == ("xfer-open-fail",) or mode == ("xfer-parange",):
                 assert "ends before any MP_ASSIGN; no page transferred" in result.stdout
                 assert "MP_ASSIGN returned" not in result.stdout
+            if mode == ("xfer-gmu-changed",):
+                assert "GMU route context changed" in result.stdout
+                assert "secure handover attempted" not in result.stdout
             if mode in (("xfer-subpage",), ("xfer-skew",)):
                 if page_size == 4096:
                     want = ("312 pages merge into 1 data regions plus 3 table pages, "

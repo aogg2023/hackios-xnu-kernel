@@ -386,6 +386,54 @@ adreno8_space_verify(struct adreno8_gpu_space *space, bool atos)
 	return pages != 0;
 }
 
+/*
+ * The handover rides on the GMU's own route: firmware reaches MP_ASSIGN
+ * through stream 5, so a strict preflight only stands while that route still
+ * reads exactly what adreno8_space_on wrote for the GMU space. Require the
+ * GMU space to be enabled, the GMU_MATCH slot to read back
+ * SMR_VALID | SMR_MASK << 16 | GMU_STREAM, and the S2CR to be a translate
+ * naming adreno8_gmu_space.context. A missing slot, a moved route, or a
+ * changed type or context rejects the secure experiment; the check reads two
+ * registers and writes nothing. The secure world's own reservations stay
+ * invisible to this check like everywhere else in the preflight.
+ */
+static bool
+adreno8_gmu_route_matches(void)
+{
+	uint32_t smr, s2cr;
+
+	if (!adreno8_gmu_space.is_on) {
+		printf("adreno8: %u: secure preflight: GMU route check: the GMU space is not enabled; stream 5 cannot vouch for the handover\n", adreno8_step);
+		return false;
+	}
+	if (GMU_MATCH >= adreno8_smmu_matches) {
+		printf("adreno8: %u: secure preflight: GMU route check: match %u falls outside the probed match registers\n", adreno8_step, GMU_MATCH);
+		return false;
+	}
+	smr = adreno8_get(&adreno8_smmu, "gmu route check", SMMU_SMR(GMU_MATCH));
+	if (!(smr & SMR_VALID)) {
+		printf("adreno8: %u: secure preflight: GMU route missing: match %u smr %#x is not valid\n", adreno8_step, GMU_MATCH, smr);
+		return false;
+	}
+	if (smr != (SMR_VALID | SMR_MASK << 16 | GMU_STREAM)) {
+		printf("adreno8: %u: secure preflight: GMU route moved: match %u smr %#x names stream %u mask %#x instead of stream %u mask %#x\n",
+		    adreno8_step, GMU_MATCH, smr, smr & 0x7fff, smr >> 16 & 0x7fff, GMU_STREAM, SMR_MASK);
+		return false;
+	}
+	s2cr = adreno8_get(&adreno8_smmu, "gmu route check", SMMU_S2CR(GMU_MATCH));
+	if ((s2cr & 0x30000) != 0) {
+		printf("adreno8: %u: secure preflight: GMU route type changed: match %u s2cr %#x is bypass or fault; translate expected\n",
+		    adreno8_step, GMU_MATCH, s2cr);
+		return false;
+	}
+	if ((s2cr & 0xff) != adreno8_gmu_space.context) {
+		printf("adreno8: %u: secure preflight: GMU route context changed: match %u s2cr %#x names context %u instead of %u\n",
+		    adreno8_step, GMU_MATCH, s2cr, s2cr & 0xff, adreno8_gmu_space.context);
+		return false;
+	}
+	return true;
+}
+
 static bool
 adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32_t match, bool strict)
 {
@@ -468,7 +516,12 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
 		    m_set ? "the M-bit rejection stands" :
 		    hits != 0 ? "a routing conflict rejects the candidate" :
 		    "HLOS-side conditions are satisfied at the sample time");
-		return !m_set && hits == 0;
+		if (m_set || hits != 0) {
+			return false;
+		}
+		/* The candidate side passed; the GMU route the handover rides on
+		 * must still read as configured. */
+		return adreno8_gmu_route_matches();
 	}
 	for (unsigned i = 0; i < adreno8_smmu_matches; i++) {
 		uint32_t smr = adreno8_get(&adreno8_smmu, "smr ownership", SMMU_SMR(i));
@@ -505,10 +558,15 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
  * the scan only touches the SMR/S2CR and context-bank registers the boot
  * probe already reads. A context SCTLR with M set, a valid SMR on the
  * candidate slot or covering stream 2, and an S2CR of any type pointing at
- * context 3 each fail the check. The pass samples the probed SMR/S2CR range
- * once at that moment and prints what routes where; the sample never changes
- * the verdict. A pass states HLOS-side conditions at the sample time only:
- * what the secure world has reserved stays invisible, and it never writes.
+ * context 3 each fail the check. The check additionally requires the GMU's
+ * own stream 5 route to read back exactly as adreno8_space_on configured it:
+ * enabled GMU space, a valid GMU_MATCH slot naming stream 5 with the
+ * configured mask, and a translate S2CR naming the GMU context. A missing,
+ * moved, or wrong-typed GMU route rejects the experiment too. The pass
+ * samples the probed SMR/S2CR range once at that moment and prints what
+ * routes where; the sample never changes the verdict. A pass states
+ * HLOS-side conditions at the sample time only: what the secure world has
+ * reserved stays invisible, and it never writes.
  */
 bool
 adreno8_secure_preflight(void)

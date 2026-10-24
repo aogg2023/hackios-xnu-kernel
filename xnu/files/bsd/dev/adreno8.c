@@ -33,9 +33,11 @@
  * adreno8_fine=1      also pause before individual accesses in that step
  * adreno8_watch=S     inspect GMU status for S seconds after step 11 or later (default 20)
  * adreno8_keep=1      retain resources; stage 15 requires a cold reset before memory reuse
- * adreno8_secure_preflight=1  stage-14 experiment mode: answer kind 5 with the read-only SMMU
- *                  preflight only; the start stops without MP_ASSIGN, without a MEM_ALLOC
- *                  reply and without further HFI message processing
+ * adreno8_secure_preflight=N  stage-14 secure experiment: 1 answers kind 5 with the read-only
+ *                  SMMU preflight only; 2 runs the isolated handover experiment: one MP_ASSIGN
+ *                  handover of the kernel's own kind-5 data and secure page-table pages, then
+ *                  the GPU memory path stops; neither mode replies to MEM_ALLOC, writes CB3 or
+ *                  hands addresses to the firmware; unknown values keep the secure path off
  * adreno8_speed=N     GX operating point; only 1 (125 MHz) is exposed before SKU selection
  * adreno8_gmuclk=1    select the GPU PLL clock parent; default uses the crystal
  * adreno8_return=1    return to the resident loader after cleanup
@@ -221,7 +223,7 @@ adreno8_wait_for(struct adreno8_block *b, uint32_t offset, uint32_t mask, uint32
 /* ---- leaving --------------------------------------------------------------------------------------------- */
 
 bool adreno8_gpu8_keep, adreno8_gpu8_return;
-bool adreno8_gpu8_secure_preflight;
+uint32_t adreno8_gpu8_secure_mode;
 bool adreno8_reset_required;
 
 /* Stop GMU access before releasing mapped memory; restore CX configuration if changed. */
@@ -339,7 +341,13 @@ adreno8_init(void)
 	one = 0;
 	adreno8_gpu8_return = PE_parse_boot_argn("adreno8_return", &one, sizeof(one)) && one != 0;
 	one = 0;
-	adreno8_gpu8_secure_preflight = PE_parse_boot_argn("adreno8_secure_preflight", &one, sizeof(one)) && one != 0;
+	if (PE_parse_boot_argn("adreno8_secure_preflight", &one, sizeof(one))) {
+		if (one <= SECURE_MODE_HANDOVER) {
+			adreno8_gpu8_secure_mode = one;
+		} else {
+			printf("adreno8: adreno8_secure_preflight=%u is not a known mode; the secure path stays off\n", one);
+		}
+	}
 	one = 0;
 	adreno8_fine = PE_parse_boot_argn("adreno8_fine", &one, sizeof(one)) && one != 0;
 	PE_parse_boot_argn("adreno8_skip", &adreno8_skip_steps, sizeof(adreno8_skip_steps));

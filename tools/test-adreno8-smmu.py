@@ -17,7 +17,7 @@ constants = "\n".join(
     if line.startswith(("#define SMMU_", "#define PTE_", "#define SCTLR_", "#define TCR_",
                         "#define TCR2_", "#define MAIR0_", "#define FSR_", "#define SMR_", "#define STAGE_1",
                         "#define GMU_CONTEXT", "#define SECURE_CONTEXT", "#define SECURE_STREAM",
-                        "#define SECURE_MATCH"))
+                        "#define SECURE_MATCH", "#define SECURE_MODE_"))
 )
 # Replace only the privileged-platform MMIO instruction; the mapper and lifecycle run unchanged.
 driver, replaced = re.subn(
@@ -44,6 +44,7 @@ typedef size_t vm_size_t;
 #define KERN_SUCCESS 0
 static int kernel_map;
 static unsigned adreno8_step;
+extern uint32_t adreno8_gpu8_secure_mode; /* defined by the memory harness; unused by the SMMU tests */
 ''' + structures + "\n" + constants + r'''
 /* The driver's printf is adreno8_say; the real one reaches the console, so
  * the stub forwards to stdout and the runner can check message order. */
@@ -470,27 +471,32 @@ int main(void) {
     assert(reads[(0x23000 + SMMU_CB_SCTLR) / 4] == 1);
     assert(reads[SMMU_SMR(2) / 4] == 1 && reads[SMMU_SMR(23) / 4] == 1);
     assert(reads[SMMU_S2CR(2) / 4] == 0);
-    /* The device-read CB3 SCTLR 0x96cc51a is nonzero with the enable bit
-     * clear; strict preflight rejects any nonzero reading and still takes
-     * the one-pass read-only view (each SMR once, S2CR only behind a
-     * valid SMR), printing the invalid candidate slot with its S2CR
-     * explicitly unread. */
-    const uint32_t cb3_leftovers[] = {1u, 0x96cc51au};
-    for (unsigned i = 0; i < 2; i++) {
-        reset(&space, false);
-        regs[(0x23000 + SMMU_CB_SCTLR) / 4] = cb3_leftovers[i];
-        assert(!adreno8_secure_preflight() && writes == 0);
-        assert(reads[(0x23000 + SMMU_CB_SCTLR) / 4] == 1);
-        for (unsigned j = 0; j < 24; j++) {
-            assert(reads[SMMU_SMR(j) / 4] == 1 && reads[SMMU_S2CR(j) / 4] == 0);
-        }
+    /* The device-read CB3 SCTLR 0x96cc51a is nonzero with the enable (M) bit
+     * clear; only M rejects. With M set the strict pass still takes the
+     * one-pass read-only view (each SMR once, S2CR only behind a valid SMR),
+     * printing the invalid candidate slot with its S2CR explicitly unread. */
+    reset(&space, false);
+    regs[(0x23000 + SMMU_CB_SCTLR) / 4] = 1u;
+    assert(!adreno8_secure_preflight() && writes == 0);
+    assert(reads[(0x23000 + SMMU_CB_SCTLR) / 4] == 1);
+    for (unsigned j = 0; j < 24; j++) {
+        assert(reads[SMMU_SMR(j) / 4] == 1 && reads[SMMU_S2CR(j) / 4] == 0);
     }
-    /* A conflict visible while SCTLR rejects: the candidate slot taken and
-     * a route into CB3 both print, the scan reaches the last match with
-     * each register read once and no S2CR read for the other 22 invalid
-     * slots, and the SCTLR verdict still stands. */
+    /* The same device-read value with the M bit clear satisfies the HLOS-side
+     * conditions at the sample time; secure-world occupancy stays invisible. */
     reset(&space, false);
     regs[(0x23000 + SMMU_CB_SCTLR) / 4] = 0x96cc51au;
+    assert(adreno8_secure_preflight() && writes == 0);
+    assert(reads[(0x23000 + SMMU_CB_SCTLR) / 4] == 1);
+    for (unsigned j = 0; j < 24; j++) {
+        assert(reads[SMMU_SMR(j) / 4] == 1 && reads[SMMU_S2CR(j) / 4] == 0);
+    }
+    /* A routing conflict while the M bit rejects: the candidate slot taken and
+     * a route into CB3 both print, the scan reaches the last match with
+     * each register read once and no S2CR read for the other 22 invalid
+     * slots, and the M-bit rejection still stands. */
+    reset(&space, false);
+    regs[(0x23000 + SMMU_CB_SCTLR) / 4] = 1u;
     regs[SMMU_SMR(2) / 4] = 0x80000002;
     regs[SMMU_S2CR(2) / 4] = 3u;
     regs[SMMU_SMR(5) / 4] = 0x80020000;
@@ -501,14 +507,15 @@ int main(void) {
                reads[SMMU_S2CR(j) / 4] == (j == 2 || j == 5 ? 1 : 0));
     }
     /* The kernel's own GMU takeover route (exact SID5 -> context 2, as
-     * stage 9 writes it) does not collide with the candidate yet prints
-     * with its raw values, so post-analysis can tell a real view from
-     * degraded all-invalid reads. It counts in scanned and valid only. */
+     * stage 9 writes it) neither names context 3 nor covers stream 2, so the
+     * HLOS-side conditions hold, yet the route still prints with its raw
+     * values; post-analysis can tell a real view from degraded all-invalid
+     * reads. It counts in scanned and valid only. */
     reset(&space, false);
     regs[(0x23000 + SMMU_CB_SCTLR) / 4] = 0x96cc51au;
     regs[SMMU_SMR(6) / 4] = 0x80000005;
     regs[SMMU_S2CR(6) / 4] = 0x302u;   /* SHCFG_NSH | context 2, the exact value stage 9 writes */
-    assert(!adreno8_secure_preflight() && writes == 0);
+    assert(adreno8_secure_preflight() && writes == 0);
     for (unsigned j = 0; j < 24; j++) {
         assert(reads[SMMU_SMR(j) / 4] == 1 &&
                reads[SMMU_S2CR(j) / 4] == (j == 6 ? 1 : 0));
@@ -589,28 +596,35 @@ if __name__ == "__main__":
                             "-fno-omit-frame-pointer", str(target / "check.c"), "-o", str(binary)], check=True)
             result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
             lines = result.stdout.splitlines()
-            rejects = [i for i, l in enumerate(lines) if "is nonzero; the context bank fails the preflight" in l]
-            stands = [i for i, l in enumerate(lines) if "the SCTLR rejection stands" in l]
+            out = "\n".join(lines)
+            summaries = [l for l in lines if "preflight routing sample at t=" in l]
+            rejects = [i for i, l in enumerate(lines) if "has the M bit set; the context bank fails the preflight" in l]
+            stands = [i for i, l in enumerate(lines) if "the M-bit rejection stands" in l]
             inval = [i for i, l in enumerate(lines) if "invalid; s2cr not read" in l]
             entries = [i for i, l in enumerate(lines)
                        if "preflight routing sample: match" in l and "invalid" not in l]
-            # Four SCTLR-nonzero scenarios (leftovers x2, conflict, own GMU
-            # route). Each keeps its rejection line first, prints at most one
-            # line per probed slot, and closes with exactly one summary.
-            assert len(rejects) == 4 and len(stands) == 4, (len(rejects), len(stands))
+            # Fourteen strict preflight runs: each prints exactly one summary.
+            # Verdicts: two M-bit rejections, eight routing conflicts, four
+            # satisfied. Two M-set scenarios (the M-set leftover, the M-set
+            # conflict) each keep the rejection line first, at most one sample
+            # line per probed slot, and close with their own summary.
+            assert len(summaries) == 14, len(summaries)
+            assert len(rejects) == 2 and len(stands) == 2, (len(rejects), len(stands))
+            assert out.count("a routing conflict rejects the candidate") == 8
+            assert out.count("HLOS-side conditions are satisfied at the sample time") == 4
+            assert out.count("context 3 satisfied the HLOS-side conditions") == 4
             for r, s in zip(rejects, stands):
                 assert r < s and not [t for t in rejects if r < t < s]
                 assert len([i for i in inval + entries if r < i < s]) <= 24
-            assert len(inval) == 3 and len(entries) == 3
-            assert all(any(rejects[k] < i < stands[k] for k in (0, 1, 3)) for i in inval)
-            assert all(rejects[2] < i < stands[2] for i in entries if "match 2 smr" in lines[i] or "match 5" in lines[i])
-            assert "match 2 smr 0x80000002 s2cr 0x3" in "\n".join(lines)
-            assert "match 5 smr 0x80020000 s2cr 0x10003" in "\n".join(lines)
-            assert "match 6 smr 0x80000005 s2cr 0x302" in "\n".join(lines)
-            assert "\n".join(lines).count("match 2 smr 0 invalid; s2cr not read") == 3
-            for k, want in ((0, "scanned 24, valid 0, 0 on"), (1, "scanned 24, valid 0, 0 on"),
-                            (2, "scanned 24, valid 2, 2 on"), (3, "scanned 24, valid 1, 0 on")):
-                assert want in lines[stands[k]], lines[stands[k]]
+            assert out.count("match 2 smr 0 invalid; s2cr not read") == 11
+            assert len(inval) == 11 and len(entries) == 12
+            assert "match 2 smr 0x80000002 s2cr 0x3" in out
+            assert "match 5 smr 0x80020000 s2cr 0x10003" in out
+            assert "match 6 smr 0x80000005 s2cr 0x302" in out
+            assert "scanned 24, valid 0, 0 on" in lines[stands[0]], lines[stands[0]]
+            assert "scanned 24, valid 2, 2 on" in lines[stands[1]], lines[stands[1]]
+            own_gmu = [l for l in summaries if "scanned 24, valid 1, 0 on" in l]
+            assert len(own_gmu) == 2 and all("are satisfied at the sample time" in l for l in own_gmu), own_gmu
             for l in lines:
                 if "preflight" in l:
                     print(l)

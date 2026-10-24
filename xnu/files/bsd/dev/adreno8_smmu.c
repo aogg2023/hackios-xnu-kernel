@@ -400,8 +400,9 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
 	 * same context bank is not readable here and stays unconfirmed until
 	 * a device run. TTBR and stream routing are written later by
 	 * adreno8_space_on, never here. strict selects the secure-preflight
-	 * rules; the ordinary takeover keeps the conditions the step14b
-	 * device runs verified.
+	 * rules (M bit plus routing) and returns inside its own pass; the
+	 * ordinary takeover keeps the conditions the step14b device runs
+	 * verified.
 	 */
 	if (space->context >= adreno8_smmu_contexts || match >= adreno8_smmu_matches || stream > 0x7fff ||
 	    (adreno8_smmu_pages + space->context + 1) * adreno8_smmu_page > adreno8_smmu.size) {
@@ -409,62 +410,67 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
 	}
 	if (strict) {
 		/*
-		 * Any non-zero SCTLR fails the preflight. Individual bits go
-		 * uninterpreted: a leftover field such as the device-read
-		 * 0x107c430c has a clear enable bit yet still means HLOS cannot
-		 * confirm the context bank is off, so preflight rejects.
+		 * The strict pass returns inside this block after one read per
+		 * register. It rejects the candidate when CB SCTLR.M is set, and
+		 * the routing pass below rejects a valid candidate slot, a valid
+		 * route covering the requested stream, or any valid route naming
+		 * the context. The specification permits SCTLR to read UNKNOWN
+		 * after reset, so fields other than M go uninterpreted; the
+		 * device-read 0x96cc51a for example has a clear M bit.
 		 */
+		unsigned scanned = 0, valid = 0, hits = 0;
+		uint64_t now = mach_absolute_time(), ns;
+		bool m_set;
+
 		sctlr = adreno8_get(&adreno8_smmu, "cb preflight",
 		    (adreno8_smmu_pages + space->context) * adreno8_smmu_page + SMMU_CB_SCTLR);
-		if (sctlr != 0) {
-			uint64_t now = mach_absolute_time(), ns;
-			unsigned scanned = 0, valid = 0, hits = 0;
-
-			printf("adreno8: %u: secure preflight: context %u SCTLR %#x is nonzero; the context bank fails the preflight\n",
+		m_set = (sctlr & SCTLR_M) != 0;
+		if (m_set) {
+			printf("adreno8: %u: secure preflight: context %u SCTLR %#x has the M bit set; the context bank fails the preflight\n",
 			    adreno8_step, space->context, sctlr);
-			/*
-			 * Same-moment routing view: one read-only pass; values
-			 * print as read, no second pass, no MMIO beyond one SMR
-			 * per slot plus one S2CR per valid SMR. The candidate
-			 * slot's SMR prints even when invalid, and then its
-			 * S2CR is explicitly unread. Every valid entry prints
-			 * (bounded by the probed match count), so post-analysis
-			 * can check whether the kernel's own GMU route (a valid
-			 * entry covering stream 5 with the S2CR pointing at
-			 * context 2) shows up: all SMRs reading invalid is
-			 * degraded read-out, a different picture from a clear
-			 * one. Nothing in the view describes what the secure
-			 * world has reserved. The step number and monotonic
-			 * nanoseconds tag the moment; the SCTLR verdict
-			 * already stands.
-			 */
-			absolutetime_to_nanoseconds(now, &ns);
-			for (unsigned i = 0; i < adreno8_smmu_matches; i++) {
-				uint32_t smr = adreno8_get(&adreno8_smmu, "smr sample", SMMU_SMR(i));
-				uint32_t s2cr = 0, mask;
-
-				scanned++;
-				if (!(smr & SMR_VALID)) {
-					if (i == match) {
-						printf("adreno8: %u: preflight routing sample: match %u smr %#x invalid; s2cr not read\n",
-						    adreno8_step, i, smr);
-					}
-					continue;
-				}
-				s2cr = adreno8_get(&adreno8_smmu, "s2cr sample", SMMU_S2CR(i));
-				valid++;
-				printf("adreno8: %u: preflight routing sample: match %u smr %#x s2cr %#x\n",
-				    adreno8_step, i, smr, s2cr);
-				mask = (smr >> 16 & 0x7fff) | SMR_MASK;
-				if (i == match || ((smr ^ stream) & 0x7fff & ~mask) == 0 ||
-				    (s2cr & 0xff) == space->context) {
-					hits++;
-				}
-			}
-			printf("adreno8: %u: preflight routing sample at t=%lluns: scanned %u, valid %u, %u on the candidate route or context %u; the SCTLR rejection stands\n",
-			    adreno8_step, ns, scanned, valid, hits, space->context);
-			return false;
 		}
+		/*
+		 * Same-moment routing view, one read-only pass; values print as
+		 * read, no second pass, no MMIO beyond one SMR per slot plus one
+		 * S2CR per valid SMR. The candidate slot's SMR prints even when
+		 * invalid, and then its S2CR is explicitly unread. Every valid
+		 * entry prints (bounded by the probed match count), so
+		 * post-analysis can check whether the kernel's own GMU route (a
+		 * valid entry covering stream 5 with the S2CR pointing at
+		 * context 2) shows up: all SMRs reading invalid is degraded
+		 * read-out, a different picture from a clear one. Nothing in the
+		 * view describes what the secure world has reserved. The step
+		 * number and monotonic nanoseconds tag the moment.
+		 */
+		absolutetime_to_nanoseconds(now, &ns);
+		for (unsigned i = 0; i < adreno8_smmu_matches; i++) {
+			uint32_t smr = adreno8_get(&adreno8_smmu, "smr sample", SMMU_SMR(i));
+			uint32_t s2cr = 0, mask;
+
+			scanned++;
+			if (!(smr & SMR_VALID)) {
+				if (i == match) {
+					printf("adreno8: %u: preflight routing sample: match %u smr %#x invalid; s2cr not read\n",
+					    adreno8_step, i, smr);
+				}
+				continue;
+			}
+			s2cr = adreno8_get(&adreno8_smmu, "s2cr sample", SMMU_S2CR(i));
+			valid++;
+			printf("adreno8: %u: preflight routing sample: match %u smr %#x s2cr %#x\n",
+			    adreno8_step, i, smr, s2cr);
+			mask = (smr >> 16 & 0x7fff) | SMR_MASK;
+			if (i == match || ((smr ^ stream) & 0x7fff & ~mask) == 0 ||
+			    (s2cr & 0xff) == space->context) {
+				hits++;
+			}
+		}
+		printf("adreno8: %u: preflight routing sample at t=%lluns: scanned %u, valid %u, %u on the candidate route or context %u; %s\n",
+		    adreno8_step, ns, scanned, valid, hits, space->context,
+		    m_set ? "the M-bit rejection stands" :
+		    hits != 0 ? "a routing conflict rejects the candidate" :
+		    "HLOS-side conditions are satisfied at the sample time");
+		return !m_set && hits == 0;
 	}
 	for (unsigned i = 0; i < adreno8_smmu_matches; i++) {
 		uint32_t smr = adreno8_get(&adreno8_smmu, "smr ownership", SMMU_SMR(i));
@@ -475,17 +481,18 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
 		}
 		s2cr = adreno8_get(&adreno8_smmu, "s2cr ownership", SMMU_S2CR(i));
 		/* Reuse a blocked stream only with the same match and a disabled context. */
-		if (!strict && i == match && smr == (SMR_VALID | SMR_MASK << 16 | stream) &&
+		if (i == match && smr == (SMR_VALID | SMR_MASK << 16 | stream) &&
 		    (s2cr & 0x30000) == SMMU_S2CR_FAULT &&
 		    adreno8_get(&adreno8_smmu, "cb ownership",
 		        (adreno8_smmu_pages + space->context) * adreno8_smmu_page + SMMU_CB_SCTLR) == 0) {
 			continue;
 		}
 		mask = (smr >> 16 & 0x7fff) | SMR_MASK;
-		/* strict treats every S2CR type as routing; the ordinary path
-		 * rejects only an active route into the requested context. */
+		/* The ordinary takeover rejects a valid entry on the candidate match,
+		 * a valid entry covering the requested stream, and an active route
+		 * into the requested context, exactly as the step14b runs verified. */
 		if (i == match || ((smr ^ stream) & 0x7fff & ~mask) == 0 ||
-		    ((strict || (s2cr & 0x30000) == 0) && (s2cr & 0xff) == space->context)) {
+		    ((s2cr & 0x30000) == 0 && (s2cr & 0xff) == space->context)) {
 			printf("adreno8: %u: stream match %u conflicts with requested context %u\n", adreno8_step, i, space->context);
 			return false;
 		}
@@ -498,14 +505,12 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
  * MP_ASSIGN. The candidate route is stream 2, match 2, context 3 (vendor
  * sun-gpu.dtsi gfx3d_secure). Bounds are checked before any MMIO read, and
  * the scan only touches the SMR/S2CR and context-bank registers the boot
- * probe already reads. A non-zero context SCTLR, a valid SMR on the
+ * probe already reads. A context SCTLR with M set, a valid SMR on the
  * candidate slot or covering stream 2, and an S2CR of any type pointing at
- * context 3 each fail the check. When a non-zero context SCTLR fails the
- * check, the pass still samples the probed SMR/S2CR range once at that
- * moment and prints what routes where; the sample never changes the
- * verdict. A pass means HLOS-side registers show context 3 and the
- * candidate slot free of routing; it does not confirm
- * what the secure world has reserved, and it never writes.
+ * context 3 each fail the check. The pass samples the probed SMR/S2CR range
+ * once at that moment and prints what routes where; the sample never changes
+ * the verdict. A pass states HLOS-side conditions at the sample time only:
+ * what the secure world has reserved stays invisible, and it never writes.
  */
 bool
 adreno8_secure_preflight(void)
@@ -519,7 +524,7 @@ adreno8_secure_preflight(void)
 	if (!adreno8_space_available(&adreno8_secure_space, SECURE_STREAM, SECURE_MATCH, true)) {
 		return false;
 	}
-	printf("adreno8: %u: secure preflight: stream %u match %u context %u carries no HLOS-side routing\n",
+	printf("adreno8: %u: secure preflight: stream %u match %u context %u satisfied the HLOS-side conditions at the sample time\n",
 	    adreno8_step, SECURE_STREAM, SECURE_MATCH, SECURE_CONTEXT);
 	return true;
 }

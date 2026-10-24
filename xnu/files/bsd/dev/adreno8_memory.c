@@ -15,7 +15,7 @@
 struct adreno8_memory_entry {
 	struct adreno8_memory buffer;
 	struct adreno8_hfi_mem_request request;
-	bool from_hfi, complete, secure;
+	bool from_hfi, complete, secure, terminal;
 };
 
 static struct adreno8_memory_entry adreno8_memory_entries[MEMORY_COUNT];
@@ -46,6 +46,11 @@ adreno8_memory_alloc(const char *name, uint32_t size, uint32_t alignment,
 	uint64_t allocated = ((uint64_t)size + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
 	uint32_t gpu_address = 0, gmu_address = 0;
 
+	/* After the one-shot experiment ended the retained set is fixed; this
+	 * boot opens no further GPU or GMU allocation. */
+	if (adreno8_secure_xfer_state() != SECURE_XFER_NOT_STARTED) {
+		return NULL;
+	}
 	if (adreno8_memory_failed || adreno8_memory_count == MEMORY_COUNT || name == NULL ||
 	    size == 0 || (size & (MEMORY_GRANULE - 1)) || size > MEMORY_BLOCK_LIMIT ||
 	    alignment < MEMORY_GRANULE || (alignment & (alignment - 1)) ||
@@ -96,6 +101,76 @@ adreno8_memory_alloc(const char *name, uint32_t size, uint32_t alignment,
 	return buffer;
 }
 
+/*
+ * Isolated handover experiment reached only from adreno8_memory_alloc_secure
+ * when the boot-args mode selects it. The buffer gets its own allocation, one
+ * VA range reserved in the secure space and PTEs written into the secure
+ * tables only: CB3 stays disabled, CB0 gets no mapping of these pages and no
+ * address reaches the firmware. adreno8_secure_xfer hands the secure table
+ * pages and the data pages to the secure owner once; the entry then stays
+ * terminal, so the caller answers no MEM_ALLOC and later requests stop at
+ * adreno8_hwsched_alloc without issuing another SCM call. A page stays
+ * retained until cold reset whatever the handover outcome, and after the
+ * attempt the CPU never reads or writes these pages again.
+ */
+static struct adreno8_memory *
+adreno8_memory_alloc_xfer(const char *name, uint32_t size, uint32_t alignment,
+    uint32_t gpu_prot, uint64_t allocated)
+{
+	struct adreno8_memory_entry *entry;
+	struct adreno8_memory *buffer;
+	uint32_t address = 0;
+
+	if (adreno8_secure_xfer_state() != SECURE_XFER_NOT_STARTED) {
+		printf("adreno8: the secure handover experiment already ended; this boot issues no further SCM call\n");
+		return NULL;
+	}
+	if (adreno8_secure_space.table_count == 0 &&
+	    adreno8_space_new_table(&adreno8_secure_space, 0, 0) == 0) {
+		adreno8_secure_xfer_abort();
+		return NULL;
+	}
+	if (!adreno8_space_find_range(&adreno8_secure_space, GPU_IOVA_START, GPU_IOVA_END,
+	    size, alignment, &address)) {
+		adreno8_secure_xfer_abort();
+		return NULL;
+	}
+	entry = &adreno8_memory_entries[adreno8_memory_count];
+	buffer = &entry->buffer;
+	if (kmem_alloc(kernel_map, &buffer->memory, (vm_size_t)allocated,
+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		buffer->memory = 0;
+		adreno8_secure_xfer_abort();
+		return NULL;
+	}
+	/* Record ownership before any table can expose this allocation. */
+	adreno8_memory_count++;
+	adreno8_memory_bytes += allocated;
+	buffer->name = name;
+	buffer->size = size;
+	buffer->gpu_address = address;
+	entry->secure = true;
+	/* Publish the zero fill while HLOS owns the pages; after the handover no
+	 * cache line of theirs may be written back over what the secure owner stores. */
+	adreno8_to_memory(buffer->memory, (vm_size_t)allocated);
+	if (!adreno8_space_map_region(&adreno8_secure_space, address, buffer->memory,
+	    size, gpu_prot)) {
+		adreno8_memory_failed = true;
+		printf("adreno8: secure allocation failed; retain GPU memory until cold reset\n");
+		adreno8_secure_xfer_abort();
+		return NULL;
+	}
+	if (!adreno8_secure_xfer(&adreno8_secure_space, buffer)) {
+		adreno8_memory_failed = true;
+		printf("adreno8: secure allocation failed; retain GPU memory until cold reset\n");
+		return NULL;
+	}
+	entry->complete = true;
+	entry->terminal = true;
+	printf("adreno8: secure allocation experiment ends here: no MEM_ALLOC reply is built, START fails on purpose\n");
+	return buffer;
+}
+
 /* kind 5 (CSW_PRIV_SECURE) buffers: the pages go to VMID CP_PIXEL through MP_ASSIGN.
  * Vendor review established the ordering invariant: the secure context attach,
  * its stream routing and the secure pagetable mapping are in place before the
@@ -119,7 +194,15 @@ adreno8_memory_alloc(const char *name, uint32_t size, uint32_t alignment,
  * Secure context 3 (TTBR, SCTLR and stream routing through adreno8_space_on)
  * is initialized when the secure path executes; page-table pages carry {HLOS
  * read/write, CP_PIXEL read} so the walker can still read tables the secure
- * world owns. */
+ * world owns.
+ * The boot-args mode picks the behavior: 1 stops after the read-only
+ * preflight, 2 runs the isolated experiment above, and both reply nothing; 0 or
+ * an unknown value keeps the path closed. The state of the secure bridge after
+ * the first handover is unknown: the earlier park and PSCI verification covered
+ * runs without any MP_ASSIGN, and whether a cold reset recovers a first
+ * handover still needs device confirmation. A single MP_ASSIGN SMC may never
+ * return; the EBUSY retry bound counts retries and a host-side timeout only
+ * bounds host waiting, it cancels nothing inside TrustZone. */
 static struct adreno8_memory *
 adreno8_memory_alloc_secure(const char *name, uint32_t size, uint32_t alignment, uint32_t gpu_prot)
 {
@@ -143,7 +226,14 @@ adreno8_memory_alloc_secure(const char *name, uint32_t size, uint32_t alignment,
 		return NULL;
 	}
 	if (!adreno8_secure_execute) {
-		if (adreno8_gpu8_secure_preflight) {
+		/* The device never raises adreno8_secure_execute, so the full
+		 * handover-and-reply path below stays host-test only. Experiment
+		 * mode runs one isolated handover inside this gate; the full
+		 * path's address publication and CB0 mapping never run there. */
+		if (adreno8_gpu8_secure_mode == SECURE_MODE_HANDOVER) {
+			return adreno8_memory_alloc_xfer(name, size, alignment, gpu_prot, allocated);
+		}
+		if (adreno8_gpu8_secure_mode == SECURE_MODE_PREFLIGHT) {
 			printf("adreno8: secure preflight-only mode: START stops here without MP_ASSIGN or MEM_ALLOC reply\n");
 		} else {
 			printf("adreno8: secure handover gated: the MP_ASSIGN and MEM_ALLOC reply path awaits the secure translation implementation review\n");
@@ -300,6 +390,13 @@ adreno8_hwsched_alloc(const struct adreno8_hfi_mem_request *request, struct adre
 	if (result == NULL) return false;
 	memset(result, 0, sizeof(*result));
 	if (request == NULL) return false;
+	/* After the one-shot experiment attempted or ended, this boot answers no
+	 * further allocation: an MP_ASSIGN may have run or may still be running
+	 * inside TrustZone, and a reply would hand out addresses anyway. */
+	if (adreno8_secure_xfer_state() != SECURE_XFER_NOT_STARTED) {
+		printf("adreno8: the secure handover experiment ended; the memory path stops here\n");
+		return false;
+	}
 	/* Only the exact CSW_PRIV_SECURE shape earns a secure owner: kind 5 with the
 	 * vendor's GFX|GFX_PRIV|GFX_WRITE|GFX_SECURE flags. The non-secure flag mask
 	 * keeps rejecting bit 12 for every other kind and flag combination. */
@@ -355,6 +452,13 @@ adreno8_hwsched_alloc(const struct adreno8_hfi_mem_request *request, struct adre
 	entry = &adreno8_memory_entries[adreno8_memory_count - 1];
 	entry->from_hfi = true;
 	entry->request = *request;
+	if (entry->terminal) {
+		/* The experiment ran or ended for this very request; the entry
+		 * records it and the gate at the top answers everything after
+		 * with false, so no reply is built and the entry never returns
+		 * a replayed success. */
+		return false;
+	}
 success:
 	result->gpu_address = buffer->gpu_address;
 	result->gmu_address = buffer->gmu_address;

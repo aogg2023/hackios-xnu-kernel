@@ -27,4 +27,27 @@ bool adreno8_secure_lost(void);
  * invisible and translation behavior needs a device run. */
 bool adreno8_secure_preflight(void);
 
+/* One-shot state of the isolated handover experiment. Not started allows one
+ * handover; attempted is set before the first MP_ASSIGN leaves the kernel and a
+ * single SMC call may never return, so any later request must treat the boot as
+ * terminal; terminal stays for the rest of the boot on success and on failure. */
+#define SECURE_XFER_NOT_STARTED 0u
+#define SECURE_XFER_ATTEMPTED   1u
+#define SECURE_XFER_TERMINAL    2u
+
+uint32_t adreno8_secure_xfer_state(void);
+
+/* Close the experiment before any MP_ASSIGN goes out (no usable data page, no
+ * argument page, or the driver could not stage the batch). Nothing transferred,
+ * so no page is marked lost; the terminal state still ends the secure path for
+ * the rest of the boot. */
+void adreno8_secure_xfer_abort(void);
+
+/* One isolated handover of the kernel's own kind-5 buffer: assign this space's
+ * page-table pages, then the buffer's data pages, print the batch plan before
+ * the first MP_ASSIGN, and stop. A true result means the CPU must never touch
+ * those pages again; the pages stay retained whether the handover succeeded or
+ * failed. Every later call returns false without issuing SCM calls. */
+bool adreno8_secure_xfer(struct adreno8_gpu_space *space, const struct adreno8_memory *buffer);
+
 #endif

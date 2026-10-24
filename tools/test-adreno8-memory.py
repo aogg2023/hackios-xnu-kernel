@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 fixture = runpy.run_path(str(ROOT / "tools/test-adreno8-smmu.py"))
 stub = fixture["stub"].replace("assert(size == 4096);", "assert(size != 0);")
 stub = stub.replace("static int adreno8_say", r'''
-static bool adreno8_gpu8_secure_preflight;
+uint32_t adreno8_gpu8_secure_mode;
 static unsigned scm_calls, scm_sleeps, scm_fail_at = 999999u;
 int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
     uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *answer) {
@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
          * allocation path keeps working right afterwards. */
         request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 11,
             .size = 0x138000, .align = (12 << 8) | 16};
-        adreno8_gpu8_secure_preflight = true;
+        adreno8_gpu8_secure_mode = SECURE_MODE_PREFLIGHT;
         assert(!adreno8_hwsched_alloc(&request, &result));
         assert(scm_calls == 0 && !adreno8_memory_failed && !adreno8_memory_retained());
         assert(adreno8_memory_count == 0 && adreno8_secure_space.table_count == 0);
@@ -67,6 +67,97 @@ int main(int argc, char **argv) {
         request.flags = 0x007;
         assert(adreno8_hwsched_alloc(&request, &again) && !again.secure);
         puts("secure handover gated: no MP_ASSIGN, non-secure path intact: PASS");
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "xfer") == 0) {
+        /* Experiment mode through the production call chain: the kind-5 request
+         * hands the kernel's own buffer over once and ends there. The result
+         * stays zeroed so no MEM_ALLOC reply can be built, CB0 gains no table,
+         * CB3 gains no write, and the secure space ends fully assigned. Every
+         * later request is refused without a new allocation or SCM call. */
+        request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 21,
+            .size = 0x138000, .align = (12 << 8) | 16};
+        adreno8_gpu8_secure_mode = SECURE_MODE_HANDOVER;
+        unsigned writes_before = writes;
+        assert(!adreno8_hwsched_alloc(&request, &result));
+        assert(result.gpu_address == 0 && result.gmu_address == 0 && result.size == 0 && !result.secure);
+        /* The fixture never hands out neighbor physical pages, so the pages
+         * stay single-page regions: ceil(pages / 32) data calls plus one table
+         * call over the root, level-1 and level-2 pages of the mapping. */
+        unsigned pages = (request.size + PAGE_SIZE - 1) / PAGE_SIZE;
+        assert(scm_calls == (pages + ASSIGN_SECTIONS - 1) / ASSIGN_SECTIONS + 1);
+        assert(!adreno8_secure_lost() && !adreno8_memory_failed && adreno8_memory_retained());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        assert(writes == writes_before);
+        assert(adreno8_gpu_space.table_count == 0);
+        assert(adreno8_secure_space.table_count == 3 && !adreno8_secure_space.is_on);
+        assert(adreno8_secure_space.secure_tables == adreno8_secure_space.table_count);
+        struct adreno8_memory *secure = &adreno8_memory_entries[0].buffer;
+        assert(adreno8_memory_entries[0].secure && adreno8_memory_entries[0].complete &&
+               adreno8_memory_entries[0].terminal && secure->memory != 0);
+        assert(secure->gpu_address >= 0x10000000 && secure->gpu_address < 0xe0000000);
+        for (unsigned offset = 0; offset < request.size; offset += 4096) {
+            assert(walk(adreno8_secure_space.tables[0].phys, secure->gpu_address + offset) ==
+                   kvtophys(secure->memory + offset));
+        }
+        assert(!adreno8_memory_publish(secure, 0, 4096) && !adreno8_memory_acquire(secure, 0, 4096));
+        unsigned calls_before = scm_calls, allocations_after = allocation_count;
+        assert(!adreno8_hwsched_alloc(&request, &again));
+        request.handle = 22;
+        assert(!adreno8_hwsched_alloc(&request, &again));
+        request.kind = 4;
+        request.flags = 0x007;
+        assert(!adreno8_hwsched_alloc(&request, &again));
+        assert(adreno8_gpu_alloc("after", 4096, 4096, ADRENO8_MEM_READ) == NULL);
+        assert(scm_calls == calls_before && allocation_count == allocations_after);
+        puts("secure handover experiment: one terminal handover, no reply, no CB3 write, path frozen: PASS");
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "xfer-fail") == 0) {
+        /* The second data batch fails after the table call and the first data
+         * batch landed: ownership is unclear, every page stays retained, the
+         * entry never completes, and later requests add no SCM call. */
+        request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 23,
+            .size = 0x138000, .align = (12 << 8) | 16};
+        adreno8_gpu8_secure_mode = SECURE_MODE_HANDOVER;
+        scm_fail_at = 3;
+        assert(!adreno8_hwsched_alloc(&request, &result));
+        assert(scm_calls == 3 && adreno8_secure_lost() && adreno8_memory_failed);
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        assert(adreno8_memory_retained() && !adreno8_memory_entries[0].complete);
+        assert(adreno8_memory_entries[0].terminal == false);
+        unsigned calls_before = scm_calls;
+        assert(!adreno8_hwsched_alloc(&request, &again));
+        request.kind = 4;
+        request.flags = 0x007;
+        assert(!adreno8_hwsched_alloc(&request, &again));
+        assert(scm_calls == calls_before);
+        puts("secure handover failure retained and frozen: PASS");
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "xfer-open-fail") == 0) {
+        /* The MP_ASSIGN argument page cannot be allocated: the experiment ends
+         * before any MP_ASSIGN, no page is transferred, nothing is marked
+         * lost, and the boot keeps the terminal refusal. */
+        request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 25,
+            .size = 0x138000, .align = (12 << 8) | 16};
+        adreno8_gpu8_secure_mode = SECURE_MODE_HANDOVER;
+        /* kmem calls: secure root, buffer, level-1, level-2, then the argument
+         * page is the fifth and fails. */
+        alloc_fail_after = 4;
+        assert(!adreno8_hwsched_alloc(&request, &result));
+        assert(scm_calls == 0 && !adreno8_secure_lost());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        assert(adreno8_memory_failed && adreno8_memory_retained());
+        assert(!adreno8_memory_entries[0].complete && !adreno8_memory_entries[0].terminal);
+        alloc_fail_after = -1;
+        unsigned allocations_after = allocation_count;
+        assert(!adreno8_hwsched_alloc(&request, &again));
+        request.kind = 4;
+        request.flags = 0x007;
+        assert(!adreno8_hwsched_alloc(&request, &again));
+        assert(allocation_count == allocations_after && scm_calls == 0);
+        puts("secure handover ends before any MP_ASSIGN when the argument page is missing: PASS");
         return 0;
     }
     if (argc > 1 && strcmp(argv[1], "secure-fail") == 0) {
@@ -258,6 +349,18 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
         subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}",
                         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                         str(target / "check.c"), "-o", str(binary)], check=True)
-        for mode in ((), ("secure-fail",), ("gated",)):
-            subprocess.run([str(binary), *mode], check=True)
+        for mode in ((), ("secure-fail",), ("gated",), ("xfer",), ("xfer-fail",), ("xfer-open-fail",)):
+            result = subprocess.run([str(binary), *mode], check=True, capture_output=True, text=True)
+            if mode == ("xfer",):
+                # The plan line prints from the real PAGE_SIZE and merge rule:
+                # single-page regions, one table call, ceil(pages / 32) data calls.
+                pages = 0x138000 // page_size
+                want = (f"{pages} pages merge into {pages} data regions plus 3 table pages, "
+                        f"{(pages + 31) // 32 + 1} MP_ASSIGN calls")
+                assert want in result.stdout, (want, result.stdout)
+                assert "secure handover complete" in result.stdout
+                assert "no MEM_ALLOC reply is built" in result.stdout
+            if mode == ("xfer-open-fail",):
+                assert "ends before any MP_ASSIGN; no page transferred" in result.stdout
+                assert "MP_ASSIGN returned" not in result.stdout
         print(f"XNU PAGE_SIZE={page_size}: PASS")

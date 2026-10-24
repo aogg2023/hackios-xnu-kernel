@@ -99,6 +99,11 @@ adreno8_assign_call(uint64_t regions_bytes, uint64_t perms_bytes)
 	extended[3] = 0;
 	/* TZ reads every staged record from DRAM: clean after the last store. */
 	adreno8_to_memory(adreno8_assign.page, ASSIGN_USED);
+	/*
+	 * The retry bound counts EBUSY retries; it is not a wall-clock bound.
+	 * A single SMC may not return at all, and then no host-side timeout
+	 * cancels the TrustZone call; a host timeout only bounds host waiting.
+	 */
 	for (unsigned retry = 0; retry < ASSIGN_EBUSY_RETRY; retry++) {
 		status = adreno8_scm_call(SCM_MP_ASSIGN, SCM_ASSIGN_ARGINFO, adreno8_assign.page_phys,
 		    regions_bytes, sources_phys, extended_phys, &answer);
@@ -140,17 +145,16 @@ adreno8_assign_flush(const struct assign_region *regions, unsigned count,
 	return true;
 }
 
-bool
-adreno8_secure_data(const struct adreno8_memory *buffer)
+/* Stage and flush the buffer's data pages to CP_PIXEL read/write. The caller has
+ * passed the preflight and opened the argument page. */
+static bool
+adreno8_assign_data(const struct adreno8_memory *buffer)
 {
 	struct assign_perm perms[] = { { VMID_CP_PIXEL, PERM_READ | PERM_WRITE, 0, 0, 0 } };
 	struct assign_region batch[ASSIGN_SECTIONS];
 	uint64_t bytes = ((uint64_t)buffer->size + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
 	unsigned filled = 0;
 
-	if (buffer->memory == 0 || !adreno8_secure_preflight() || !adreno8_assign_open()) {
-		return false;
-	}
 	for (uint64_t at = 0; at < bytes; ) {
 		uint64_t phys = kvtophys(buffer->memory + at), run = PAGE_SIZE;
 
@@ -190,8 +194,10 @@ adreno8_secure_data(const struct adreno8_memory *buffer)
 	return true;
 }
 
-bool
-adreno8_secure_page_tables(struct adreno8_gpu_space *space)
+/* Assign page-table pages past the cursor to {HLOS read/write, CP_PIXEL read}.
+ * The caller opened the argument page; committing the cursor is the caller's. */
+static bool
+adreno8_assign_tables(struct adreno8_gpu_space *space)
 {
 	struct assign_perm perms[] = {
 		{ VMID_HLOS, PERM_READ | PERM_WRITE, 0, 0, 0 },
@@ -200,12 +206,9 @@ adreno8_secure_page_tables(struct adreno8_gpu_space *space)
 	struct assign_region batch[ASSIGN_SECTIONS];
 	unsigned filled = 0;
 
-	if (!adreno8_secure_preflight() || !adreno8_assign_open()) {
-		return false;
-	}
 	for (unsigned i = space->secure_tables; i < space->table_count; i++) {
 		if (space->tables[i].table == 0 || space->tables[i].phys == 0) {
-			/* Same conservative rule as adreno8_secure_data: an unproven page ends
+			/* Same conservative rule as adreno8_assign_data: an unproven page ends
 			 * the secure path for the boot and every table page stays reserved. */
 			adreno8_assign.lost = true;
 			printf("adreno8: secure pages retained until cold reset\n");
@@ -224,6 +227,117 @@ adreno8_secure_page_tables(struct adreno8_gpu_space *space)
 	if (filled != 0 && !adreno8_assign_flush(batch, filled, perms, 2)) {
 		return false;
 	}
+	return true;
+}
+
+bool
+adreno8_secure_data(const struct adreno8_memory *buffer)
+{
+	if (buffer->memory == 0 || !adreno8_secure_preflight() || !adreno8_assign_open()) {
+		return false;
+	}
+	return adreno8_assign_data(buffer);
+}
+
+bool
+adreno8_secure_page_tables(struct adreno8_gpu_space *space)
+{
+	if (!adreno8_secure_preflight() || !adreno8_assign_open()) {
+		return false;
+	}
+	if (!adreno8_assign_tables(space)) {
+		return false;
+	}
 	space->secure_tables = space->table_count;
+	return true;
+}
+
+/* Count the data pages and merge runs into region entries without staging, so
+ * an experiment can print its batch plan before any MP_ASSIGN. The counts come
+ * from the real PAGE_SIZE and the merge rule adreno8_assign_data uses. */
+static bool
+adreno8_assign_plan(const struct adreno8_memory *buffer, unsigned *pages, unsigned *regions)
+{
+	uint64_t bytes = ((uint64_t)buffer->size + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
+
+	*pages = 0;
+	*regions = 0;
+	for (uint64_t at = 0; at < bytes; ) {
+		uint64_t phys = kvtophys(buffer->memory + at), run = PAGE_SIZE;
+
+		if (phys == 0 || (phys & PAGE_MASK)) {
+			printf("adreno8: secure page %#llx unusable for MP_ASSIGN\n", phys);
+			return false;
+		}
+		while (at + run < bytes && kvtophys(buffer->memory + at + run) == phys + run) {
+			run += PAGE_SIZE;
+		}
+		*pages += (unsigned)(run / PAGE_SIZE);
+		*regions += 1;
+		at += run;
+	}
+	return true;
+}
+
+/*
+ * Isolated handover experiment state. The boot-args mode gates entry; this
+ * state makes the attempt one-shot and terminal. Not started allows one handover;
+ * attempted is set before any MP_ASSIGN goes out so a repeated request cannot
+ * start a second one; terminal closes the path for the rest of the boot whether
+ * the handover succeeded or failed.
+ */
+static uint32_t adreno8_xfer_state;
+
+uint32_t
+adreno8_secure_xfer_state(void)
+{
+	return adreno8_xfer_state;
+}
+
+/* Close the experiment when the driver cannot reach the first MP_ASSIGN (no
+ * usable page, no argument page). Nothing was transferred, so no page is
+ * marked lost; the state still ends the secure path for this boot. */
+void
+adreno8_secure_xfer_abort(void)
+{
+	adreno8_xfer_state = SECURE_XFER_TERMINAL;
+	printf("adreno8: secure handover ends before any MP_ASSIGN; no page transferred\n");
+}
+
+/*
+ * One isolated handover of this kernel's own kind-5 buffer: assign the secure
+ * page-table pages, then the data pages, and stop. The caller runs
+ * adreno8_secure_preflight first; this function is reached only from that one
+ * kernel call site. No MEM_ALLOC reply, no CB3 enable, no CB0 mapping and no
+ * address reaches the firmware. Whatever the outcome, the attempt is terminal
+ * and the pages stay retained; a success keeps them with the secure owner
+ * rather than marking them lost. This does not prove the secure bridge can
+ * hand memory back, a path the earlier park and PSCI checks never exercised.
+ */
+bool
+adreno8_secure_xfer(struct adreno8_gpu_space *space, const struct adreno8_memory *buffer)
+{
+	unsigned pages, regions, batches;
+
+	if (adreno8_xfer_state != SECURE_XFER_NOT_STARTED || buffer->memory == 0) {
+		return false;
+	}
+	if (!adreno8_assign_plan(buffer, &pages, &regions) || !adreno8_assign_open()) {
+		adreno8_secure_xfer_abort();
+		return false;
+	}
+	adreno8_xfer_state = SECURE_XFER_ATTEMPTED;
+	batches = (regions + ASSIGN_SECTIONS - 1) / ASSIGN_SECTIONS +
+	    (space->table_count - space->secure_tables + ASSIGN_SECTIONS - 1) / ASSIGN_SECTIONS;
+	printf("adreno8: secure handover attempted: %u pages merge into %u data regions plus %u table pages, %u MP_ASSIGN calls\n",
+	    pages, regions, space->table_count - space->secure_tables, batches);
+	if (!adreno8_assign_tables(space) || !adreno8_assign_data(buffer)) {
+		adreno8_xfer_state = SECURE_XFER_TERMINAL;
+		return false;
+	}
+	space->secure_tables = space->table_count;
+	adreno8_xfer_state = SECURE_XFER_TERMINAL;
+	printf("adreno8: secure handover complete: %u pages owned by CP_PIXEL, retained until cold reset; no MEM_ALLOC reply\n",
+	    pages);
 	return true;
 }

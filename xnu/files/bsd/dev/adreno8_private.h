@@ -203,6 +203,7 @@ struct adreno8_gpu_space {
 #define SMMU_CB_TLBSYNC         0x7f0
 #define SMMU_CB_TLBSTATUS       0x7f4           /* bit 0: a sync is still on its way */
 #define SCTLR_ON                (1u | 2u | 4u | 32u) /* M, TRE, AFE and CFRE; faults are polled; ASIDPNE hint disabled */
+#define SCTLR_M                 1u              /* CB SCTLR bit 0: stage-1 translation on; the secure preflight reads only this bit of context 3 */
 #define TCR_39_BITS             (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)     /* 39 bits, three levels (dt: qcom,use-3-lvl-tables) */
 #define TCR2_39_BITS            (1u | 1u << 4 | 7u << 15) /* 36-bit PA, 16-bit ASID, upstream separation */
 #define MAIR0_NORMAL            0xf404ff44
@@ -269,7 +270,10 @@ extern struct adreno8_gpu_space adreno8_secure_space;
 extern bool adreno8_gpu8_keep;
 extern bool adreno8_reset_required;
 extern bool adreno8_gpu8_return;
-extern bool adreno8_gpu8_secure_preflight; /* boot-args adreno8_secure_preflight=1: stop kind-5 handling after the read-only preflight */
+extern uint32_t adreno8_gpu8_secure_mode; /* boot-args adreno8_secure_preflight=N: 0 off, 1 read-only preflight only, 2 isolated handover experiment; unknown values parse to 0 */
+#define SECURE_MODE_OFF          0u
+#define SECURE_MODE_PREFLIGHT    1u            /* answer kind 5 with the read-only preflight only, no MP_ASSIGN and no reply */
+#define SECURE_MODE_HANDOVER     2u            /* isolated experiment: one handover of the kernel's own pages, terminal afterwards, no reply and no CB3 write */
 extern bool adreno8_secure_execute;         /* production MP_ASSIGN path; stays 0 until the secure translation implementation review passes */
 bool adreno8_memory_retained(void);
 

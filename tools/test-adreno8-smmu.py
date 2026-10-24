@@ -28,6 +28,7 @@ driver, replaced = re.subn(
 assert replaced == 1
 stub = r'''
 #include <assert.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -44,10 +45,21 @@ typedef size_t vm_size_t;
 static int kernel_map;
 static unsigned adreno8_step;
 ''' + structures + "\n" + constants + r'''
-static int adreno8_say(const char *s, ...) { return 0; }
+/* The driver's printf is adreno8_say; the real one reaches the console, so
+ * the stub forwards to stdout and the runner can check message order. */
+static int adreno8_say(const char *s, ...) {
+    va_list ap;
+    int n;
+    va_start(ap, s);
+    n = vprintf(s, ap);
+    va_end(ap);
+    return n;
+}
 static void adreno8_announce(const char *s, ...) {}
 static void adreno8_settle(void) {}
 static bool adreno8_cx_ready(void) { return true; }
+static uint64_t mach_absolute_time(void) { return 0x1234abcdull; }
+static void absolutetime_to_nanoseconds(uint64_t time, uint64_t *ns) { *ns = time; }
 static void adreno8_space_off(struct adreno8_gpu_space *, uint32_t);
 static bool adreno8_space_faulted(struct adreno8_gpu_space *);
 static uint32_t regs[0x40000 / 4];
@@ -459,13 +471,31 @@ int main(void) {
     assert(reads[SMMU_SMR(2) / 4] == 1 && reads[SMMU_SMR(23) / 4] == 1);
     assert(reads[SMMU_S2CR(2) / 4] == 0);
     /* The device-read CB3 SCTLR 0x96cc51a is nonzero with the enable bit
-     * clear; strict preflight rejects any nonzero reading. */
+     * clear; strict preflight rejects any nonzero reading and still samples
+     * the whole probed SMR range at that moment (one read each, no S2CR
+     * read without a valid SMR), so the routing picture is on the log. */
     const uint32_t cb3_leftovers[] = {1u, 0x96cc51au};
     for (unsigned i = 0; i < 2; i++) {
         reset(&space, false);
         regs[(0x23000 + SMMU_CB_SCTLR) / 4] = cb3_leftovers[i];
         assert(!adreno8_secure_preflight() && writes == 0);
+        assert(reads[(0x23000 + SMMU_CB_SCTLR) / 4] == 1);
+        assert(reads[SMMU_SMR(0) / 4] == 1 && reads[SMMU_SMR(23) / 4] == 1);
+        assert(reads[SMMU_SMR(2) / 4] == 1 && reads[SMMU_S2CR(2) / 4] == 0);
     }
+    /* A conflict visible while SCTLR rejects: the candidate slot taken and
+     * a route into CB3 are sampled too; the scan reaches the last match
+     * with each register read once, and the SCTLR verdict still stands. */
+    reset(&space, false);
+    regs[(0x23000 + SMMU_CB_SCTLR) / 4] = 0x96cc51au;
+    regs[SMMU_SMR(2) / 4] = 0x80000002;
+    regs[SMMU_S2CR(2) / 4] = 3u;
+    regs[SMMU_SMR(5) / 4] = 0x80020000;
+    regs[SMMU_S2CR(5) / 4] = 0x10003u;
+    assert(!adreno8_secure_preflight() && writes == 0);
+    assert(reads[SMMU_SMR(2) / 4] == 1 && reads[SMMU_S2CR(2) / 4] == 1);
+    assert(reads[SMMU_SMR(23) / 4] == 1);
+    assert(reads[SMMU_SMR(5) / 4] == 1 && reads[SMMU_S2CR(5) / 4] == 1);
     reset(&space, false);
     regs[SMMU_SMR(2) / 4] = 0x80000002;
     regs[SMMU_S2CR(2) / 4] = 3u;
@@ -540,5 +570,18 @@ if __name__ == "__main__":
             binary = target / f"check-{page_size}"
             subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}", "-fsanitize=address,undefined",
                             "-fno-omit-frame-pointer", str(target / "check.c"), "-o", str(binary)], check=True)
-            subprocess.run([str(binary)], check=True)
+            result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+            lines = result.stdout.splitlines()
+            rejects = [i for i, l in enumerate(lines) if "is nonzero; the context bank fails the preflight" in l]
+            stands = [i for i, l in enumerate(lines) if "the SCTLR rejection stands" in l]
+            hits = [i for i, l in enumerate(lines) if "sits on the candidate route or context" in l]
+            # Three SCTLR-nonzero scenarios; each keeps its rejection line
+            # first, samples between, and closes with exactly one summary.
+            assert len(rejects) == 3 and len(stands) == 3, (len(rejects), len(stands))
+            for r, s in zip(rejects, stands):
+                assert r < s and not [t for t in rejects if r < t < s]
+            assert len(hits) == 2 and rejects[2] < min(hits) and max(hits) < stands[2]
+            for l in lines:
+                if "preflight" in l:
+                    print(l)
             print(f"XNU PAGE_SIZE={page_size}: PASS")

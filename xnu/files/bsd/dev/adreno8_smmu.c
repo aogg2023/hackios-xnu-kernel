@@ -417,8 +417,38 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
 		sctlr = adreno8_get(&adreno8_smmu, "cb preflight",
 		    (adreno8_smmu_pages + space->context) * adreno8_smmu_page + SMMU_CB_SCTLR);
 		if (sctlr != 0) {
+			uint64_t now = mach_absolute_time(), ns;
+			unsigned live = 0, hits = 0;
+
 			printf("adreno8: %u: secure preflight: context %u SCTLR %#x is nonzero; the context bank fails the preflight\n",
 			    adreno8_step, space->context, sctlr);
+			/*
+			 * Same-moment routing sample: one read-only pass over the
+			 * probed SMR/S2CR range, no writes; the step number and the
+			 * monotonic nanoseconds tag when it was taken. The SCTLR
+			 * verdict already stands; a clean scan keeps the rejection
+			 * and a conflicting scan adds no new reason.
+			 */
+			absolutetime_to_nanoseconds(now, &ns);
+			for (unsigned i = 0; i < adreno8_smmu_matches; i++) {
+				uint32_t smr = adreno8_get(&adreno8_smmu, "smr sample", SMMU_SMR(i));
+				uint32_t s2cr, mask;
+
+				if (!(smr & SMR_VALID)) {
+					continue;
+				}
+				s2cr = adreno8_get(&adreno8_smmu, "s2cr sample", SMMU_S2CR(i));
+				mask = (smr >> 16 & 0x7fff) | SMR_MASK;
+				live++;
+				if (i == match || ((smr ^ stream) & 0x7fff & ~mask) == 0 ||
+				    (s2cr & 0xff) == space->context) {
+					hits++;
+					printf("adreno8: %u: preflight routing sample: match %u smr %#x s2cr %#x sits on the candidate route or context %u\n",
+					    adreno8_step, i, smr, s2cr, space->context);
+				}
+			}
+			printf("adreno8: %u: preflight routing sample at t=%lluns: %u valid match(es), %u on the candidate route or context; the SCTLR rejection stands\n",
+			    adreno8_step, ns, live, hits, space->context);
 			return false;
 		}
 	}
@@ -456,8 +486,11 @@ adreno8_space_available(struct adreno8_gpu_space *space, uint32_t stream, uint32
  * the scan only touches the SMR/S2CR and context-bank registers the boot
  * probe already reads. A non-zero context SCTLR, a valid SMR on the
  * candidate slot or covering stream 2, and an S2CR of any type pointing at
- * context 3 each fail the check. A pass means HLOS-side registers show
- * context 3 and the candidate slot free of routing; it does not confirm
+ * context 3 each fail the check. When a non-zero context SCTLR fails the
+ * check, the pass still samples the probed SMR/S2CR range once at that
+ * moment and prints what routes where; the sample never changes the
+ * verdict. A pass means HLOS-side registers show context 3 and the
+ * candidate slot free of routing; it does not confirm
  * what the secure world has reserved, and it never writes.
  */
 bool

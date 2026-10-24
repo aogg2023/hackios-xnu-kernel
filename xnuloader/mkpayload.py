@@ -30,6 +30,8 @@ ap.add_argument('--require-cmd', action='append', default=[], metavar='TOKEN',
                 help='refuse to build unless the cmdline carries this exact token')
 ap.add_argument('--forbid-cmd', action='append', default=[], metavar='PREFIX',
                 help='refuse to build if the cmdline carries a token with this prefix')
+ap.add_argument('--exact-cmd', default='', metavar='CMDLINE',
+                help='refuse to build unless the cmdline is the approved string; only the epoch value may differ')
 ap.add_argument('items', nargs='*')
 args = ap.parse_args()
 
@@ -52,6 +54,26 @@ for bad in args.forbid_cmd:
     hit = [t for t in tokens if t == bad or t.startswith(bad + '=')]
     if hit:
         sys.exit(f'forbid-cmd: cmdline carries {hit[0]}')
+if args.exact_cmd:
+    def norm(ts):
+        keep, epoch = [], None
+        for t in ts:
+            if t.startswith('epoch='):
+                if epoch is not None:
+                    sys.exit(f'exact-cmd: duplicate token {t}')
+                epoch = t
+            else:
+                keep.append(t)
+        return keep, epoch
+    want, wepoch = norm(args.exact_cmd.split())
+    got, gepoch = norm(tokens)
+    if wepoch is None or gepoch is None:
+        sys.exit('exact-cmd: both the approved string and the cmdline need one epoch token')
+    if sorted(got) != sorted(want):
+        extra = sorted(set(got) - set(want))
+        missing = sorted(set(want) - set(got))
+        dup = sorted({t for t in got if got.count(t) > want.count(t)})
+        sys.exit(f'exact-cmd: extra={extra} missing={missing} duplicate={dup}')
 
 body = b''
 def add(name, data):

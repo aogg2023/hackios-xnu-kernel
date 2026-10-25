@@ -46,7 +46,6 @@
 #define CMD_REG(reg)            (((uint32_t)(reg) & 0xff) << 4)
 #define OPC_EXT_WRITEL          0                       /* eight bytes */
 #define OPC_EXT_READL           1                       /* ... read */
-#define OPC_EXT_WRITE           2                       /* four bytes */
 #define OPC_EXT_READ            13                      /* ... read */
 #define TRANSACT_TIMEOUT_US     2000
 

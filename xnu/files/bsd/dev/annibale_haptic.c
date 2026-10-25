@@ -241,7 +241,8 @@ spmi_write16(uint16_t ppid, uint16_t addr, const uint8_t *bytes, uint32_t count)
 	if (count > 4) {
 		wr(channel + CH_WDATA1, w1);
 	}
-	wr(channel + CH_CMD, CMD_OPC(count > 4 ? OPC_EXT_WRITEL : OPC_EXT_WRITE) | CMD_REG(addr & 0xff) | (count - 1));
+	/* Extended Register Write Long for every write: the short form left annibale_torch.c's register unchanged */
+	wr(channel + CH_CMD, CMD_OPC(OPC_EXT_WRITEL) | CMD_REG(addr & 0xff) | (count - 1));
 	do {
 		status = rd(channel + CH_STATUS);
 		now = mach_absolute_time();

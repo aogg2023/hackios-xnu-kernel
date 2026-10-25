@@ -21,6 +21,7 @@ typedef uintptr_t vm_offset_t;
 struct adreno8_block { const char *name; uint32_t phys, size; vm_offset_t base; };
 #define RPMH_LEVELS 64
 static bool adreno8_reset_required;
+static uint32_t adreno8_gmu_from_pll;
 static bool PE_parse_boot_argn(const char *, void *, unsigned);
 static uint32_t adreno8_get(struct adreno8_block *, const char *, uint32_t);
 static void adreno8_put(struct adreno8_block *, const char *, uint32_t, uint32_t);
@@ -36,7 +37,7 @@ HARNESS = r'''
 #undef printf
 static uint32_t regs[0x10000 / 4], before[0x10000 / 4];
 static unsigned scenario, fail_at, reads, writes, polls, transaction_polls, sleeps, responses, triggers, lookups;
-static bool flag_present = true, touch_present = true, triggered, done;
+static bool flag_present = true, touch_present = true, triggered, done, poisoned_poll;
 static uint32_t flag = 1, touch, cx_address = 0x30000, level_count = 11, response_value = 3;
 static uint32_t mx_address = 0x30004, mx_level_count = 9, mx_response_value = 5;
 static uint32_t initial_control = ARC_AMC_ENABLE, initial_irq = 1;
@@ -71,8 +72,12 @@ static uint32_t adreno8_rpmh_lookup(const char *name, uint16_t *levels, unsigned
     return lookups == 1 ? cx_address : mx_address;
 }
 static uint32_t adreno8_get(struct adreno8_block *b, const char *name, uint32_t off) {
+    assert(!poisoned_poll);
     assert(b->phys == 0x16520000 && b->size == 0x10000 && off < b->size && !(off & 3));
     b->base = 0x100000; reads++;
+    if ((scenario == 56 && !strcmp(name, "irq enable before restore")) ||
+        (scenario == 57 && !strcmp(name, "irq status after request")) ||
+        (scenario == 58 && off == ARC_COMMAND_STATUS)) return UINT32_MAX;
     if ((scenario == 27 || (scenario == 47 && lookups == 2)) &&
         !strcmp(name, "irq enable before request"))
         regs[ARC_IRQ_ENABLE / 4] |= 1u << 5;
@@ -87,7 +92,7 @@ static uint32_t adreno8_get(struct adreno8_block *b, const char *name, uint32_t 
 }
 static void adreno8_put(struct adreno8_block *b, const char *name, uint32_t off, uint32_t value) {
     (void)name;
-    assert(adreno8_reset_required && b->phys == 0x16520000);
+    assert(!poisoned_poll && adreno8_reset_required && b->phys == 0x16520000);
     assert(off == ARC_CONTROL || off == ARC_ENABLE || off == ARC_MSGID ||
            off == ARC_ADDRESS || off == ARC_IRQ_ENABLE || off == ARC_IRQ_CLEAR);
     writes++;
@@ -114,6 +119,7 @@ static void adreno8_put(struct adreno8_block *b, const char *name, uint32_t off,
 static uint32_t adreno8_rd(vm_offset_t address) {
     assert(address == 0x100000 + ARC_IRQ_STATUS && triggered);
     reads++; polls++; transaction_polls++;
+    if (scenario == 59) { poisoned_poll=true; return UINT32_MAX; }
     if (transaction_polls == 3 && scenario != 23 && !(scenario == 43 && lookups == 2)) {
         done = true;
         regs[ARC_IRQ_STATUS / 4] |= ARC_TCS_BIT | 2;
@@ -192,6 +198,7 @@ int main(int argc, char **argv) {
             assert(writes == 14 && triggers == 1 && responses == 1 && lookups == 2 && adreno8_reset_required);
         else if (scenario == 47) assert(writes == 19 && triggers == 1 && responses == 1 && adreno8_reset_required);
         else if (scenario == 48) assert(writes == 26 && triggers == 2 && responses == 2 && adreno8_reset_required);
+        else if (scenario == 56) assert(writes == 13 && triggers == 1 && responses == 1 && lookups == 1);
         else if (scenario >= 43 && scenario <= 49)
             assert(writes == 22 && triggers == 2 && lookups == 2 && adreno8_reset_required);
         else if (scenario == 27) assert(writes == 5 && !triggers && adreno8_reset_required);
@@ -201,6 +208,8 @@ int main(int argc, char **argv) {
         if (scenario == 24 || scenario == 25) assert(!responses);
         if (scenario == 43) assert(polls == 100003 && sleeps == 100002 && responses == 1);
         if (scenario == 44 || scenario == 45) assert(responses == 1);
+        if (scenario >= 57) assert(writes == 8 && triggers == 1 && !responses && lookups == 1);
+        if (scenario == 59) assert(polls == 1 && !sleeps && !done);
         if (scenario >= 20 && scenario <= 30 && !success) assert(lookups == 1);
     }
     assert(regs[0x127c / 4] == 0xdeadbeef);
@@ -233,27 +242,27 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mutations", action="store_true")
     args = parser.parse_args()
-    scenarios = [(s,) for s in range(56) if s not in (31, 32)]
+    scenarios = [(s,) for s in range(60) if s not in (31, 32)]
     scenarios += [(20, n) for n in range(1, 29) if n not in (8, 12, 22, 26)]
     with tempfile.TemporaryDirectory(prefix="adreno8-arc-read-") as directory:
         directory = Path(directory)
         run(PRODUCTION, directory, scenarios)
         if args.mutations:
             mutations = [
-                ("resource_write", "ARC_MSGID, 0x108", "ARC_MSGID, 0x10108", (20,)),
+                ("resource_write", "write ? 0x10108u : 0x108u", "write ? 0x10108u : 0x10108u", (20,)),
                 ("command_data_write", "ARC_ADDRESS, address)", "0x127cu, address)", (20,)),
                 ("missing_reset", "adreno8_reset_required = true;", "adreno8_reset_required = false;", (20,)),
-                ("repeat_allowed", "asked != 1 || arc_attempted", "asked != 1 || false", (20,)),
+                ("repeat_allowed", "asked != 1 || arc_state != ARC_COLD", "asked != 1 || false", (20,)),
                 ("touch_implicit_zero", '!PE_parse_boot_argn("touchscreen", &touch, sizeof(touch)) || touch != 0',
                  'PE_parse_boot_argn("touchscreen", &touch, sizeof(touch)) && touch != 0', (4,)),
-                ("unknown_parameter", "asked != 1 || arc_attempted", "asked == 0 || arc_attempted", (2,)),
+                ("unknown_parameter", "asked != 1 || arc_state != ARC_COLD", "asked == 0 || arc_state != ARC_COLD", (2,)),
                 ("response_from_data", 'arc_read("TCS2 ARC response", ARC_RESPONSE)',
                  'arc_read("TCS2 ARC response", 0x127c)', (20,)),
-                ("timeout_cleanup", 'printf("adreno8: ARC read completion unconfirmed;',
-                 'arc_write("premature clear", ARC_ENABLE, 0); printf("adreno8: ARC read completion unconfirmed;', (23,)),
+                ("timeout_cleanup", 'printf("adreno8: ARC transaction completion unconfirmed;',
+                 'arc_write("premature clear", ARC_ENABLE, 0); printf("adreno8: ARC transaction completion unconfirmed;', (23,)),
                 ("irq_snapshot_restore", "irq & ~(ARC_TCS_BIT & ~irq_before)", "irq_before", (28,)),
                 ("clear_peer_irq", "ARC_IRQ_CLEAR, ARC_TCS_BIT", "ARC_IRQ_CLEAR, 0xffffffffu", (20,)),
-                ("incomplete_command", '(arc_read("TCS2 command status", ARC_COMMAND_STATUS) & ARC_COMMAND_DONE) != ARC_COMMAND_DONE',
+                ("incomplete_command", '(command & ARC_COMMAND_DONE) != ARC_COMMAND_DONE',
                  "false", (24,)),
                 ("other_tcs_busy", 'arc_read("TCS0 status", 0xd28) != 1', "false", (35,)),
                 ("skip_register_verify", "if (arc_read(name, offset) == value)", "if (true)", (20, 3)),
@@ -262,9 +271,9 @@ def main():
                 ("restore_trigger", '"TCS2 restore initial control", ARC_CONTROL, control)',
                  '"TCS2 restore initial control", ARC_CONTROL, control | ARC_AMC_TRIGGER)', (20,)),
                 ("stale_irq", '(arc_read("irq status", ARC_IRQ_STATUS) & ARC_TCS_BIT) != 0', "false", (13,)),
-                ("read_mx_after_cx_failure", 'arc_resource_read("cx.lvl") && arc_resource_read("mx.lvl")',
-                 '(unsigned)arc_resource_read("cx.lvl") & (unsigned)arc_resource_read("mx.lvl")', (23,)),
-                ("skip_mx", '&& arc_resource_read("mx.lvl")', '&& true', (20,)),
+                ("read_mx_after_cx_failure", '!arc_resource_read("cx.lvl", &vote) || !arc_resource_read("mx.lvl", &vote)',
+                 '(unsigned)!arc_resource_read("cx.lvl", &vote) | (unsigned)!arc_resource_read("mx.lvl", &vote)', (23,)),
+                ("skip_mx", '|| !arc_resource_read("mx.lvl", &vote)', '|| false', (20,)),
             ]
             for name, old, new, scenario in mutations:
                 assert PRODUCTION.count(old) == 1, name

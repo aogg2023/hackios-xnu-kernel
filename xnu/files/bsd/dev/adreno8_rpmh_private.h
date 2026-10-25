@@ -1,4 +1,4 @@
-/* Sequential CX/MX ARC diagnostic for the observed Apps RSC DRV2 v3.8. */
+/* Apps RSC DRV2 v3.8 ARC diagnostics and ACTIVE clock votes. */
 #ifndef _DEV_ADRENO8_RPMH_PRIVATE_H
 #define _DEV_ADRENO8_RPMH_PRIVATE_H
 #include "adreno8_private.h"
@@ -7,5 +7,10 @@
  * after CX completes and TCS2 is restored. Failure stops subsequent requests;
  * every write requires a cold reset before kernel memory can be reused. */
 bool adreno8_rpmh_arc_read(void);
+
+/* gmuclk=1 requires explicit touchscreen/wfi/wfe_mode=0 and empty sleep/wake/fast
+ * TCSes. Read this boot's CX/MX votes, retain max(inherited, level 128), confirm
+ * each ACTIVE vote before clocks start, and keep it until cold reset. Once only. */
+bool adreno8_rpmh_clock_prepare(void);
 
 #endif

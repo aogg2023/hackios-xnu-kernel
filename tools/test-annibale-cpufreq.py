@@ -31,7 +31,7 @@ typedef struct { unsigned int num_cpus; ml_topology_cpu_t cpus[2]; } ml_topology
 #define __builtin_arm_dsb(kind) ((void)0)
 
 static uint32_t shmem[0x80], doorbell[0xc0], tsens[3][0x80];
-static uint32_t version = 0x40000, levels = 20, batch = 8, boot_level = 1200000;
+static uint32_t version = 0x40000, levels = 20, batch = 8, boot_level = 2, sustained = 17, indexing = 1;
 static uint32_t level[2], sets, set_domain[16], set_level[16], deny_set, never_free;
 static uint32_t mode, membench, threads, seconds, stop_after, benches;
 static int32_t schedule[64];            /* cluster 1 temperature for each second, tenths; < -1000: invalid */
@@ -90,22 +90,25 @@ static void firmware(void)
     case 0x0: out[0] = version; words = 1; break;
     case 0x1: out[0] = 2; words = 4; break;
     case 0x3:
-        out[0] = (1u << 31) | (1u << 30); out[1] = 1000; out[2] = 3000000; out[3] = 3000000;
+        out[0] = 0x6a000000 & (indexing ? ~0u : ~(1u << 25)); out[1] = 0; out[2] = 3100000; out[3] = sustained;
         memcpy(&out[4], in[0] ? "cpu6\0\0\0\0\0\0\0\0\0\0\0\0" : "cpu0\0\0\0\0\0\0\0\0\0\0\0\0", 16);
         words = 8; break;
     case 0x4: {
         uint32_t entry = version >= 0x40000 ? 5 : 3, first = in[1], n = MIN(batch, levels - first);
         out[0] = n | (levels - first - n) << 16;
         for (uint32_t i = 0; i < n; i++) {
-            out[1 + i * entry] = 300000 + (first + i) * 200000;     /* the top: 4100000 */
+            out[1 + i * entry] = 300000 + (first + i) * 200000;     /* the top of 20: 4100000 */
             out[2 + i * entry] = 7;
-            if (entry == 5) out[4 + i * entry] = 0xffffffff;        /* (not a level: must not be read as one) */
+            if (entry == 5) { out[4 + i * entry] = out[1 + i * entry]; out[5 + i * entry] = first + i; }
         }
         words = 1 + n * entry; break;
     }
     case 0x6: out[0] = 4100000; out[1] = 300000; words = 2; break;
     case 0x7:
         if (deny_set) { status = -3; break; }
+        if (indexing ? in[1] >= levels : (in[1] < 300000 || (in[1] - 300000) % 200000 || (in[1] - 300000) / 200000 >= levels)) {
+            status = -2; break;                                     /* (a value where an index is wanted, or no level) */
+        }
         set_domain[sets] = in[0]; set_level[sets++] = in[1]; level[in[0]] = in[1]; break;
     case 0x8: out[0] = level[in[0]]; words = 1; break;
     default: status = -1;
@@ -132,7 +135,7 @@ static void reset(uint32_t m)
     shmem[1] = 1;
     level[0] = level[1] = boot_level;
     sets = deny_set = never_free = seconds = threads = benches = membench = 0;
-    version = 0x40000; levels = 20; batch = 8;
+    version = 0x40000; levels = 20; batch = 8; sustained = 17; indexing = 1;
     mode = m;
     memset(perf_domain, 0, sizeof(perf_domain));
     for (unsigned g = 0; g < 3; g++) set_temperature(g, 400);
@@ -152,7 +155,7 @@ int main(void)
     /* only reports: nothing is set, the watch runs without control */
     reset(2);
     annibale_cpufreq();
-    assert(sets == 0 && threads == 1 && thread_arg == NULL && perf_domain[1].top == 4100000 && perf_domain[1].boot_level == boot_level);
+    assert(sets == 0 && threads == 1 && thread_arg == NULL && perf_domain[1].top == 17 && perf_domain[1].boot_level == boot_level);
     assert(perf_domain[1].ours && !perf_domain[0].ours);
     for (unsigned i = 0; i < 64; i++) schedule[i] = 990;
     run_thread(40);
@@ -161,13 +164,13 @@ int main(void)
     /* raised at boot when cool, only the cluster with our cores */
     reset(1);
     annibale_cpufreq();
-    assert(sets == 1 && set_domain[0] == 1 && set_level[0] == 4100000 && perf_domain[1].raised && thread_arg != NULL);
+    assert(sets == 1 && set_domain[0] == 1 && set_level[0] == 17 && perf_domain[1].raised && thread_arg != NULL);
 
     /* hot: back to the boot loader's level; 92 C: stays there; below 90 C: up again */
     for (unsigned i = 0; i < 64; i++) schedule[i] = 600;
     schedule[3] = 950; schedule[4] = 920; schedule[5] = 905; schedule[6] = 899;
     run_thread(8);
-    assert(sets == 3 && set_level[1] == boot_level && set_level[2] == 4100000 && perf_domain[1].raised);
+    assert(sets == 3 && set_level[1] == boot_level && set_level[2] == 17 && perf_domain[1].raised);
 
     /* no valid reading while raised: down, and not up again without one */
     reset(1);
@@ -183,7 +186,13 @@ int main(void)
     assert(sets == 0);
     for (unsigned i = 0; i < 64; i++) schedule[i] = i < 3 ? 930 : 700;
     run_thread(4);
-    assert(sets == 1 && set_level[0] == 4100000);
+    assert(sets == 1 && set_level[0] == 17);
+
+    /* a sustained level that is not among those described: the top one */
+    reset(1);
+    sustained = 99;
+    annibale_cpufreq();
+    assert(sets == 1 && set_level[0] == 19);
 
     /* a refused request is not repeated every second */
     reset(1);
@@ -194,17 +203,27 @@ int main(void)
     run_thread(10);
     assert(sets == 0);
 
-    /* SCMI 3.x levels (three words each), one per answer */
+    /* SCMI 3.x levels (three words each, by value), one per answer; the sustained one among them, then not */
     reset(1);
-    version = 0x30000; batch = 1; levels = 5;
+    version = 0x30000; batch = 1; indexing = 0; sustained = 3100000; level[1] = 1100000;
+    annibale_cpufreq();
+    assert(sets == 1 && set_level[0] == 3100000 && perf_domain[1].boot_level == 1100000);
+    reset(1);
+    version = 0x30000; batch = 1; levels = 5; indexing = 0; sustained = 3100000;
     annibale_cpufreq();
     assert(perf_domain[1].top == 300000 + 4 * 200000 && sets == 1 && set_level[0] == 1100000);
+
+    /* 4.0 without level indexing: values */
+    reset(1);
+    indexing = 0; sustained = 3100000;
+    annibale_cpufreq();
+    assert(sets == 1 && set_level[0] == 3100000);
 
     /* a channel that never comes free: no level, no hang */
     reset(1);
     shmem[1] = 0; never_free = 1;
     annibale_cpufreq();
-    assert(sets == 0 && threads == 0 && perf_domain[1].top == 0);
+    assert(sets == 0 && threads == 0 && !perf_domain[1].known);
 
     /* membench=1 still runs the memory test */
     reset(2);

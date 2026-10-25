@@ -102,7 +102,7 @@ int main(int argc, char **argv) {
         assert(!adreno8_gpu_faulted());
         regs[(0x23000 + SMMU_CB_FSR) / 4] = 2;
         assert(adreno8_gpu_faulted());
-        assert(adreno8_memory_entries[0].complete && adreno8_memory_entries[0].terminal);
+        assert(adreno8_memory_entries[0].complete);
         puts("secure translation 3a: enabled context, blocked route, no reply, secure fault included: PASS");
         return 0;
     }
@@ -130,8 +130,7 @@ int main(int argc, char **argv) {
         assert(adreno8_secure_space.table_count == 3 && !adreno8_secure_space.is_on);
         assert(adreno8_secure_space.secure_tables == adreno8_secure_space.table_count);
         struct adreno8_memory *secure = &adreno8_memory_entries[0].buffer;
-        assert(adreno8_memory_entries[0].secure && adreno8_memory_entries[0].complete &&
-               adreno8_memory_entries[0].terminal && secure->memory != 0);
+        assert(adreno8_memory_entries[0].secure && adreno8_memory_entries[0].complete && secure->memory != 0);
         assert(secure->gpu_address >= 0x10000000 && secure->gpu_address < 0xe0000000);
         /* TrustZone reads the buffer from DRAM: a clean over the whole request
          * range must land before the first MP_ASSIGN of this handover. */
@@ -171,7 +170,6 @@ int main(int argc, char **argv) {
         assert(scm_calls == 3 && adreno8_secure_lost() && adreno8_memory_failed);
         assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
         assert(adreno8_memory_retained() && !adreno8_memory_entries[0].complete);
-        assert(adreno8_memory_entries[0].terminal == false);
         unsigned calls_before = scm_calls;
         assert(!adreno8_hwsched_alloc(&request, &again));
         request.kind = 4;
@@ -195,7 +193,7 @@ int main(int argc, char **argv) {
         assert(scm_calls == 0 && !adreno8_secure_lost());
         assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
         assert(adreno8_memory_failed && adreno8_memory_retained());
-        assert(!adreno8_memory_entries[0].complete && !adreno8_memory_entries[0].terminal);
+        assert(!adreno8_memory_entries[0].complete);
         alloc_fail_after = -1;
         unsigned allocations_after = allocation_count;
         assert(!adreno8_hwsched_alloc(&request, &again));
@@ -248,7 +246,7 @@ int main(int argc, char **argv) {
             assert(scm_calls == (pages + ASSIGN_SECTIONS - 1) / ASSIGN_SECTIONS + 1);
             assert(!adreno8_secure_lost() && !adreno8_memory_failed && adreno8_memory_retained());
             assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
-            assert(adreno8_memory_entries[0].complete && adreno8_memory_entries[0].terminal);
+            assert(adreno8_memory_entries[0].complete);
             puts(table_case ? "middle-break table page cannot exist at 4 KiB: handover completes: PASS"
                  : "middle-break data page cannot exist at 4 KiB: handover completes: PASS");
             return 0;
@@ -290,12 +288,11 @@ int main(int argc, char **argv) {
         assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
         if (PAGE_SIZE == 4096) {
             assert(scm_calls == 2 && !adreno8_memory_failed);
-            assert(adreno8_memory_entries[0].secure && adreno8_memory_entries[0].complete &&
-                   adreno8_memory_entries[0].terminal);
+            assert(adreno8_memory_entries[0].secure && adreno8_memory_entries[0].complete);
             assert(adreno8_secure_space.secure_tables == adreno8_secure_space.table_count);
         } else {
             assert(scm_calls == 0 && adreno8_memory_failed && adreno8_memory_count == 1);
-            assert(!adreno8_memory_entries[0].complete && !adreno8_memory_entries[0].terminal);
+            assert(!adreno8_memory_entries[0].complete);
             assert(adreno8_secure_space.secure_tables == 0);
         }
         printf("native page span %s the handover through the hwsched chain: PASS\n",
@@ -454,7 +451,7 @@ int main(int argc, char **argv) {
 with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
     target = Path(directory)
     (target / "adreno8_private.h").write_text(stub)
-    for name in ("adreno8_memory_private.h", "adreno8_hwsched_private.h", "adreno8_secure_private.h"):
+    for name in ("adreno8_smmu_private.h", "adreno8_memory_private.h", "adreno8_hwsched_private.h", "adreno8_secure_private.h"):
         (target / name).write_text((ROOT / "xnu/files/bsd/dev" / name).read_text())
     (target / "adreno8_smmu.c").write_text(fixture["driver"])
     (target / "adreno8_memory.c").write_text(driver)

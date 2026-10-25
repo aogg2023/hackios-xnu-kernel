@@ -275,12 +275,12 @@ extern struct adreno8_gpu_space adreno8_secure_space;
 extern bool adreno8_gpu8_keep;
 extern bool adreno8_reset_required;
 extern bool adreno8_gpu8_return;
-extern uint32_t adreno8_gpu8_secure_mode; /* boot-args adreno8_secure_preflight=N: 0 off, 1 read-only preflight only, 2 isolated handover experiment; unknown values parse to 0 */
+extern uint32_t adreno8_gpu8_secure_mode; /* boot-args adreno8_secure_preflight=N; unknown values parse to 0 */
 #define SECURE_MODE_OFF          0u
 #define SECURE_MODE_PREFLIGHT    1u            /* answer kind 5 with the read-only preflight only, no MP_ASSIGN and no reply */
 #define SECURE_MODE_HANDOVER     2u            /* isolated experiment: one handover of the kernel's own pages, terminal afterwards, no reply and no CB3 write */
 #define SECURE_MODE_TRANSLATION_A 3u           /* 3a: context 3 pointed at the handed-over tables and enabled, stream 2 route kept at fault, register read-backs and a clear FSR as the only proof this SMMU offers */
-#define SECURE_MODE_TRANSLATION_B 4u           /* 3b: reserved for the routing switch plus the MEM_ALLOC reply; not implemented in this kernel */
+#define SECURE_MODE_TRANSLATION_B 4u           /* 3b: enable the secure route, then reply to one kind-5 allocation */
 bool adreno8_memory_retained(void);
 
 int
@@ -387,6 +387,8 @@ adreno8_secure_translation_walk(struct adreno8_gpu_space *space, uint32_t iova, 
     uint32_t size, uint32_t prot);
 bool
 adreno8_secure_translation_3a(struct adreno8_gpu_space *space);
+bool
+adreno8_secure_translation_3b(struct adreno8_gpu_space *space);
 bool
 adreno8_step_queues(void);
 bool

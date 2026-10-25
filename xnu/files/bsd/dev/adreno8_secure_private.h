@@ -16,23 +16,24 @@ bool adreno8_secure_lost(void);
  * invisible and translation behavior needs a device run. */
 bool adreno8_secure_preflight(void);
 
-/* One-shot state of the isolated handover experiment. Not started allows one
- * handover; attempted is set before the first MP_ASSIGN leaves the kernel and a
- * single SMC call may never return, so any later request must treat the boot as
- * terminal; terminal stays for the rest of the boot on success and on failure. */
+/* Only one ownership transfer runs per boot. TERMINAL blocks further work;
+ * mode 4 records a successful transfer as ASSIGNED, then advances to READY
+ * after validating the secure translation. A failure closes READY without returning any pages. */
 #define SECURE_XFER_NOT_STARTED 0u
 #define SECURE_XFER_ATTEMPTED   1u
 #define SECURE_XFER_TERMINAL    2u
+#define SECURE_XFER_ASSIGNED    3u
+#define SECURE_XFER_READY       4u
 
 uint32_t adreno8_secure_xfer_state(void);
 
-/* Close the experiment before any MP_ASSIGN goes out: no secure root table
- * page, no free IOVA range, no buffer allocation, no region mapping, no
- * provable data or table page, no argument page. Nothing transferred,
- * so no page is marked lost; the terminal state still ends the secure path for
- * the rest of the boot. The call is inert once an attempt went out: after the
- * first MP_ASSIGN only the transfer result may close the state. */
+/* Before the first MP_ASSIGN, close the attempt without changing page ownership.
+ * After ASSIGNED or READY, close the service while retaining its pages. Other states are
+ * unchanged: this call cannot cancel an in-progress SMC. */
 void adreno8_secure_xfer_abort(void);
+
+/* Called only after mode 4 validates both the context and translate route. */
+bool adreno8_secure_xfer_ready(void);
 
 /* One isolated handover of the kernel's own kind-5 buffer: assign this space's
  * page-table pages, then the buffer's data pages, print the batch plan before

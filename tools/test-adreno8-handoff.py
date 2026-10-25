@@ -228,7 +228,7 @@ int main(int argc, char **argv) {
         boot();
         assert(scm_calls == 2 && scm_sleeps == 0 && adreno8_secure_lost());
         assert(adreno8_memory_failed && adreno8_memory_retained());
-        assert(!adreno8_memory_entries[0].complete && !adreno8_memory_entries[0].terminal);
+        assert(!adreno8_memory_entries[0].complete);
         assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
         request_refused(5, 0x1007);
         puts("data batch failure through the real pump: lost, retained, zero reply: PASS");
@@ -290,7 +290,7 @@ int main(int argc, char **argv) {
     assert(scm_calls == (pages + ASSIGN_SECTIONS - 1) / ASSIGN_SECTIONS + 1);
     assert(scm_sleeps == 0 && !adreno8_secure_lost() && !adreno8_memory_failed);
     assert(adreno8_memory_retained() && adreno8_memory_count == 1);
-    assert(adreno8_memory_entries[0].complete && adreno8_memory_entries[0].terminal);
+    assert(adreno8_memory_entries[0].complete);
     assert(adreno8_memory_entries[0].secure);
     assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
     assert(adreno8_secure_space.table_count == 3 && !adreno8_secure_space.is_on);
@@ -304,100 +304,101 @@ int main(int argc, char **argv) {
 }
 '''
 
-with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
-    target = Path(directory)
-    (target / "adreno8_private.h").write_text(stub)
-    for name in ("adreno8_memory_private.h", "adreno8_hwsched_private.h",
-                 "adreno8_secure_private.h", "adreno8_wire_private.h"):
-        (target / name).write_text((DEV / name).read_text())
-    (target / "adreno8_smmu.c").write_text(fixture["driver"])
-    (target / "adreno8_memory.c").write_text(driver)
-    (target / "adreno8_secure.c").write_text((DEV / "adreno8_secure.c").read_text())
-    (target / "check.c").write_text(
-        'static unsigned invalidations, failure_snapshots;\n'
-        '#include "adreno8_smmu.c"\n#include "adreno8_secure.c"\n#undef printf\n'
-        '#include "adreno8_memory.c"\n#include "adreno8_wire_private.h"\n'
-        '#include "adreno8_hwsched_private.h"\n' + world + transport + "\n" + protocol +
-        "\n#undef printf\n" + setup + tests)
-    for page_size in (4096, 16384):
-        binary = target / f"check-{page_size}"
-        subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}",
-                        "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
-                        str(target / "check.c"), "-o", str(binary)], check=True)
-        for mode in ((), ("off",), ("preflight",), ("batchfail",), ("tablefail",),
-                     ("data2fail",), ("ebusy",), ("argfail",)):
-            result = subprocess.run([str(binary), *mode], check=True,
-                                    capture_output=True, text=True)
-            out = result.stdout
-            assert "START resource request 20 failed (11 words)" in out, (mode, out)
-            if mode == ():
-                pages = 0x138000 // page_size
-                want = (f"{pages} pages merge into {pages} data regions plus 3 table pages, "
-                        f"{(pages + 31) // 32 + 1} logical MP_ASSIGN batches")
-                assert want in out, (want, out)
-                assert "secure handover complete" in out
-                # Every batch header names its role, permissions, shared
-                # argument page, and region count before that batch's call line.
-                assert re.search(
-                    r"MP_ASSIGN plan: batch 0 table, permissions HLOS read/write and "
-                    r"CP_PIXEL read, argument page 0x[0-9a-f]+, 3 regions", out), out
-                assert "MP_ASSIGN plan: batch 0 table, permissions HLOS read/write" in out
-                assert ("MP_ASSIGN plan: batch 1 data, permissions CP_PIXEL read/write" in out)
-                assert out.find("MP_ASSIGN plan:") < out.find("MP_ASSIGN batch 0 table:")
-                # Shared parser: single-pass stream order plus wire
-                # comparison of every region, permission record, and
-                # argument page. The role sequence comes from this scenario
-                # (3 table pages then 32-region data batches), not the log.
-                expected = (pages + 31) // 32 + 1
-                roles = ["table"] + ["data"] * ((pages + 31) // 32)
-                batches, calls, failed = logcheck.check(out, page_size, roles)
-                assert failed is None
-                assert sorted(batches) == list(range(expected)) and len(calls) == expected
-                assert "no MEM_ALLOC reply is built" in out
-                assert "the secure handover experiment ended" in out
-            if mode in (("off",), ("preflight",)):
-                assert "HLOS-side conditions are satisfied at the sample time" in out
-            if mode == ("off",):
-                assert "secure handover off" in out
-            if mode == ("preflight",):
-                assert "secure preflight-only mode: START stops here" in out
-                assert "secure handover attempted" not in out
-            if mode in (("off",), ("preflight",)):
-                assert "scmsnap call" not in out
-            if mode == ("batchfail",):
-                assert "secure handover attempted" in out
-                assert "MP_ASSIGN batch 1 data returned -5, answer 0x5, 2 top-level SCM calls" in out
-                assert "secure allocation failed; retain GPU memory until cold reset" in out
-                batches, calls, failed = logcheck.check(out, page_size,
-                                                        ["table", "data"])
-                assert failed == 1 and sorted(batches) == [0, 1] and len(calls) == 2
-            if mode == ("ebusy",):
-                assert "secure handover attempted" in out
-                assert out.count("returned -12") == 1
-                assert "secure pages retained until cold reset" in out
-                # The 20 EBUSY retries reuse one staged batch: the region log
-                # for batch 0 prints once and all 20 snapshots match it.
-                batches, calls, failed = logcheck.check(out, page_size, ["table"])
-                assert failed == 0 and sorted(batches) == [0] and len(calls) == 20
-                assert len(batches[0]["regions"]) == 3
-            if mode in (("tablefail",), ("data2fail",)):
-                # The parser compares the failed batch's printed regions and
-                # permissions with its snapshot item by item; nothing from a
-                # later batch may appear under any prefix.
-                stop = 0 if mode == ("tablefail",) else 2
-                roles = ["table"] + ["data"] * stop
-                batches, calls, failed = logcheck.check(out, page_size, roles)
-                assert failed == stop and sorted(batches) == list(range(stop + 1))
-                assert len(calls) == stop + 1
-                role = "table" if stop == 0 else "data"
-                assert f"MP_ASSIGN batch {stop} {role} returned -5" in out
-                assert f"MP_ASSIGN batch {stop + 1}" not in out
-                assert f"MP_ASSIGN plan: batch {stop + 1}" not in out
-            if mode == ("argfail",):
-                assert "ends before any MP_ASSIGN; no page transferred" in out
-                assert "MP_ASSIGN batch" not in out
-                assert "MP_ASSIGN plan" not in out
-                assert "scmsnap call" not in out
-            if mode != ("off",) and mode != ("preflight",):
-                assert "the secure handover experiment ended" in out
-        print(f"XNU PAGE_SIZE={page_size}: PASS")
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory(prefix="adreno8-handoff-") as directory:
+        target = Path(directory)
+        (target / "adreno8_private.h").write_text(stub)
+        for name in ("adreno8_smmu_private.h", "adreno8_memory_private.h", "adreno8_hwsched_private.h",
+                     "adreno8_secure_private.h", "adreno8_wire_private.h"):
+            (target / name).write_text((DEV / name).read_text())
+        (target / "adreno8_smmu.c").write_text(fixture["driver"])
+        (target / "adreno8_memory.c").write_text(driver)
+        (target / "adreno8_secure.c").write_text((DEV / "adreno8_secure.c").read_text())
+        (target / "check.c").write_text(
+            'static unsigned invalidations, failure_snapshots;\n'
+            '#include "adreno8_smmu.c"\n#include "adreno8_secure.c"\n#undef printf\n'
+            '#include "adreno8_memory.c"\n#include "adreno8_wire_private.h"\n'
+            '#include "adreno8_hwsched_private.h"\n' + world + transport + "\n" + protocol +
+            "\n#undef printf\n" + setup + tests)
+        for page_size in (4096, 16384):
+            binary = target / f"check-{page_size}"
+            subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}",
+                            "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                            str(target / "check.c"), "-o", str(binary)], check=True)
+            for mode in ((), ("off",), ("preflight",), ("batchfail",), ("tablefail",),
+                         ("data2fail",), ("ebusy",), ("argfail",)):
+                result = subprocess.run([str(binary), *mode], check=True,
+                                        capture_output=True, text=True)
+                out = result.stdout
+                assert "START resource request 20 failed (11 words)" in out, (mode, out)
+                if mode == ():
+                    pages = 0x138000 // page_size
+                    want = (f"{pages} pages merge into {pages} data regions plus 3 table pages, "
+                            f"{(pages + 31) // 32 + 1} logical MP_ASSIGN batches")
+                    assert want in out, (want, out)
+                    assert "secure handover complete" in out
+                    # Every batch header names its role, permissions, shared
+                    # argument page, and region count before that batch's call line.
+                    assert re.search(
+                        r"MP_ASSIGN plan: batch 0 table, permissions HLOS read/write and "
+                        r"CP_PIXEL read, argument page 0x[0-9a-f]+, 3 regions", out), out
+                    assert "MP_ASSIGN plan: batch 0 table, permissions HLOS read/write" in out
+                    assert ("MP_ASSIGN plan: batch 1 data, permissions CP_PIXEL read/write" in out)
+                    assert out.find("MP_ASSIGN plan:") < out.find("MP_ASSIGN batch 0 table:")
+                    # Shared parser: single-pass stream order plus wire
+                    # comparison of every region, permission record, and
+                    # argument page. The role sequence comes from this scenario
+                    # (3 table pages then 32-region data batches), not the log.
+                    expected = (pages + 31) // 32 + 1
+                    roles = ["table"] + ["data"] * ((pages + 31) // 32)
+                    batches, calls, failed = logcheck.check(out, page_size, roles)
+                    assert failed is None
+                    assert sorted(batches) == list(range(expected)) and len(calls) == expected
+                    assert "no MEM_ALLOC reply is built" in out
+                    assert "the secure handover experiment ended" in out
+                if mode in (("off",), ("preflight",)):
+                    assert "HLOS-side conditions are satisfied at the sample time" in out
+                if mode == ("off",):
+                    assert "secure handover off" in out
+                if mode == ("preflight",):
+                    assert "secure preflight-only mode: START stops here" in out
+                    assert "secure handover attempted" not in out
+                if mode in (("off",), ("preflight",)):
+                    assert "scmsnap call" not in out
+                if mode == ("batchfail",):
+                    assert "secure handover attempted" in out
+                    assert "MP_ASSIGN batch 1 data returned -5, answer 0x5, 2 top-level SCM calls" in out
+                    assert "secure allocation failed; retain GPU memory until cold reset" in out
+                    batches, calls, failed = logcheck.check(out, page_size,
+                                                            ["table", "data"])
+                    assert failed == 1 and sorted(batches) == [0, 1] and len(calls) == 2
+                if mode == ("ebusy",):
+                    assert "secure handover attempted" in out
+                    assert out.count("returned -12") == 1
+                    assert "secure pages retained until cold reset" in out
+                    # The 20 EBUSY retries reuse one staged batch: the region log
+                    # for batch 0 prints once and all 20 snapshots match it.
+                    batches, calls, failed = logcheck.check(out, page_size, ["table"])
+                    assert failed == 0 and sorted(batches) == [0] and len(calls) == 20
+                    assert len(batches[0]["regions"]) == 3
+                if mode in (("tablefail",), ("data2fail",)):
+                    # The parser compares the failed batch's printed regions and
+                    # permissions with its snapshot item by item; nothing from a
+                    # later batch may appear under any prefix.
+                    stop = 0 if mode == ("tablefail",) else 2
+                    roles = ["table"] + ["data"] * stop
+                    batches, calls, failed = logcheck.check(out, page_size, roles)
+                    assert failed == stop and sorted(batches) == list(range(stop + 1))
+                    assert len(calls) == stop + 1
+                    role = "table" if stop == 0 else "data"
+                    assert f"MP_ASSIGN batch {stop} {role} returned -5" in out
+                    assert f"MP_ASSIGN batch {stop + 1}" not in out
+                    assert f"MP_ASSIGN plan: batch {stop + 1}" not in out
+                if mode == ("argfail",):
+                    assert "ends before any MP_ASSIGN; no page transferred" in out
+                    assert "MP_ASSIGN batch" not in out
+                    assert "MP_ASSIGN plan" not in out
+                    assert "scmsnap call" not in out
+                if mode != ("off",) and mode != ("preflight",):
+                    assert "the secure handover experiment ended" in out
+            print(f"XNU PAGE_SIZE={page_size}: PASS")

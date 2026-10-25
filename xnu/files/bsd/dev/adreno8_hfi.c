@@ -1,6 +1,7 @@
 /* SM8750 GMU HFI queues, resource tables and GX diagnostics. */
 #include "adreno8_private.h"
 #include "adreno8_hwsched_private.h"
+#include "adreno8_memory_private.h"
 
 #define printf adreno8_say
 
@@ -97,6 +98,13 @@ adreno8_hfi_reply(uint32_t id, const uint32_t *payload, uint32_t count)
 	return adreno8_queue_write(msg, count + 1);
 }
 
+static bool
+adreno8_hfi_failed(void)
+{
+	adreno8_hwsched_memory_failed();
+	return false;
+}
+
 bool
 adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, const char *what)
 {
@@ -104,8 +112,9 @@ adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, const cha
 	uint64_t start, elapsed = 0;
 	unsigned notices = 0;
 
-	if (id > 0xff || count >= ADRENO8_HFI_MAX_DWORDS || (count != 0 && payload == NULL)) {
-		return false;
+	if (id > 0xff || count >= ADRENO8_HFI_MAX_DWORDS || (count != 0 && payload == NULL) ||
+	    (adreno8_gpu8_secure_mode == SECURE_MODE_TRANSLATION_B && adreno8_gpu_faulted())) {
+		return adreno8_hfi_failed();
 	}
 	adreno8_hfi_seq = (adreno8_hfi_seq + 1) & 0xfff;
 	msg[0] = (adreno8_hfi_seq << 20) | ((count + 1) << 8) | id;
@@ -115,7 +124,7 @@ adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, const cha
 	start = mach_absolute_time();
 	if (!adreno8_queue_write(msg, count + 1)) {
 		printf("adreno8: %u: could not queue HFI %u (%s)\n", adreno8_step, id, what);
-		return false;
+		return adreno8_hfi_failed();
 	}
 	for (;;) {
 		uint32_t irq = adreno8_rd(adreno8_gmu.base + GMU_GMU2HOST_INFO);
@@ -158,7 +167,7 @@ adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, const cha
 				/* HWSCHED START/RAW use UINT32_MAX as failure; generic requests use errno-style zero success. */
 				if ((id == 10 || id == 131) ? resp[2] == 0xffffffffu : resp[2] != 0) {
 					printf("adreno8: %u: HFI %u (%s) failed: %#x\n", adreno8_step, id, what, resp[2]);
-					return false;
+					return adreno8_hfi_failed();
 				}
 				ack = true;
 			} else if (type == 0 && received_id == 100) {
@@ -193,12 +202,17 @@ adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, const cha
 			printf("adreno8: %u: GMU fault during HFI: interrupt %#x init %#x\n", adreno8_step, irq, init);
 			break;
 		}
+		if (adreno8_gpu8_secure_mode == SECURE_MODE_TRANSLATION_B && adreno8_gpu_faulted()) {
+			printf("adreno8: HFI stopped after an address-space fault\n");
+			goto failed;
+		}
 		if (ack) {
 			return true;
 		}
 		adreno8_sleep_us(100);
 	}
 failed:
+	adreno8_hwsched_memory_failed();
 	adreno8_gmu_post_mortem();
 	return false;
 }

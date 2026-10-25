@@ -33,17 +33,14 @@
  * adreno8_fine=1      also pause before individual accesses in that step
  * adreno8_watch=S     inspect GMU status for S seconds after step 11 or later (default 20)
  * adreno8_keep=1      retain resources; stage 15 requires a cold reset before memory reuse
- * adreno8_secure_preflight=N  stage-14 secure experiment: every kind-5 request runs the
- *                  read-only adreno8_secure_preflight before the mode branch; mode 1 stops
- *                  after it with the preflight-only log, mode 2 runs the isolated handover
- *                  experiment: one MP_ASSIGN handover of the kernel's own kind-5 data and
- *                  secure page-table pages, then the GPU memory path stops; mode 0 and
- *                  unknown values stop after the preflight with the closed-path log; none
- *                  of the modes replies to MEM_ALLOC, writes CB3 or hands addresses to the
- *                  firmware; 3 (3a) goes on to point context 3 at the handed-over tables,
- *                  switch it on and keep stream 2's route faulting, with register read-backs
- *                  and a clear FSR as the only proof; 4 (3b) is reserved for the routing
- *                  switch and the MEM_ALLOC reply and is not implemented in this kernel
+ * adreno8_secure_preflight=N  stage-14 secure memory mode. Mode 0 and unknown values
+ *                  stop after the read-only preflight; mode 1 reports the preflight result.
+ *                  Mode 2 transfers one kind-5 buffer and its tables, then stops without a
+ *                  reply. Mode 3 also configures context 3 while stream 2 remains faulted.
+ *                  Mode 4 repeats that setup in the same boot, validates the translate
+ *                  route, then replies to MEM_ALLOC. READY permits normal allocations and
+ *                  exact replay of the original secure request; new secure handles fail.
+ *                  All transferred pages remain allocated until cold reset.
  * adreno8_cbscan=1    diagnostic only: after the step-8 SMMU read, print context-bank 0-5 and
  *                  20 registers (SCTLR, TTBR0, TCR, FSR) and read context 3's SCTLR twice;
  *                  read-only, the values enter no decision, off unless asked

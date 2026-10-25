@@ -1,6 +1,7 @@
 /* gen8.0.0 HWSCHED startup, using the vendor cold-boot HFI sequence. */
 #include "adreno8_private.h"
 #include "adreno8_hwsched_private.h"
+#include "adreno8_memory_private.h"
 
 #define printf adreno8_say
 
@@ -127,7 +128,8 @@ adreno8_hwsched_request(const uint32_t *request, uint32_t words,
 bool
 adreno8_hwsched_ready(void)
 {
-	return adreno8_hwsched_started;
+	return adreno8_hwsched_started &&
+	    (adreno8_gpu8_secure_mode != SECURE_MODE_TRANSLATION_B || !adreno8_gpu_faulted());
 }
 
 bool
@@ -139,6 +141,7 @@ adreno8_hwsched_start(void)
 	if (adreno8_hwsched_attempted || !adreno8_cx_ready() || !adreno8_gmu_talks ||
 	    !adreno8_hfi_tables_sent || !adreno8_gpu8_keep || adreno8_gpu8_return) {
 		printf("adreno8: HWSCHED requires fresh HFI tables, keep=1 and return=0\n");
+		adreno8_hwsched_memory_failed();
 		return false;
 	}
 	adreno8_hwsched_attempted = true;
@@ -163,7 +166,8 @@ adreno8_hwsched_start(void)
 bool
 adreno8_hwsched_raw(const uint32_t *pm4, uint32_t dwords, const char *name)
 {
-	if (!adreno8_hwsched_started || pm4 == NULL || dwords == 0 || dwords >= 255) {
+	if (!adreno8_hwsched_ready() || pm4 == NULL || dwords == 0 || dwords >= 255) {
+		adreno8_hwsched_memory_failed();
 		return false;
 	}
 	adreno8_reset_required = true;

@@ -353,13 +353,7 @@ adreno8_assign_plan(const struct adreno8_memory *buffer, unsigned *pages, unsign
 	return true;
 }
 
-/*
- * Isolated handover experiment state. The boot-args mode gates entry; this
- * state makes the attempt one-shot and terminal. Not started allows one handover;
- * attempted is set before any MP_ASSIGN goes out so a repeated request cannot
- * start a second one; terminal closes the path for the rest of the boot whether
- * the handover succeeded or failed.
- */
+/* One ownership transfer per boot; only validated mode 4 opens the service. */
 static uint32_t adreno8_xfer_state;
 
 uint32_t
@@ -368,14 +362,15 @@ adreno8_secure_xfer_state(void)
 	return adreno8_xfer_state;
 }
 
-/* Close the experiment when the driver cannot reach the first MP_ASSIGN (no
- * usable page, no argument page). Nothing was transferred, so no page is
- * marked lost; the state still ends the secure path for this boot. Once an
- * attempt went out the caller owns the outcome: this must not overwrite an
- * attempted state or claim no page transferred after a real call. */
+/* Close an unstarted transfer or the validated service, preserving ownership. */
 void
 adreno8_secure_xfer_abort(void)
 {
+	if (adreno8_xfer_state == SECURE_XFER_ASSIGNED || adreno8_xfer_state == SECURE_XFER_READY) {
+		adreno8_xfer_state = SECURE_XFER_TERMINAL;
+		printf("adreno8: secure service closed; all pages retained until cold reset\n");
+		return;
+	}
 	if (adreno8_xfer_state != SECURE_XFER_NOT_STARTED) {
 		return;
 	}
@@ -383,13 +378,27 @@ adreno8_secure_xfer_abort(void)
 	printf("adreno8: secure handover ends before any MP_ASSIGN; no page transferred\n");
 }
 
+bool
+adreno8_secure_xfer_ready(void)
+{
+	if (adreno8_gpu8_secure_mode != SECURE_MODE_TRANSLATION_B ||
+	    adreno8_xfer_state != SECURE_XFER_ASSIGNED || adreno8_assign.lost ||
+	    !adreno8_secure_space.is_on || adreno8_secure_space.table_count == 0 ||
+	    adreno8_secure_space.secure_tables != adreno8_secure_space.table_count) {
+		return false;
+	}
+	adreno8_xfer_state = SECURE_XFER_READY;
+	return true;
+}
+
 /*
  * One isolated handover of this kernel's own kind-5 buffer: assign the secure
  * page-table pages, then the data pages, and stop. The caller runs
  * adreno8_secure_preflight first; this function is reached only from that one
  * kernel call site. No MEM_ALLOC reply, no CB3 enable, no CB0 mapping and no
- * address reaches the firmware. Whatever the outcome, the attempt is terminal
- * and the pages stay retained; a success keeps them with the secure owner
+ * address reaches the firmware in this function. A successful mode-4 transfer
+ * ends as ASSIGNED; other outcomes end as TERMINAL. The pages stay retained;
+ * a success keeps them with the secure owner
  * rather than marking them lost. This does not prove the secure bridge can
  * hand memory back, a path the earlier park and PSCI checks never exercised.
  */
@@ -435,8 +444,9 @@ adreno8_secure_xfer(struct adreno8_gpu_space *space, const struct adreno8_memory
 		return false;
 	}
 	space->secure_tables = space->table_count;
-	adreno8_xfer_state = SECURE_XFER_TERMINAL;
-	printf("adreno8: secure handover complete: %u pages owned by CP_PIXEL after %u top-level MP_ASSIGN SCM calls, A6 interrupted continuation SMCs not counted, retained until cold reset; no MEM_ALLOC reply\n",
+	adreno8_xfer_state = adreno8_gpu8_secure_mode == SECURE_MODE_TRANSLATION_B ?
+	    SECURE_XFER_ASSIGNED : SECURE_XFER_TERMINAL;
+	printf("adreno8: secure handover complete: %u pages owned by CP_PIXEL after %u top-level MP_ASSIGN SCM calls, A6 interrupted continuation SMCs not counted, retained until cold reset; no MEM_ALLOC reply from the ownership-transfer step\n",
 	    pages, adreno8_assign.attempts);
 	return true;
 }

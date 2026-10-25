@@ -86,6 +86,10 @@ static void adreno8_sleep_us(uint32_t us) {
     if ((scenario == 2 || scenario == 3 || scenario == 9 || scenario == 11) && sleeps == 1)
         ack(1, sent_header, 3, 0);
 }
+#define SECURE_MODE_TRANSLATION_B 4u
+static uint32_t adreno8_gpu8_secure_mode;
+static bool adreno8_gpu_faulted(void) { return false; }
+void adreno8_hwsched_memory_failed(void) {}
 static void adreno8_gmu_post_mortem(void) { failures++; }
 static bool adreno8_hwsched_request(const uint32_t *request, uint32_t words, uint32_t *reply, uint32_t *reply_words) { return false; }
 ''' + FUNCTIONS + r'''

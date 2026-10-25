@@ -46,6 +46,10 @@ static bool adreno8_cx_ready(void) { return cx_ready; }
 static uint64_t mach_absolute_time(void) { return clock_ns; }
 static void absolutetime_to_nanoseconds(uint64_t value, uint64_t *out) { *out = value; }
 static void adreno8_settle(void) {}
+#define SECURE_MODE_TRANSLATION_B 4u
+static uint32_t adreno8_gpu8_secure_mode;
+static bool adreno8_gpu_faulted(void) { return false; }
+void adreno8_hwsched_memory_failed(void) {}
 static void adreno8_gmu_post_mortem(void) { failure_snapshots++; }
 static uint32_t header(unsigned id, unsigned words, unsigned type, unsigned seq) {
     return id | (words << 8) | (type << 16) | (seq << 20);

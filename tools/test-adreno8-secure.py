@@ -12,6 +12,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 fixture = runpy.run_path(str(ROOT / "tools/test-adreno8-smmu.py"))
 stub = fixture["stub"].replace("assert(size == 4096);", "assert(size != 0);")
+stub += "\nuint32_t adreno8_gpu8_secure_mode;\n"
 poison_hook = """static vm_offset_t poison_va; /* when set, kvtophys fails for that page */
 static uint64_t kvtophys(vm_offset_t va) {
     if (poison_va && va >= poison_va && va < poison_va + PAGE_SIZE) return 0;"""
@@ -575,7 +576,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="adreno8-secure-") as directory:
         target = Path(directory)
         (target / "adreno8_private.h").write_text(stub)
-        for name in ("adreno8_memory_private.h", "adreno8_secure_private.h"):
+        for name in ("adreno8_smmu_private.h", "adreno8_memory_private.h", "adreno8_secure_private.h"):
             (target / name).write_text((ROOT / "xnu/files/bsd/dev" / name).read_text())
         (target / "adreno8_smmu.c").write_text(fixture["driver"])
         (target / "adreno8_secure.c").write_text(driver)

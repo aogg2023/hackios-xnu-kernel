@@ -31,6 +31,9 @@ struct adreno8_hfi_mem_result {
 bool adreno8_hwsched_alloc(const struct adreno8_hfi_mem_request *request,
     struct adreno8_hfi_mem_result *result);
 
+/* Mode 4 closes allocations on transport/start failure and retains all pages. */
+void adreno8_hwsched_memory_failed(void);
+
 extern bool adreno8_hfi_tables_sent;
 bool adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, const char *what);
 

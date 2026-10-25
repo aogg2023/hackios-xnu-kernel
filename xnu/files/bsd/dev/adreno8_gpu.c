@@ -347,7 +347,7 @@ gpu_register_config(void)
 		return false;
 	gpu_write(GEN8_CP_INTERRUPT_STATUS_MASK_GLOBAL, A8_CP_GLOBAL_MASK);
 	gpu_write(GEN8_RBBM_SECVID_TSB_CNTL, 0);
-	gpu_write(GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_LO, 0xf0000000);
+	gpu_write(GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_LO, ADRENO8_SECURE_IOVA_START);
 	gpu_write(GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_HI, 0);
 	gpu_write(GEN8_RBBM_SECVID_TSB_TRUSTED_SIZE, 0xfffff000);
 	if (!gpu_hwcg() || !gpu_powerup_list())

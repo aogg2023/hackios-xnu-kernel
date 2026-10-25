@@ -313,6 +313,9 @@ int main(int argc, char **argv)
     assert(gpu_state == GPU_TESTED && oob_acked && adreno8_reset_required && raw_calls == 3);
     assert(gmu_regs[GMU_HOST2GMU_SET / 4] == 1u << 30);
     assert(gpu_regs[0][GEN8_UCHE_CCHE_GC_GMEM_RANGE_MIN_LO] == 0x04000000);
+    assert(gpu_regs[0][GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_LO] == 0xf0000000u);
+    assert(gpu_regs[0][GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_HI] == 0);
+    assert(gpu_regs[0][GEN8_RBBM_SECVID_TSB_TRUSTED_SIZE] == 0xfffff000u);
     assert(max_gx_offset == 4 * GEN8_RBBM_SECVID_TSB_CNTL && max_gx_offset == 0x3e00c);
     assert(!diagnostic_reads && !diagnostic_writes);
 

@@ -24,7 +24,7 @@ stub = stub.replace("    regs[offset / 4] = value;",
 tests = r'''
 #include <sys/mman.h>
 static const uint32_t mapping_size = 0x138000;
-static const uint32_t mapping_iova = 0x3fff0000;
+static const uint32_t mapping_iova = 0xf01f0000;
 static const uint32_t mapping_prot = ADRENO8_MEM_READ | ADRENO8_MEM_WRITE | ADRENO8_MEM_PRIV;
 static vm_offset_t mapping_memory;
 static void prepare(void) {
@@ -46,6 +46,18 @@ static bool check_mapping(void) {
 }
 int main(void) {
     prepare();
+    assert(ADRENO8_SECURE_IOVA_START == 0xf0000000u && ADRENO8_SECURE_IOVA_END == 0xfffff000u);
+    uint32_t end_page = 0;
+    assert(adreno8_space_find_range(&adreno8_secure_space, 0xffffe000u, ADRENO8_SECURE_IOVA_END,
+        4096, 4096, &end_page) && end_page == 0xffffe000u);
+    assert(!adreno8_space_find_range(&adreno8_secure_space, 0xffffe000u, ADRENO8_SECURE_IOVA_END,
+        8192, 4096, &end_page));
+    assert(!adreno8_space_find_range(&adreno8_secure_space, ADRENO8_SECURE_IOVA_START,
+        ADRENO8_SECURE_IOVA_END, 0x10000000u, 4096, &end_page));
+    assert(adreno8_space_table(&adreno8_secure_space, 1, 3) != NULL);
+    assert(((uint64_t *)adreno8_secure_space.tables[0].table)[0] == 0);
+    assert(adreno8_space_table(&adreno8_secure_space, 2, 0x780) != NULL);
+    assert(adreno8_space_table(&adreno8_secure_space, 2, 0x781) != NULL);
     assert(check_mapping());
     /* Each mutation preserves the first leaf and damages a later part of the
      * mapping, except the explicit first-leaf case. */

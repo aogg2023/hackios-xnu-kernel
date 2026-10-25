@@ -68,7 +68,7 @@ static void adreno8_wr(vm_offset_t address, uint32_t value) {
         assert(regs[(0x23000 + SMMU_CB_SCTLR) / 4] == 0x27);
         if (resource_replies == 1) {
             assert(words == 11 && (msg[0] & 0xff) == 20);
-            assert(msg[2] != 0 && msg[3] == 0 && msg[4] == 0x1007 && msg[5] == 5);
+            assert(msg[2] == 0xf0000000u && msg[3] == 0 && msg[4] == 0x1007 && msg[5] == 5);
             assert(msg[6] == 11 && msg[7] == 11 && msg[8] == 0);
             assert(msg[9] == 0x138000 && msg[10] == 0xc10);
             secure_address = msg[2];
@@ -93,7 +93,7 @@ static void adreno8_wr(vm_offset_t address, uint32_t value) {
             }
             emit_memory(0x007, 4, 12, 0x2000, 0xc10);
         } else if (resource_replies == 2) {
-            assert(words == 11 && msg[4] == 0x007 && msg[5] == 4 && msg[2] != 0);
+            assert(words == 11 && msg[4] == 0x007 && msg[5] == 4 && msg[2] >= 0x10000000u && msg[2] < 0xe0000000u);
             emit_memory(0x1007, 5, 11, 0x138000, 0xc10);
         } else if (resource_replies == 3) {
             assert(words == 11 && msg[2] == secure_address && msg[4] == 0x1007 && msg[5] == 5);
@@ -178,6 +178,11 @@ int main(int argc, char **argv) {
     assert(regs[SMMU_S2CR(SECURE_MATCH) / 4] == 0x303);
     struct adreno8_memory_entry *entry = &adreno8_memory_entries[1];
     assert(entry->secure && entry->complete && entry->from_hfi && entry->buffer.gpu_address == secure_address);
+    struct adreno8_space_table *parent = adreno8_space_table(&adreno8_secure_space, 1, 3);
+    assert(parent && ((uint64_t *)adreno8_secure_space.tables[0].table)[3] == (parent->phys | PTE_TABLE));
+    assert(((uint64_t *)adreno8_secure_space.tables[0].table)[0] == 0);
+    assert(adreno8_space_entry(&adreno8_gpu_space, secure_address) == NULL);
+    assert(before->gpu_address == 0x10000000u);
     unsigned calls_before = scm_calls, allocations_before = allocation_count;
     struct adreno8_hfi_mem_result result;
     struct adreno8_hfi_mem_request request = {0x1007, 5, 11, 0x138000, 0xc10};
@@ -190,6 +195,7 @@ int main(int argc, char **argv) {
     struct adreno8_memory *after = adreno8_gpu_alloc("after START", 4096, 4096,
         ADRENO8_MEM_READ | ADRENO8_MEM_WRITE | ADRENO8_MEM_PRIV);
     assert(after && adreno8_memory_publish(after, 0, 4096) && adreno8_memory_acquire(after, 0, 4096));
+    assert(after->gpu_address < 0xe0000000u);
     allocations_before = allocation_count;
     request.handle++;
     assert(!adreno8_hwsched_alloc(&request, &result) && result.gpu_address == 0);
@@ -251,6 +257,9 @@ if __name__ == "__main__":
         sctlr_check = ('adreno8_get(&adreno8_smmu, "secure sctlr after translate", '
                        'cb + SMMU_CB_SCTLR) != SCTLR_ON ||')
         variants = {
+            "secure_iova_in_normal_range": ("adreno8_memory.c", memory.replace(
+                "&adreno8_secure_space, ADRENO8_SECURE_IOVA_START, ADRENO8_SECURE_IOVA_END",
+                "&adreno8_secure_space, GPU_IOVA_START, GPU_IOVA_END", 1), 0),
             "normal_allocation_stays_closed": ("adreno8_memory.c", memory.replace(
                 closed, "state != SECURE_XFER_NOT_STARTED", 1), 0),
             "hfi_allocation_stays_closed": ("adreno8_memory.c", memory.replace(

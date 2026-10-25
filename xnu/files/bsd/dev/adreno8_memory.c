@@ -118,7 +118,7 @@ adreno8_memory_alloc_xfer(const char *name, uint32_t size, uint32_t alignment,
 		adreno8_secure_xfer_abort();
 		return NULL;
 	}
-	if (!adreno8_space_find_range(&adreno8_secure_space, GPU_IOVA_START, GPU_IOVA_END,
+	if (!adreno8_space_find_range(&adreno8_secure_space, ADRENO8_SECURE_IOVA_START, ADRENO8_SECURE_IOVA_END,
 	    size, alignment, &address)) {
 		adreno8_secure_xfer_abort();
 		return NULL;

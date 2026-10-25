@@ -220,7 +220,8 @@ int main(int argc, char **argv) {
         puts("preflight-only through the real pump: START stops, zero reply, no SCM: PASS");
         return 0;
     }
-    adreno8_gpu8_secure_mode = SECURE_MODE_HANDOVER;
+    bool translation = strcmp(which, "translation") == 0;
+    adreno8_gpu8_secure_mode = translation ? SECURE_MODE_TRANSLATION_A : SECURE_MODE_HANDOVER;
     if (strcmp(which, "batchfail") == 0) {
         /* The table batch lands, the first data batch fails: ownership is
          * unclear, the pump still sends nothing, and START cannot be retried. */
@@ -293,9 +294,14 @@ int main(int argc, char **argv) {
     assert(adreno8_memory_entries[0].complete);
     assert(adreno8_memory_entries[0].secure);
     assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
-    assert(adreno8_secure_space.table_count == 3 && !adreno8_secure_space.is_on);
+    assert(adreno8_secure_space.table_count == 3 && adreno8_secure_space.is_on == translation);
     assert(adreno8_secure_space.secure_tables == adreno8_secure_space.table_count);
-    assert(adreno8_gpu_space.table_count == 0 && writes == writes_before);
+    assert(adreno8_memory_entries[0].buffer.gpu_address == 0xf0000000u);
+    struct adreno8_space_table *parent = adreno8_space_table(&adreno8_secure_space, 1, 3);
+    assert(parent && ((uint64_t *)adreno8_secure_space.tables[0].table)[3] == (parent->phys | PTE_TABLE));
+    assert(((uint64_t *)adreno8_secure_space.tables[0].table)[0] == 0);
+    assert(adreno8_gpu_space.table_count == 0 && (translation ? writes > writes_before : writes == writes_before));
+    if (translation) assert(regs[SMMU_S2CR(SECURE_MATCH) / 4] == 0x20300);
     assert(adreno8_gmu_space.is_on && gmu_regs[GMU_GMU2HOST_INFO / 4] == 0);
     request_refused(5, 0x1007);
     request_refused(4, 0x007);
@@ -326,12 +332,12 @@ if __name__ == "__main__":
                             "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                             str(target / "check.c"), "-o", str(binary)], check=True)
             for mode in ((), ("off",), ("preflight",), ("batchfail",), ("tablefail",),
-                         ("data2fail",), ("ebusy",), ("argfail",)):
+                         ("data2fail",), ("ebusy",), ("argfail",), ("translation",)):
                 result = subprocess.run([str(binary), *mode], check=True,
                                         capture_output=True, text=True)
                 out = result.stdout
                 assert "START resource request 20 failed (11 words)" in out, (mode, out)
-                if mode == ():
+                if mode in ((), ("translation",)):
                     pages = 0x138000 // page_size
                     want = (f"{pages} pages merge into {pages} data regions plus 3 table pages, "
                             f"{(pages + 31) // 32 + 1} logical MP_ASSIGN batches")

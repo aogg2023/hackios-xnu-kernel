@@ -75,6 +75,18 @@ int main(int argc, char **argv) {
         .kind = 1, .handle = 42, .size = 8193, .align = (12 << 8) | 16,
     };
     reset_memory();
+    assert(ADRENO8_SECURE_IOVA_START == 0xf0000000u && ADRENO8_SECURE_IOVA_END == 0xfffff000u);
+    if (argc > 1 && strcmp(argv[1], "xfer-iova-align") == 0) {
+        request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 21,
+            .size = 4096, .align = (12 << 8) | 31};
+        adreno8_gpu8_secure_mode = SECURE_MODE_HANDOVER;
+        assert(!adreno8_hwsched_alloc(&request, &result));
+        assert(scm_calls == 0 && adreno8_memory_count == 0 && adreno8_memory_retained());
+        assert(adreno8_secure_xfer_state() == SECURE_XFER_TERMINAL);
+        assert(result.gpu_address == 0 && result.size == 0);
+        puts("secure IOVA: 2 GiB alignment cannot wrap into the 32-bit trusted subset: PASS");
+        return 0;
+    }
     if (argc > 1 && strcmp(argv[1], "gated") == 0) {
         /* The production kind-5 request stops after the read-only preflight:
          * no MP_ASSIGN, no retained range, no table work; the non-secure
@@ -103,6 +115,9 @@ int main(int argc, char **argv) {
         regs[(0x23000 + SMMU_CB_FSR) / 4] = 2;
         assert(adreno8_gpu_faulted());
         assert(adreno8_memory_entries[0].complete);
+        assert(adreno8_memory_entries[0].buffer.gpu_address == 0xf0000000u);
+        assert(((uint64_t *)adreno8_secure_space.tables[0].table)[0] == 0);
+        assert(adreno8_space_table(&adreno8_secure_space, 1, 3) != NULL);
         puts("secure translation 3a: enabled context, blocked route, no reply, secure fault included: PASS");
         return 0;
     }
@@ -131,7 +146,11 @@ int main(int argc, char **argv) {
         assert(adreno8_secure_space.secure_tables == adreno8_secure_space.table_count);
         struct adreno8_memory *secure = &adreno8_memory_entries[0].buffer;
         assert(adreno8_memory_entries[0].secure && adreno8_memory_entries[0].complete && secure->memory != 0);
-        assert(secure->gpu_address >= 0x10000000 && secure->gpu_address < 0xe0000000);
+        assert(secure->gpu_address == 0xf0000000u &&
+            (uint64_t)secure->gpu_address + secure->size <= 0xfffff000u);
+        struct adreno8_space_table *parent = adreno8_space_table(&adreno8_secure_space, 1, 3);
+        assert(parent && ((uint64_t *)adreno8_secure_space.tables[0].table)[3] == (parent->phys | PTE_TABLE));
+        assert(((uint64_t *)adreno8_secure_space.tables[0].table)[0] == 0);
         /* TrustZone reads the buffer from DRAM: a clean over the whole request
          * range must land before the first MP_ASSIGN of this handover. */
         int data_clean = 0;
@@ -465,7 +484,7 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
                         str(target / "check.c"), "-o", str(binary)], check=True)
         for mode in ((), ("gated",), ("translation",), ("xfer",), ("xfer-fail",), ("xfer-open-fail",),
                      ("xfer-gmu-changed",), ("xfer-middle-data",), ("xfer-middle-table",),
-                     ("xfer-subpage",), ("xfer-skew",), ("xfer-parange",)):
+                     ("xfer-subpage",), ("xfer-skew",), ("xfer-parange",), ("xfer-iova-align",)):
             result = subprocess.run([str(binary), *mode], check=True, capture_output=True, text=True)
             if mode == ("xfer",):
                 # The plan line prints from the real PAGE_SIZE and merge rule:

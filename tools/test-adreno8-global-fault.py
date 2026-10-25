@@ -24,19 +24,25 @@ static unsigned gx_reads, gx_writes, raw_calls, allocation_count, publish_count;
 static unsigned gf_reads, gf_lines, gf_sqe_reads, gf_write_barrier, gf_poll_calls, gf_console_calls;
 static unsigned gf_saved_reads, gf_saved_writes, gf_saved_poll, gf_saved_console, gf_saved_barriers;
 static bool gf_dsb_marker;
-static uint32_t gf_values[2][6];
+static uint32_t gf_values[3][6];
 ''')
 source = replace_once(source, "int adreno8_say(const char *fmt, ...) {", "static unsigned gf_console_calls;\nint adreno8_say(const char *fmt, ...) {\n    gf_console_calls++;")
 source = replace_once(source, "bool adreno8_hfi_poll(void) {", "bool adreno8_hfi_poll(void) {\n    gf_poll_calls++;")
+source = replace_once(source, "void adreno8_sleep_us(uint32_t us) {", "static unsigned gf_delays;\nvoid adreno8_sleep_us(uint32_t us) { if (us == 100) gf_delays++;")
 source = replace_once(source, "    if (address >= adreno8_smmu.base && address < adreno8_smmu.base + adreno8_smmu.size) return 0;", r'''
     if (address >= adreno8_smmu.base && address < adreno8_smmu.base + adreno8_smmu.size) {
         const uint32_t offsets[] = {0x48,0x40,0x44,0x50,0x54,0x48};
         unsigned phase=gf_reads/6, position=gf_reads%6;
-        assert(phase<2 && gf_lines==phase && adreno8_direct_ring && !raw_nop_asked);
+        assert(phase<3 && gf_lines==phase && adreno8_direct_ring && !raw_nop_asked);
         assert(address-adreno8_smmu.base==offsets[position]);
-        assert(ring_input_mask==7 && ring_setup_read_mask==127 && !ring_payloads && !ring_wptr_writes);
+        assert(ring_input_mask==7 && ring_setup_read_mask==127);
+        if (phase<2) assert(!ring_payloads && !ring_wptr_writes);
         if (!phase) assert(!ring_sqe_writes && !gf_dsb_marker);
-        else assert(ring_sqe_writes==1 && gf_dsb_marker && barriers>gf_write_barrier && !gf_sqe_reads);
+        else {
+            assert(ring_sqe_writes==1 && gf_dsb_marker && barriers>gf_write_barrier);
+            assert(gf_sqe_reads==(phase==2));
+            if (phase==2) assert(ring_payloads==1 && ring_wptr_writes==1 && gf_delays==2000);
+        }
         if (!position) {
             gf_saved_reads=gx_reads+gmu_reads; gf_saved_writes=gx_writes+gmu_writes;
             gf_saved_poll=gf_poll_calls; gf_saved_console=gf_console_calls; gf_saved_barriers=barriers;
@@ -64,13 +70,13 @@ source = replace_once(source, write, replace_once(write, "    if (adreno8_direct
 source += r'''
 void loader_log_line(const char *line) {
     if (!strncmp(line,"adreno8: ordinary SQE global fault ",34)) {
-        assert(gf_lines<2 && gf_reads==6*(gf_lines+1));
+        assert(gf_lines<3 && gf_reads==6*(gf_lines+1));
         assert(gf_saved_reads==gx_reads+gmu_reads && gf_saved_writes==gx_writes+gmu_writes);
         assert(gf_saved_poll==gf_poll_calls && gf_saved_console==gf_console_calls && gf_saved_barriers==barriers);
         char expected[192];
         const uint32_t *v=gf_values[gf_lines];
         snprintf(expected,sizeof(expected),"adreno8: ordinary SQE global fault %s: fsr=%#x/%#x far=%#x:%08x synr=%#x/%#x\n",
-                 gf_lines?"after DSB":"before store",v[0],v[5],v[2],v[1],v[3],v[4]);
+                 gf_lines==2?"completion timeout":gf_lines?"after DSB":"before store",v[0],v[5],v[2],v[1],v[3],v[4]);
         assert(!strcmp(line,expected)); gf_lines++;
     } else if (!strcmp(line,"adreno8: ordinary SQE start DSB returned\n")) {
         assert(gf_lines==1 && gf_reads==6 && ring_sqe_writes==1 && barriers>gf_write_barrier);
@@ -81,8 +87,8 @@ static void fresh_global(unsigned mode) {
     prepare_ring(); raw_nop_asked=mode;
     gf_reads=gf_lines=gf_sqe_reads=gf_write_barrier=gf_poll_calls=gf_console_calls=0;
     gf_saved_reads=gf_saved_writes=gf_saved_poll=gf_saved_console=gf_saved_barriers=0;
-    gf_dsb_marker=false;
-    for (unsigned phase=0;phase<2;phase++) {
+    gf_dsb_marker=false; gf_delays=0;
+    for (unsigned phase=0;phase<3;phase++) {
         gf_values[phase][0]=gf_values[phase][5]=0;
         for (unsigned i=1;i<5;i++) gf_values[phase][i]=0xffffffffu;
     }
@@ -114,6 +120,20 @@ int main(int argc, char **argv) {
             assert(ring_sqe_writes==phase && !gf_sqe_reads && !ring_payloads && !ring_wptr_writes);
             assert(!setup_waits);
         }
+    /* Preserve the two startup samples, then sample once after all completion polls. */
+    for(unsigned unknown=0;unknown<3;unknown++) {
+        fresh_global(0); ring_rptr_moves=false;
+        for(unsigned i=1;i<5;i++) gf_values[2][i]=unknown==0?0:unknown==1?~0u:0x56780000u+i;
+        assert(!adreno8_gpu_cp_init()); ring_retained(0);
+        assert(gf_reads==18 && gf_lines==3 && gf_sqe_reads==1 && gf_delays==2000);
+        assert(ring_sqe_writes==1 && ring_payloads==1 && ring_wptr_writes==1);
+    }
+    for(unsigned end=0;end<=5;end+=5) for(unsigned i=0;i<sizeof(faults)/sizeof(*faults);i++) {
+        fresh_global(0); ring_rptr_moves=false; gf_values[2][end]=faults[i];
+        assert(!adreno8_gpu_cp_init()); ring_retained(0);
+        assert(gf_reads==18 && gf_lines==3 && gf_sqe_reads==1 && gf_delays==2000);
+        assert(ring_sqe_writes==1 && ring_payloads==1 && ring_wptr_writes==1);
+    }
     for(unsigned bad=0;bad<2;bad++) {
         fresh_global(0);
         vm_offset_t base=adreno8_smmu.base; uint32_t size=adreno8_smmu.size;
@@ -151,6 +171,10 @@ pre = 'if (!gpu_global_fault_sample("before store"))\n\t\treturn gpu_fail("globa
 post = 'if (!gpu_global_fault_sample("after DSB"))\n\t\treturn gpu_fail("global fault after ordinary SQE DSB");'
 marker = 'loader_log_line("adreno8: ordinary SQE start DSB returned\\n");'
 mutations = [
+    ("no-timeout-sample", '\t(void)gpu_global_fault_sample("completion timeout");\n', ""),
+    ("wrong-timeout-phase", 'gpu_global_fault_sample("completion timeout")', 'gpu_global_fault_sample("after DSB")'),
+    ("early-timeout-sample", '\tfor (unsigned i = 0; i < 2000; i++) {\n\t\tif (!adreno8_hfi_poll() || !gpu_status_ok())',
+     '\t(void)gpu_global_fault_sample("completion timeout");\n\tfor (unsigned i = 0; i < 2000; i++) {\n\t\tif (!adreno8_hfi_poll() || !gpu_status_ok())'),
     ("no-pre-sample", pre, ""),
     ("no-post-sample", post, ""),
     ("ignore-pre-fault", pre, '(void)gpu_global_fault_sample("before store");'),

@@ -556,6 +556,9 @@ gpu_direct_ring_init(uint32_t raw_mode)
 		}
 		adreno8_sleep_us(100);
 	}
+	(void)gpu_global_fault_sample("completion timeout");
+	printf("adreno8: direct ring CP_INIT timeout: WPTR=%#x RBBM_STATUS=%#x\n",
+	    gpu_read(GEN8_CP_RB_WPTR_GC), gpu_read(GEN8_RBBM_STATUS));
 	return gpu_fail("direct ring CP_INIT completion timeout");
 }
 

@@ -23,6 +23,7 @@ gemnoc_function = driver[start:end]
 start = driver.index("adreno8_step_clocks(")
 end = driver.index("\n}\n", start) + 2
 clocks_function = driver[start:end]
+always_table = re.search(r"static const struct \{ const char \*name; uint32_t offset; \} always_on\[\] = \{.*?\n};", driver, re.S).group()
 common = (ROOT / "xnu/files/bsd/dev/adreno8.c").read_text()
 start = common.index("adreno8_set(")
 end = common.index("\n}\n", start) + 2
@@ -115,13 +116,14 @@ static bool adreno8_clock_on(struct adreno8_block *b, const char *name, uint32_t
     branches++; return branches != fail_branch;
 }
 static void adreno8_settle(void) { if (ahb_pending_read) ahb_settled = true; }
-''' + structure + "\nuint32_t\n" + set_function + "\nstatic bool\n" + gemnoc_function + "\nbool\n" + function + "\nbool\n" + power_function + "\nbool\n" + scm_function + "\nbool\n" + clocks_function + r'''
+''' + always_table + "\n" + structure + "\nuint32_t\n" + set_function + "\nstatic bool\n" + gemnoc_function + "\nbool\n" + function + "\nbool\n" + power_function + "\nbool\n" + scm_function + "\nbool\n" + clocks_function + r'''
 static uint32_t *ahb_control(unsigned index) {
     assert(index < 5);
     return &regs[(adreno8_cx_misc.base + 0x40 + 4 * index) / 4];
 }
 static void ahb_reset(unsigned mode) {
     memset(regs, 0, sizeof(regs));
+    for (unsigned i = 0; i < 6; i++) regs[always_on[i].offset / 4] = CBCR_ENABLE;
     powered = accept = clock_boot_ok = true; reject_gemnoc = false;
     adreno8_gmu_from_pll = mode; adreno8_reset_required = false;
     clock_boot_calls = writes = branches = fail_branch = ahb_reads = ahb_writes = 0;
@@ -130,6 +132,7 @@ static void ahb_reset(unsigned mode) {
     regs[GPUCC_GMU_RCGR / 4 + 1] = 0x100000;
 }
 int main(void) {
+    for (unsigned i = 0; i < 6; i++) regs[always_on[i].offset / 4] = CBCR_ENABLE;
     scm_answer = 1; assert(adreno8_scm_gpu_init() && scm_calls == 2);
     scm_calls = 0; scm_answer = 0; assert(adreno8_scm_gpu_init() && scm_calls == 1);
     scm_calls = 0; scm_status[0] = -4; assert(adreno8_scm_gpu_init() && scm_calls == 1);
@@ -264,31 +267,32 @@ int main(void) {
 mutations = [
     ("AHB writes on XO", "\tif (!adreno8_gmu_from_pll) return true;\n", ""),
     ("all-ones inherited AHB accepted", "if (inherited[i] == 0xffffffffu) return false;", "if (false) return false;"),
-    ("missing AHB retention", "\t\tadreno8_reset_required = true;\n", ""),
+    ("missing AHB retention", "\n\t\tadreno8_reset_required = true;\n", "\n"),
     ("missing AHB write", "\t\tadreno8_put(&adreno8_cx_misc, ahb[i], 0x40 + 4 * i, 0x1b12);\n", ""),
-    ("missing AHB write barrier", "\t\tadreno8_settle();\n", ""),
+    ("missing AHB write barrier", "\n\t\tadreno8_settle();\n", "\n"),
     ("ignored AHB readback", "!= 0x1b12) return false;", "!= 0x1b12 && false) return false;"),
     ("AHB rewrite after confirmation", "if (inherited[i] == 0x1b12) continue;", "if (false) continue;"),
     ("wrong AHB timeout", "0x40 + 4 * i, 0x1b12);", "0x40 + 4 * i, 0x1b11);"),
     ("shifted AHB write offset", "0x40 + 4 * i, 0x1b12);", "0x44 + 4 * i, 0x1b12);"),
     ("AHB RMW preserves unknown fields", "0x40 + 4 * i, 0x1b12);", "0x40 + 4 * i, inherited[i] | 0x1b12);"),
 ]
-checks = [("production", source, False)]
-for label, before, after in mutations:
-    assert clocks_function.count(before) == 1, label
-    changed = clocks_function.replace(before, after, 1)
-    assert source.count(clocks_function) == 1
-    checks.append((label, source.replace(clocks_function, changed, 1), True))
-for label, code, rejected in checks:
-    with tempfile.TemporaryDirectory(prefix="adreno8-config-") as directory:
-        src = Path(directory) / "check.c"
-        binary = Path(directory) / "check"
-        src.write_text(code)
-        subprocess.run(["cc", "-std=c11", "-fsanitize=address,undefined", str(src), "-o", str(binary)], check=True)
-        result = subprocess.run([str(binary)], capture_output=True, text=True)
-        if rejected:
-            assert result.returncode != 0, "mutation survived: " + label
-        else:
-            assert result.returncode == 0, result.stdout + result.stderr
-print("BCM, RCG, power, GEMNOC and AHB timeout ordering/retention/failures/idempotence: PASS")
-print("AHB timeout mutations rejected:", len(mutations))
+if __name__ == "__main__":
+    checks = [("production", source, False)]
+    for label, before, after in mutations:
+        assert clocks_function.count(before) == 1, label
+        changed = clocks_function.replace(before, after, 1)
+        assert source.count(clocks_function) == 1
+        checks.append((label, source.replace(clocks_function, changed, 1), True))
+    for label, code, rejected in checks:
+        with tempfile.TemporaryDirectory(prefix="adreno8-config-") as directory:
+            src = Path(directory) / "check.c"
+            binary = Path(directory) / "check"
+            src.write_text(code)
+            subprocess.run(["cc", "-std=c11", "-fsanitize=address,undefined", str(src), "-o", str(binary)], check=True)
+            result = subprocess.run([str(binary)], capture_output=True, text=True)
+            if rejected:
+                assert result.returncode != 0, "mutation survived: " + label
+            else:
+                assert result.returncode == 0, result.stdout + result.stderr
+    print("BCM, RCG, power, GEMNOC and AHB timeout ordering/retention/failures/idempotence: PASS")
+    print("AHB timeout mutations rejected:", len(mutations))

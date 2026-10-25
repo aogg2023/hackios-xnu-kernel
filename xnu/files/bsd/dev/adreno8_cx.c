@@ -375,6 +375,12 @@ adreno8_cx_is_on(void)
 	return (adreno8_rd(adreno8_gpucc.base + GPUCC_CX_GDSCR) | adreno8_rd(adreno8_gpucc.base + GPUCC_CX_HW_CTRL)) & GDSC_POWER_ON;
 }
 
+/* gpucc-sun.c enables these branches during probe, before KGSL starts. */
+static const struct { const char *name; uint32_t offset; } always_on[] = {
+	{ "cb", 0x93a4 }, { "cxo_aon", 0x9008 }, { "gx_ahb_ff", 0x9064 },
+	{ "rscc_hub_aon", 0x93a8 }, { "rscc_xo_aon", 0x9004 }, { "sleep", 0x90cc }
+};
+
 bool
 adreno8_step_gpucc(void)
 {
@@ -400,11 +406,6 @@ adreno8_step_gpucc(void)
 	adreno8_get(&adreno8_gpucc, "memnoc_gfx", GPUCC_MEMNOC_GFX_CBCR);
 	adreno8_get(&adreno8_gpucc, "hub_aon", GPUCC_HUB_AON_CBCR);
 	adreno8_get(&adreno8_gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR);
-	/* gpucc-sun.c enables these branches during probe, before KGSL starts. */
-	static const struct { const char *name; uint32_t offset; } always_on[] = {
-		{ "cb", 0x93a4 }, { "cxo_aon", 0x9008 }, { "gx_ahb_ff", 0x9064 },
-		{ "rscc_hub_aon", 0x93a8 }, { "rscc_xo_aon", 0x9004 }, { "sleep", 0x90cc }
-	};
 	for (unsigned i = 0; i < sizeof(always_on) / sizeof(always_on[0]); i++)
 		if (adreno8_get(&adreno8_gpucc, always_on[i].name, always_on[i].offset) == 0xffffffffu)
 			return false;
@@ -615,6 +616,19 @@ adreno8_step_clocks(void)
 
 	if (adreno8_gmu_from_pll) {
 		if (!adreno8_clock_boot()) return false;
+		uint32_t always_values[sizeof(always_on) / sizeof(always_on[0])];
+		for (unsigned i = 0; i < sizeof(always_on) / sizeof(always_on[0]); i++) {
+			always_values[i] = adreno8_get(&adreno8_gpucc, always_on[i].name, always_on[i].offset);
+			if (always_values[i] == 0xffffffffu) return false;
+		}
+		for (unsigned i = 0; i < sizeof(always_on) / sizeof(always_on[0]); i++) {
+			if (always_values[i] & CBCR_ENABLE) continue;
+			adreno8_reset_required = true;
+			adreno8_put(&adreno8_gpucc, always_on[i].name, always_on[i].offset, always_values[i] | CBCR_ENABLE);
+			adreno8_settle();
+			uint32_t value = adreno8_get(&adreno8_gpucc, always_on[i].name, always_on[i].offset);
+			if (value == 0xffffffffu || !(value & CBCR_ENABLE)) return false;
+		}
 	} else {
 		adreno8_announce("select the GMU crystal clock for the default clock experiment");
 		if (!adreno8_clock_source("gmu_clk_src", GPUCC_GMU_RCGR, 0)) return false;

@@ -814,6 +814,14 @@ adreno8_space_faulted(struct adreno8_gpu_space *space)
 	printf("adreno8: %u: %s SMMU fault %#x at %#x:%#x, syndrome %#x\n", adreno8_step, space->name, fsr,
 	    adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_FAR_HI), adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_FAR_LO),
 	    adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_FSYNR0));
+	/* Secure diagnostics read registers only. Ownership transfer forbids CPU
+	 * access to data pages; this path also leaves shared table contents untouched. */
+	if (space == &adreno8_secure_space) {
+		printf("adreno8: %u: secure fault context SCTLR %#x, global FSR %#x\n", adreno8_step,
+		    adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_SCTLR),
+		    adreno8_rd(adreno8_smmu.base + SMMU_SGFSR));
+		return true;
+	}
 	uint32_t address = adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_FAR_LO);
 	struct adreno8_space_table *leaf = adreno8_space_table(space, 2, address >> 21);
 	printf("adreno8: %u: fault context SCTLR %#x, leaf PTE %#llx, global FSR %#x\n", adreno8_step,
@@ -826,8 +834,8 @@ adreno8_space_faulted(struct adreno8_gpu_space *space)
 /*
  * Mode 3 (3a): point secure context 3 at the tables just handed over and switch it on,
  * leaving stream 2's route at fault so no transaction reaches it. The proofs a
- * write-restricted path can give are all here: the IOVA resolves to the buffer's page in a
- * software walk (run before the handover, see adreno8_secure_translation_walk), every
+ * write-restricted path can give are all here: every buffer page resolves through the
+ * root table before the handover (see adreno8_secure_translation_walk), every
  * write reads back, the TLB invalidate completes, and FSR is clear. This SMMU reports
  * IDR0.ATOSNS=1, so ATS1PR/ATSR cannot add a hardware translation proof; only the
  * firmware's own traffic in 3b can.
@@ -850,40 +858,26 @@ static bool
 adreno8_3a_stop(const char *name, uint32_t wrote, uint32_t read)
 {
 	printf("adreno8: %u: secure translation 3a stopped at %s: wrote %#010x, reads %#010x;"
-	    " context %u left as it is, stream %u stays faulted\n", adreno8_step, name, wrote, read,
-	    SECURE_CONTEXT, SECURE_STREAM);
+	    " context %u retained; no further register writes\n", adreno8_step, name, wrote, read,
+	    SECURE_CONTEXT);
 	return false;
-}
-
-/* Software walk, run while the pages are still the kernel's: the buffer's IOVA must
- * resolve to the buffer's first page through the secure space's own table chain. */
-bool
-adreno8_secure_translation_walk(struct adreno8_gpu_space *space, uint32_t iova, vm_offset_t memory)
-{
-	uint64_t *entry = adreno8_space_entry(space, iova);
-	uint64_t phys = kvtophys(memory);
-
-	if (entry == NULL || (phys & (SMMU_GRANULE - 1)) != 0 ||
-	    (*entry & PTE_ADDRESS) != (phys & PTE_ADDRESS)) {
-		printf("adreno8: %u: secure translation 3a: IOVA %#x does not resolve to the buffer's"
-		    " page (PTE %#llx, PA %#llx)\n", adreno8_step, iova,
-		    entry != NULL ? *entry : 0, phys);
-		return false;
-	}
-	printf("adreno8: %u: secure translation 3a: table walk of IOVA %#x resolves to PA %#llx\n",
-	    adreno8_step, iova, phys);
-	return true;
 }
 
 bool
 adreno8_secure_translation_3a(struct adreno8_gpu_space *space)
 {
 	uint32_t cb = (adreno8_smmu_pages + SECURE_CONTEXT) * adreno8_smmu_page;
-	uint64_t root = space->tables[0].phys | (uint64_t)space->context << 48;
+	uint64_t root;
 	uint32_t read, value;
 
-	adreno8_announce("secure translation 3a: context %u pointed at the handed-over tables and"
-	    " switched on; stream %u stays faulted", SECURE_CONTEXT, SECURE_STREAM);
+	if (space != &adreno8_secure_space || space->is_on || space->context != SECURE_CONTEXT ||
+	    space->table_count == 0 || space->table_count > sizeof(space->tables) / sizeof(space->tables[0]) ||
+	    space->tables[0].level != 0 || space->tables[0].index != 0) {
+		return false;
+	}
+	root = space->tables[0].phys | (uint64_t)space->context << 48;
+	adreno8_announce("secure translation 3a: prepare context %u with the handed-over tables;"
+	    " configure stream %u as fault before enabling the context", SECURE_CONTEXT, SECURE_STREAM);
 	/* Claim the route slot as fault first: the SMR write below then cannot expose a
 	 * translate entry before the context holds our tables. */
 	value = SMMU_S2CR_FAULT | SMMU_S2CR_SHCFG_NSH;
@@ -949,6 +943,8 @@ adreno8_secure_translation_3a(struct adreno8_gpu_space *space)
 		return false;
 	}
 	adreno8_settle();
+	/* Retain the context even if the enable write cannot be confirmed. */
+	space->is_on = true;
 	value = SCTLR_ON;
 	if (!adreno8_3a_write(cb + SMMU_CB_SCTLR, value, &read, "cb sctlr")) {
 		return adreno8_3a_stop("cb sctlr", value, read);

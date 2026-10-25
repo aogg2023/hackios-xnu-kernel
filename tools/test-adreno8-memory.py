@@ -91,6 +91,21 @@ int main(int argc, char **argv) {
         puts("secure handover gated: no MP_ASSIGN, non-secure path intact: PASS");
         return 0;
     }
+    if (argc > 1 && strcmp(argv[1], "translation") == 0) {
+        request = (struct adreno8_hfi_mem_request){.flags = 0x1007, .kind = 5, .handle = 21,
+            .size = 0x138000, .align = (12 << 8) | 16};
+        adreno8_gpu8_secure_mode = SECURE_MODE_TRANSLATION_A;
+        assert(!adreno8_hwsched_alloc(&request, &result));
+        assert(result.gpu_address == 0 && result.size == 0);
+        assert(adreno8_secure_space.is_on && !adreno8_memory_failed);
+        assert(regs[SMMU_S2CR(SECURE_MATCH) / 4] == 0x20300);
+        assert(!adreno8_gpu_faulted());
+        regs[(0x23000 + SMMU_CB_FSR) / 4] = 2;
+        assert(adreno8_gpu_faulted());
+        assert(adreno8_memory_entries[0].complete && adreno8_memory_entries[0].terminal);
+        puts("secure translation 3a: enabled context, blocked route, no reply, secure fault included: PASS");
+        return 0;
+    }
     if (argc > 1 && strcmp(argv[1], "xfer") == 0) {
         /* Experiment mode through the production call chain: the kind-5 request
          * hands the kernel's own buffer over once and ends there. The result
@@ -451,7 +466,7 @@ with tempfile.TemporaryDirectory(prefix="adreno8-memory-") as directory:
         subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}",
                         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                         str(target / "check.c"), "-o", str(binary)], check=True)
-        for mode in ((), ("gated",), ("xfer",), ("xfer-fail",), ("xfer-open-fail",),
+        for mode in ((), ("gated",), ("translation",), ("xfer",), ("xfer-fail",), ("xfer-open-fail",),
                      ("xfer-gmu-changed",), ("xfer-middle-data",), ("xfer-middle-table",),
                      ("xfer-subpage",), ("xfer-skew",), ("xfer-parange",)):
             result = subprocess.run([str(binary), *mode], check=True, capture_output=True, text=True)

@@ -27,6 +27,8 @@ driver, replaced = re.subn(
     driver, count=1, flags=re.S,
 )
 assert replaced == 1
+# Compile the extracted secure walker with the same production SMMU source.
+driver += "\n" + (ROOT / "xnu/files/bsd/dev/adreno8_translation.c").read_text()
 stub = r'''
 #include <assert.h>
 #include <stdarg.h>
@@ -185,7 +187,8 @@ static void adreno8_put(struct adreno8_block *b, const char *name, uint32_t offs
 }
 static bool adreno8_wait_for(struct adreno8_block *b, uint32_t offset, uint32_t mask, uint32_t value, uint32_t ms) {
     if (offset == 0x22000 + 0x8f0) return atos_wait_ok;
-    assert(offset == 0x22000 + SMMU_CB_TLBSTATUS || offset == 0x20000 + SMMU_CB_TLBSTATUS);
+    assert(offset == 0x22000 + SMMU_CB_TLBSTATUS || offset == 0x20000 + SMMU_CB_TLBSTATUS ||
+           offset == 0x23000 + SMMU_CB_TLBSTATUS);
     return sync_ok;
 }
 static void adreno8_to_memory(vm_offset_t memory, vm_size_t size) {

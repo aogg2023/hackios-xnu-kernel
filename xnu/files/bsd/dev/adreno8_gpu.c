@@ -392,13 +392,29 @@ gpu_ucode_base(uint32_t reg, const struct adreno8_memory *memory)
 bool
 adreno8_gpu_cp_init(void)
 {
-	uint32_t words[10];
+	uint32_t words[10], raw_nop = 0;
 	if (gpu_state != GPU_PREPARED)
 		return gpu_fail("CP initialization order");
+	PE_parse_boot_argn("adreno8_raw_nop", &raw_nop, sizeof(raw_nop));
+	if (raw_nop > 2)
+		return gpu_fail("unknown RAW NOP diagnostic");
 	if (!gpu_oob_get() || !gpu_register_config() ||
 	    !gpu_ucode_base(GEN8_CP_SQE_INSTR_BASE_LO, sqe) ||
 	    !gpu_ucode_base(GEN8_CP_AQE_INSTR_BASE_LO_0, aqe))
 		return false;
+	/* The vendor first sends CP_INIT. This diagnostic stops after one NOP,
+	 * or five NOPs with the same message length as CP_INIT; CP stays uninitialized. */
+	if (raw_nop) {
+		uint32_t count = raw_nop == 1 ? 2 : 10;
+		for (uint32_t i = 0; i < count; i += 2) {
+			words[i] = adreno8_pm4_type7(0x10, 1);
+			words[i + 1] = 0;
+		}
+		if (!gpu_raw(words, count, "pre-init NOP"))
+			return false;
+		printf("adreno8: RAW NOP diagnostic acknowledged and idle (%u PM4 dwords)\n", count);
+		return gpu_fail("RAW NOP diagnostic stop");
+	}
 	uint32_t count = adreno8_pm4_cp_init(words, A8_COUNT(words), powerup->gpu_address);
 	if (!gpu_raw(words, count, "CP initialization"))
 		return false;

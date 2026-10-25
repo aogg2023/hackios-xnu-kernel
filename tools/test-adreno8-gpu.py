@@ -73,6 +73,7 @@ for file, old, new, ctype in tables:
     table_checks += f"assert(sizeof({new}) == sizeof(ref_{new})); assert(!memcmp({new},ref_{new},sizeof({new})));\n"
 
 pm4 = vendor["adreno_pm4types.h"]
+assert int(re.search(r"^#define\s+CP_NOP\s+(0x[0-9a-fA-F]+)", pm4, re.M)[1], 16) == 0x10
 reference += re.search(r"^#define CP_TYPE7_PKT[^\n]+", pm4, re.M)[0] + "\n"
 for name in ["pm4_calc_odd_parity_bit", "cp_type7_packet"]:
     reference += re.search(r"static inline uint " + name + r"\([^}]+\}", pm4)[0] + "\n"
@@ -93,6 +94,13 @@ struct adreno8_gpu_space;
 ''' + block_declarations + f"enum {{ GPU_MAPPING_SIZE = {gpu_size} }};\n" + r'''
 bool adreno8_reset_required;
 uint32_t adreno8_pause_ms, adreno8_step, adreno8_newest_step;
+static uint32_t raw_nop_asked;
+bool PE_parse_boot_argn(const char *name, void *value, int size)
+{
+    assert(!strcmp(name, "adreno8_raw_nop") && size == sizeof(raw_nop_asked));
+    if (raw_nop_asked) memcpy(value, &raw_nop_asked, size);
+    return raw_nop_asked != 0;
+}
 int adreno8_say(const char *fmt, ...) { (void)fmt; return 0; }
 uint32_t adreno8_rd(vm_offset_t);
 void adreno8_wr(vm_offset_t, uint32_t);
@@ -221,7 +229,11 @@ bool adreno8_hwsched_raw(const uint32_t *pm4_words, uint32_t words, const char *
     assert(oob_requested && oob_acked && memory_on && adreno8_reset_required);
     raw_calls++;
     if (!raw_ok) return false;
-    if (raw_calls == 1) {
+    if (raw_nop_asked) {
+        assert(raw_calls == 1 && words == (raw_nop_asked == 1 ? 2 : 10));
+        for (unsigned i = 0; i < words; i += 2)
+            assert(pm4_words[i] == cp_type7_packet(0x10, 1) && pm4_words[i + 1] == 0);
+    } else if (raw_calls == 1) {
         assert(words == 10 && pm4_words[0] == cp_type7_packet(0x17, 1));
         assert(pm4_words[2] == cp_type7_packet(0x48, 7));
         assert(pm4_words[7] == powerup->gpu_address && pm4_words[8] == 0);
@@ -266,6 +278,7 @@ static void reset(void)
     gx_reads = gx_writes = raw_calls = allocation_count = publish_count = current_pipe = 0;
     max_gx_offset = 0; adreno8_gpu.size = GPU_MAPPING_SIZE;
     adreno8_pause_ms = adreno8_step = adreno8_newest_step = 0;
+    raw_nop_asked = 0;
     diagnostic_reads = diagnostic_writes = diagnostic_offset = 0;
     last_mmio = MMIO_NONE; barriers = gmu_reads = gmu_writes = 0;
     smmu_ok = hfi_ok = oob_ok = clock_ok = raw_ok = idle_ok = acquire_ok = true;
@@ -390,6 +403,16 @@ int main(int argc, char **argv)
     unsigned read_stop = gx_reads, write_stop = gx_writes;
     assert(!adreno8_gpu_secure_exit() && !adreno8_gpu_scratch_test());
     assert(gx_reads == read_stop && gx_writes == write_stop);
+    for (unsigned mode = 1; mode <= 2; mode++) {
+        reset(); prepare(); raw_nop_asked = mode;
+        assert(!adreno8_gpu_cp_init() && raw_calls == 1 && gpu_state == GPU_FAILED);
+        assert(!adreno8_gpu_cp_ready() && !adreno8_gpu_secure_exit() && !adreno8_gpu_scratch_test());
+        assert(raw_calls == 1 && allocation_count == 4 && oob_requested && oob_acked);
+        reset(); prepare(); raw_nop_asked = mode; raw_ok = false;
+        assert(!adreno8_gpu_cp_init() && raw_calls == 1 && gpu_state == GPU_FAILED);
+    }
+    reset(); prepare(); raw_nop_asked = 3;
+    assert(!adreno8_gpu_cp_init() && !raw_calls && !gx_reads && !gx_writes);
     reset(); prepare(); smmu_after_raw = true;
     assert(!adreno8_gpu_cp_init() && gpu_state == GPU_FAILED);
     reset(); prepare(); idle_ok = false;

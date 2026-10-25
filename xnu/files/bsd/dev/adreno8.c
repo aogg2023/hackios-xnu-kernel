@@ -32,6 +32,7 @@
  * adreno8_skip=MASK   skip selected steps (bit 0 selects step 1)
  * adreno8_pause=MS    pause before access groups in the newest step (default 2200 ms)
  * adreno8_fine=1      also pause before individual accesses in that step
+ * adreno8_raw_nop=N   stop after RAW NOPs before CP_INIT: 1=two words, 2=ten words
  * adreno8_watch=S     inspect GMU status for S seconds after step 11 or later (default 20)
  * adreno8_keep=1      retain resources; stage 15 requires a cold reset before memory reuse
  * adreno8_secure_preflight=N  stage-14 secure memory mode. Mode 0 and unknown values

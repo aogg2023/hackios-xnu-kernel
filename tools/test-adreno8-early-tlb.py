@@ -24,6 +24,8 @@ for name, digest in {
     sources[name] = data.decode()
 for name, offset in (("TLBIALLNSNH", "68"), ("sTLBGSYNC", "70"), ("sTLBGSTATUS", "74")):
     assert re.search(r"#define\s+ARM_SMMU_GR0_" + name + r"\s+0x" + offset + r"\b", sources["arm-smmu.h"])
+for name, bit in (("GFIE", 2), ("GFRE", 1), ("CLIENTPD", 0)):
+    assert re.search(r"#define\s+ARM_SMMU_sCR0_" + name + r"\s+BIT\(" + str(bit) + r"\)", sources["arm-smmu.h"])
 assert "#define QCOM_DUMMY_VAL -1" in sources["arm-smmu.c"]
 assert "ARM_SMMU_GR0_TLBIALLNSNH, QCOM_DUMMY_VAL" in sources["arm-smmu.c"]
 assert "ARM_SMMU_GR0_sTLBGSYNC," in sources["arm-smmu.c"]
@@ -53,7 +55,8 @@ stub = stub.replace("static unsigned reads[0x40000 / 4];", r'''
 static unsigned reads[0x40000 / 4];
 static uint32_t cm3, gx, final_status, status_busy_reads;
 static unsigned preflight_reads, cm3_reads, gx_reads, invalidations, syncs, status_reads;
-static unsigned invalidate_barrier, sync_barrier;
+static unsigned invalidate_barrier, sync_barrier, scr_reads, scr_writes, scr_barrier, scr_fault;
+static uint32_t inherited_scr0;
 static bool prerequisites_started, cx_ready = true;
 ''', 1)
 stub = stub.replace("static bool adreno8_cx_ready(void) { return true; }",
@@ -82,6 +85,15 @@ stub = stub.replace("    reads[offset / 4]++;", r'''
     }
     assert(b == &adreno8_smmu);
     if (prerequisites_started && offset >= 0x800 && offset < 0xc00) preflight_reads++;
+    if (prerequisites_started && offset == 0) {
+        assert(preflight_reads == (regs[0x20 / 4] & 255));
+        scr_reads++;
+        if (scr_reads == 2) {
+            assert(scr_writes == 1 && barriers > scr_barrier);
+            if (scr_fault == 2) return regs[0] ^ 0x100;
+            if (scr_fault == 3) return ~0u;
+        }
+    }
     reads[offset / 4]++;
 ''', 1)
 stub = stub.replace("    writes++;", r'''
@@ -91,13 +103,22 @@ stub = stub.replace("    writes++;", r'''
            !adreno8_gpu_space.is_on && !adreno8_secure_space.is_on);
     assert(cm3_reads == 1 && gx_reads == 1 && cm3 != ~0u && (cm3 & 1) && gx != ~0u && (gx & 3) == 3);
     assert(preflight_reads == (regs[0x20 / 4] & 255));
+    if (offset == 0) {
+        assert(writes == 1 && !scr_writes && scr_reads == 1);
+        assert(inherited_scr0 != ~0u && !(inherited_scr0 & 1) && (inherited_scr0 & 6) == 6);
+        assert(value == (inherited_scr0 & ~4u));
+        scr_writes++; scr_barrier = barriers;
+        if (scr_fault != 1) regs[0] = value;
+        return;
+    }
+    assert(regs[0] == (inherited_scr0 & ~4u) && scr_reads == (scr_writes ? 2u : 1u));
     assert(value == 0xffffffff);
     for (unsigned i = 0; i < preflight_reads; i++) assert(!(regs[(0x800 + 4 * i) / 4] & 0x80000000));
     if (offset == 0x68) {
-        assert(writes == 1 && !invalidations && !syncs && barriers > 0);
+        assert(writes == 1 + scr_writes && !invalidations && !syncs && barriers > 0);
         invalidations++; invalidate_barrier = barriers;
     } else {
-        assert(offset == 0x70 && writes == 2 && invalidations == 1 && !syncs);
+        assert(offset == 0x70 && writes == 2 + scr_writes && invalidations == 1 && !syncs);
         assert(barriers > invalidate_barrier);
         syncs++; sync_barrier = barriers;
     }
@@ -119,7 +140,8 @@ static void fresh(bool direct)
     adreno8_direct_ring = direct;
     adreno8_reset_required = false;
     barriers = cm3_reads = gx_reads = preflight_reads = invalidations = syncs = status_reads = 0;
-    invalidate_barrier = sync_barrier = 0;
+    invalidate_barrier = sync_barrier = scr_reads = scr_writes = scr_barrier = scr_fault = 0;
+    inherited_scr0 = regs[0] = 0x2e0406;
     prerequisites_started = false;
     cm3 = 1; gx = 3; final_status = status_busy_reads = 0;
     clock_ns = 0; clock_step = 1000000;
@@ -132,7 +154,8 @@ static void unchanged(void)
 }
 static void completed(void)
 {
-    assert(writes == 2 && invalidations == 1 && syncs == 1 && adreno8_reset_required);
+    assert(writes == 2 + scr_writes && invalidations == 1 && syncs == 1 && adreno8_reset_required);
+    assert(regs[0] == (inherited_scr0 & ~4u) && scr_reads == (scr_writes ? 2u : 1u));
     assert(barriers > sync_barrier && preflight_reads == (regs[0x20 / 4] & 255));
     assert(allocation_count == 0 && !clean_count);
     assert(regs[0x68 / 4] == 0 && regs[0x70 / 4] == 0);
@@ -174,17 +197,34 @@ int main(void)
         fresh(true); gx = bad_gx[i];
         assert(!adreno8_step_smmu_read()); unchanged(); assert(!preflight_reads);
     }
+    const uint32_t bad_scr0[] = {0xffffffffu, 0, 1, 3, 4, 5, 0x2e0407};
+    for (unsigned i = 0; i < sizeof(bad_scr0) / sizeof(*bad_scr0); i++) {
+        fresh(true); inherited_scr0 = regs[0] = bad_scr0[i];
+        assert(!adreno8_step_smmu_read()); unchanged(); assert(scr_reads == 1);
+    }
+    const uint32_t valid_scr0[] = {2, 6, 0xfffffffeu, 0x2e0406, 0xdeadbeee};
+    for (unsigned i = 0; i < sizeof(valid_scr0) / sizeof(*valid_scr0); i++) {
+        fresh(true); inherited_scr0 = regs[0] = valid_scr0[i];
+        assert(adreno8_step_smmu_read()); completed();
+        assert(scr_writes == !!(inherited_scr0 & 4));
+    }
+    for (unsigned fault = 1; fault <= 3; fault++) {
+        fresh(true); scr_fault = fault;
+        assert(!adreno8_step_smmu_read());
+        assert(writes == 1 && scr_writes == 1 && scr_reads == 2 && adreno8_reset_required);
+        assert(!invalidations && !syncs && !status_reads && !allocation_count);
+    }
     fresh(true); cm3 = 3; gx = 7; /* Only the reset bit and two GX-off bits are constrained. */
     assert(adreno8_step_smmu_read()); completed();
     for (unsigned busy = 0; busy <= 2; busy++) {
         fresh(true); status_busy_reads = busy; final_status = 0xffffffffu;
         assert(!adreno8_step_smmu_read());
-        assert(adreno8_reset_required && writes == 2 && invalidations == 1 && syncs == 1);
+        assert(adreno8_reset_required && writes == 3 && invalidations == 1 && syncs == 1);
         assert(status_reads == busy + 1 && barriers == sync_barrier && allocation_count == 0);
     }
     fresh(true); status_busy_reads = 1000;
     assert(!adreno8_step_smmu_read());
-    assert(status_reads == 100 && clock_ns == 101000000ull && writes == 2);
+    assert(status_reads == 100 && clock_ns == 101000000ull && writes == 3);
     assert(adreno8_reset_required && barriers == sync_barrier && !allocation_count);
     fresh(true); cx_ready = false;
     assert(!adreno8_step_smmu_read()); unchanged(); assert(!reads[0x20 / 4]);
@@ -202,7 +242,7 @@ int main(void)
     assert(!adreno8_step_smmu_read()); unchanged(); assert(!cm3_reads && !gx_reads);
     fresh(false); cm3 = gx = 0xffffffffu; regs[0x800 / 4] = 0xffffffffu;
     adreno8_gmu_space.is_on = adreno8_gpu_space.is_on = adreno8_secure_space.is_on = true;
-    assert(adreno8_step_smmu_read()); unchanged(); assert(!cm3_reads && !gx_reads && !preflight_reads);
+    assert(adreno8_step_smmu_read()); unchanged(); assert(!cm3_reads && !gx_reads && !preflight_reads && !scr_reads && !scr_writes);
     release_all();
     puts("early ordinary NS TLB: preflight, WO sequence, timeout, retained failure and HWSCHED zero writes passed");
 }
@@ -225,7 +265,15 @@ for label, before, after in (
     ("gx-all1", "gx == ~0u || ", ""),
     ("smr-cap16", "i < adreno8_smmu_matches; i++", "i < adreno8_smmu_matches && i < 16; i++"),
     ("ignored-valid-smr", "SMMU_SMR(i)) & SMR_VALID", "SMMU_SMR(i)) & 0"),
-    ("retention", "adreno8_reset_required = true;", "adreno8_reset_required = false;"),
+    ("scr0-clientpd", "(scr0 & 1)", "false"),
+    ("scr0-gfre", "!(scr0 & 2)", "false"),
+    ("scr0-unconditional-write", "if (scr0 & 4)", "if (true)"),
+    ("scr0-wrong-bit", "scr0 & ~4u", "scr0 & ~2u"),
+    ("scr0-readback-ignored", 'if (adreno8_get(&adreno8_smmu, "early NS global fault IRQ readback", SMMU_SCR0) != (scr0 & ~4u))',
+     'if (adreno8_get(&adreno8_smmu, "early NS global fault IRQ readback", SMMU_SCR0) == 0)'),
+    ("scr0-retention", "adreno8_reset_required = true;", "adreno8_reset_required = false;"),
+    ("scr0-post-write-barrier", '\t\tadreno8_settle();\n\t\tif (adreno8_get(&adreno8_smmu, "early NS global fault IRQ readback"',
+     '\t\tif (adreno8_get(&adreno8_smmu, "early NS global fault IRQ readback"'),
     ("no-invalidate", '\tadreno8_put(&adreno8_smmu, "early NS TLB invalidate", SMMU_TLBIALLNSNH, ~0u);', ""),
     ("wrong-invalidate-value", 'SMMU_TLBIALLNSNH, ~0u);', 'SMMU_TLBIALLNSNH, 0);'),
     ("no-sync", '\tadreno8_put(&adreno8_smmu, "early NS TLB sync", SMMU_TLBGSYNC, ~0u);', ""),
@@ -243,6 +291,9 @@ for label, before, after in (
 ):
     assert before in production, label
     variants[label] = production.replace(before, after, 1)
+variants["tlb-retention"] = production.replace(
+    '\tadreno8_reset_required = true;\n\tadreno8_settle();\n\tadreno8_put(&adreno8_smmu, "early NS TLB invalidate"',
+    '\tadreno8_reset_required = false;\n\tadreno8_settle();\n\tadreno8_put(&adreno8_smmu, "early NS TLB invalidate"', 1)
 variants["before-layout"] = production.replace("\tif (!adreno8_smmu_layout()) {",
     "\tif (adreno8_direct_ring && !adreno8_smmu_early_ns_tlb()) return false;\n\tif (!adreno8_smmu_layout()) {", 1)
 with tempfile.TemporaryDirectory(prefix="adreno8-early-tlb-") as directory:

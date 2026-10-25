@@ -15,6 +15,7 @@
 #include "adreno8_context_private.h"
 
 extern void loader_log_line(const char *line);
+extern struct adreno8_block adreno8_smmu;
 
 #define printf adreno8_say
 #define A8_COUNT(a) (sizeof(a) / sizeof((a)[0]))
@@ -434,6 +435,26 @@ gpu_ring_wptr(uint32_t value)
 	return gpu_fail("direct ring fenced WPTR timeout");
 }
 
+/* Arm IHI 0062D.c GR0: sGFAR 0x40/44, sGFSR 0x48, sGFSYNR0/1 0x50/54.
+ * Preserve raw details; a fault arriving during the sample also stops this probe. */
+static bool
+gpu_global_fault_sample(const char *phase)
+{
+	if (!adreno8_smmu.base || adreno8_smmu.size < 0x58)
+		return false;
+	uint32_t first = adreno8_rd(adreno8_smmu.base + SMMU_SGFSR);
+	uint32_t low = adreno8_rd(adreno8_smmu.base + 0x40);
+	uint32_t high = adreno8_rd(adreno8_smmu.base + 0x44);
+	uint32_t syn0 = adreno8_rd(adreno8_smmu.base + 0x50);
+	uint32_t syn1 = adreno8_rd(adreno8_smmu.base + 0x54);
+	uint32_t last = adreno8_rd(adreno8_smmu.base + SMMU_SGFSR);
+	char line[192];
+	snprintf(line, sizeof(line), "adreno8: ordinary SQE global fault %s: fsr=%#x/%#x far=%#x:%08x synr=%#x/%#x\n",
+	    phase, first, last, high, low, syn0, syn1);
+	loader_log_line(line);
+	return first == 0 && last == 0;
+}
+
 /* Linux a8xx_hw_init/a8xx_cp_init at efbda69d92e6 use a zeroed powerup page,
  * BR/BV RPTR shadows and a 32 KiB ring before enabling SQE. The setup probes
  * stop before CP_INIT and retain allocations and OOB until cold reset. */
@@ -497,9 +518,13 @@ gpu_direct_ring_init(uint32_t raw_mode)
 		    raw_mode == 2 ? "SQE zero-value write was issued and zero readback verified before this interval" : "SQE was not started by this probe");
 		return gpu_fail("ordinary setup-only diagnostic stop");
 	}
+	if (!gpu_global_fault_sample("before store"))
+		return gpu_fail("global fault before ordinary SQE store");
 	gpu_write(GEN8_CP_SQE_CNTL, 1);
 	adreno8_settle();
 	loader_log_line("adreno8: ordinary SQE start DSB returned\n");
+	if (!gpu_global_fault_sample("after DSB"))
+		return gpu_fail("global fault after ordinary SQE DSB");
 	if (gpu_read(GEN8_CP_SQE_CNTL) != 1)
 		return gpu_fail("direct ring SQE enable readback");
 	uint32_t count = adreno8_pm4_cp_init((uint32_t *)ring->memory, ring->size / 4, powerup->gpu_address);

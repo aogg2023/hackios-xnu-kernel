@@ -84,8 +84,9 @@ for name, (phys, size) in resources.items():
 # Use the production mapping declarations; an independent test-only size hid the 64 KiB mapping.
 gmu_source = (DEV / "adreno8_gmu.c").read_text()
 block_declarations = ""
-for name, base in (("gpu", 0x10000000), ("gmu", 0x20000000)):
-    initializer = re.search(r"struct adreno8_block adreno8_" + name + r"\s*=\s*\{([^}]+)\};", gmu_source)[1]
+for name, base in (("gpu", 0x10000000), ("gmu", 0x20000000), ("smmu", 0x30000000)):
+    block_source = (DEV / "adreno8_smmu.c").read_text() if name == "smmu" else gmu_source
+    initializer = re.search(r"struct adreno8_block adreno8_" + name + r"\s*=\s*\{([^}]+)\};", block_source)[1]
     phys, size = [int(n, 16) for n in re.findall(r"0x[0-9a-f]+", initializer)]
     if name == "gpu":
         assert (phys, size) == (gpu_phys, gpu_size), "GPU mapping differs from kgsl_3d0_reg_memory"
@@ -128,7 +129,7 @@ for name in ["pm4_calc_odd_parity_bit", "cp_type7_packet"]:
     reference += re.search(r"static inline uint " + name + r"\([^}]+\}", pm4)[0] + "\n"
 
 shared = (DEV / "adreno8_private.h").read_text()
-constants = "\n".join(line for line in shared.splitlines() if line.startswith("#define GMU"))
+constants = "\n".join(line for line in shared.splitlines() if line.startswith(("#define GMU", "#define SMMU_SGFSR")))
 source = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -232,6 +233,7 @@ void adreno8_settle(void) { last_mmio = MMIO_BARRIER; barriers++; }
 
 uint32_t adreno8_rd(vm_offset_t address)
 {
+    if (address >= adreno8_smmu.base && address < adreno8_smmu.base + adreno8_smmu.size) return 0;
     assert(last_mmio != MMIO_READ);
     if (adreno8_direct_ring && address == adreno8_gmu.base + GMU_AHB_FENCE_STATUS)
         assert(last_mmio == MMIO_BARRIER);

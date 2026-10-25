@@ -134,7 +134,7 @@ adreno8_smmu_cb_scan_after_step9(void)
 static bool
 adreno8_smmu_early_ns_tlb(void)
 {
-	uint32_t reset, gx, status;
+	uint32_t reset, gx, status, scr0;
 	uint64_t start, elapsed;
 
 	if (adreno8_gmu_space.is_on || adreno8_gpu_space.is_on || adreno8_secure_space.is_on) {
@@ -152,6 +152,19 @@ adreno8_smmu_early_ns_tlb(void)
 			printf("adreno8: %u: early NS TLB invalidation rejected visible match %u\n", adreno8_step, i);
 			return false;
 		}
+	}
+	/* Arm IHI 0062D.c 9.6.1: GFIE is bit 2; keep GFRE and every other bit. */
+	scr0 = adreno8_get(&adreno8_smmu, "early NS fault control", SMMU_SCR0);
+	if (scr0 == ~0u || (scr0 & 1) || !(scr0 & 2)) {
+		printf("adreno8: %u: early NS fault control rejected %#x\n", adreno8_step, scr0);
+		return false;
+	}
+	if (scr0 & 4) {
+		adreno8_reset_required = true;
+		adreno8_put(&adreno8_smmu, "early NS global fault IRQ mask", SMMU_SCR0, scr0 & ~4u);
+		adreno8_settle();
+		if (adreno8_get(&adreno8_smmu, "early NS global fault IRQ readback", SMMU_SCR0) != (scr0 & ~4u))
+			return false;
 	}
 	adreno8_reset_required = true;
 	adreno8_settle();

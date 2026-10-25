@@ -78,6 +78,7 @@ source = replace_once(source, "    if (reg == GEN8_CP_APERTURE_CNTL_HOST) return
     if (reg == GEN8_CP_APERTURE_CNTL_HOST) return current_pipe << 12;''')
 source += r'''
 void loader_log_line(const char *line) {
+    if (strstr(line, "ordinary SQE global fault")) return;
     assert(adreno8_direct_ring && adreno8_gpu.base && !marker_scope_only);
     if (!strcmp(line, "adreno8: ordinary SQE raw STR enter\n")) {
         if (marker_expect_pause) assert(marker_last_action == 1 && marker_pause_count);
@@ -191,8 +192,8 @@ mutations = [
     ("start-wrong-label", "gpu", start, zero),
     ("zero-after-read", "gpu", zero + '\n\t\t\tif (gpu_read(GEN8_CP_SQE_CNTL) != 0)\n\t\t\t\treturn gpu_fail("ordinary SQE zero-value control readback");',
      'if (gpu_read(GEN8_CP_SQE_CNTL) != 0)\n\t\t\t\treturn gpu_fail("ordinary SQE zero-value control readback");\n\t\t\t' + zero),
-    ("start-after-read", "gpu", start + '\n\tif (gpu_read(GEN8_CP_SQE_CNTL) != 1)\n\t\treturn gpu_fail("direct ring SQE enable readback");',
-     'if (gpu_read(GEN8_CP_SQE_CNTL) != 1)\n\t\treturn gpu_fail("direct ring SQE enable readback");\n\t' + start),
+    ("start-after-read", "gpu", start + '\n\tif (!gpu_global_fault_sample("after DSB"))\n\t\treturn gpu_fail("global fault after ordinary SQE DSB");\n\tif (gpu_read(GEN8_CP_SQE_CNTL) != 1)\n\t\treturn gpu_fail("direct ring SQE enable readback");',
+     'if (!gpu_global_fault_sample("after DSB"))\n\t\treturn gpu_fail("global fault after ordinary SQE DSB");\n\tif (gpu_read(GEN8_CP_SQE_CNTL) != 1)\n\t\treturn gpu_fail("direct ring SQE enable readback");\n\t' + start),
     ("nonzero-inherited-accepted", "gpu", 'if (inherited != 0)', 'if (false)'),
     ("access-pause-missing", "put", 'adreno8_hold(true);', ''),
 ]

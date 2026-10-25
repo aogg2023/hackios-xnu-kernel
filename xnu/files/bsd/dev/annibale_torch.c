@@ -540,7 +540,8 @@ light_locked(uint32_t ma)
 		return false;
 	}
 	lit = true;
-	say("torch: channel 0 is lit at %u mA (itarget %#02x)\n", ma, code);
+	say("torch: channel 0 is lit at %u.%u mA (itarget %#02x, %u mA asked)\n", (code + 1) * IRES_MA / 1000,
+	    (code + 1) * IRES_MA % 1000 / 100, code, ma);
 	return true;
 }
 

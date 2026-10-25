@@ -118,8 +118,10 @@ void redwood_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsign
     uint64_t *lost, uint32_t *refused);
 extern uint32_t gpu_va;                 /* boot-arg gpu_va: 0 as before, 1 describe the addresses, 2 also guard them */
 bool redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only);
-void redwood_gpu_mapped(void);
-void redwood_gpu_unmap(uint64_t address, uint64_t size);
+/* Commit prior map writes. Failure retains ownership of any entries already installed. */
+bool redwood_gpu_mapped(void);
+/* True only after all requested PTEs are removed and TLB synchronization completes. */
+bool redwood_gpu_unmap(uint64_t address, uint64_t size);
 void redwood_gpu_to_memory(void *start, uint64_t size);
 uint32_t redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
 bool redwood_gpu_done(uint32_t fence);

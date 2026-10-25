@@ -57,8 +57,8 @@ void redwood_gpu_space(uint64_t * used, uint32_t * live, uint64_t * largest, uns
     uint64_t * lost, uint32_t * refused);
 extern uint32_t gpu_va;                 /* boot-arg gpu_va: 0 as before, 1 describe the addresses, 2 also guard them */
 bool redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only);
-void redwood_gpu_mapped(void);
-void redwood_gpu_unmap(uint64_t address, uint64_t size);
+bool redwood_gpu_mapped(void);
+bool redwood_gpu_unmap(uint64_t address, uint64_t size);
 void redwood_gpu_to_memory(void * start, uint64_t size);
 uint32_t redwood_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
 extern uint32_t gpu_log;
@@ -226,14 +226,14 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 
 	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
 	for (bool waited = false;; waited = true) {
-		if (redwood_gpu_done(fence)) {
+		if (!gGPUReported && redwood_gpu_ready() && redwood_gpu_done(fence)) {
 			if (waited) {
 				gGPUStat.waits++;
 				gGPUStat.waiting += mach_absolute_time() - began;
 			}
 			return true;
 		}
-		if (mach_absolute_time() - began >= patience || gGPUReported) {
+		if (mach_absolute_time() - began >= patience || gGPUReported || !redwood_gpu_ready()) {
 			break;                  /* (a GPU that has stopped answering is not waited for again) */
 		}
 		IOLockUnlock(gGPULock);
@@ -248,7 +248,7 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 	 * this run: a GPU that may yet write memory of ours is given nothing more. Either way this
 	 * wait has failed, and says so: the submission did not finish.
 	 */
-	if (milliseconds >= 1000 && !gGPUReported) {
+	if (milliseconds >= 1000 && !gGPUReported && redwood_gpu_ready()) {
 		redwood_gpu_report("no answer");
 		gGPUReported = !redwood_gpu_recover();
 	}
@@ -261,9 +261,9 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 	uint32_t fence = surface->drawn;
 	bool done = true;
 
-	if (fence != 0 && gGPULock != NULL) {
+	if (gGPULock != NULL) {
 		IOLockLock(gGPULock);
-		done = !redwood_gpu_ready() || gpuWait(fence, milliseconds);
+		done = !gGPUReported && (fence == 0 || (redwood_gpu_ready() && gpuWait(fence, milliseconds)));
 		IOLockUnlock(gGPULock);
 	}
 	return done;
@@ -455,7 +455,7 @@ class RedwoodGPUUserClient : public IOUserClient
 	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle);
 	void freeBuffer(struct gpu_buffer * b);
 	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
-	void dropKept(struct gpu_kept * k);
+	bool dropKept(struct gpu_kept * k);
 	void reap(void);
 	IOReturn gemNew(struct msm_gem_new * request);
 	IOReturn surfaceBuffer(struct redwood_surface * request);
@@ -488,398 +488,14 @@ RedwoodGPUUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 
 bool
 RedwoodGPUUserClient::start(IOService * provider)
 {
-	if (!redwood_gpu_ready() || !IOUserClient::start(provider)) {
+	if (gGPUReported || !redwood_gpu_ready() || !IOUserClient::start(provider)) {
 		return false;
 	}
 	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
 	return fBuffers != NULL;
 }
 
-/*
- * With the lock held, and the GPU done with everything it has been given (`idle`). If it is
- * not -- it has stopped answering -- the buffer's memory stays the GPU's for good: it may yet be
- * written, and must not be somebody else's by then.
- */
-void
-RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
-{
-	bool busy = redwood_gpu_ready() && b->fence != 0 && !redwood_gpu_done(b->fence);
-
-	if (busy && fLeftCount == GPU_LEFT) {
-		busy = !gpuWait(b->fence, 1000);        /* (nowhere to keep it: this one is waited for) */
-	}
-	if (busy && fLeftCount < GPU_LEFT) {
-		struct gpu_left * left = &fLeft[fLeftCount++];
-
-		left->memory = b->memory;
-		left->surface = b->surface;
-		left->address = b->address;
-		left->size = b->size;
-		left->fence = b->fence;
-		left->flags = b->flags;
-	} else {
-		if (busy) {
-			static uint32_t said;
-
-			if (b->surface == NULL) {
-				b->memory->retain();
-			} else {
-				b->surface->memory->retain();
-			}
-			if (said++ < 8) {
-				IOLog("RedwoodGPU: the GPU is not done with what it was given: a buffer of %llu bytes stays its own\n", b->size);
-			}
-		} else if (b->surface == NULL && redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
-			b->memory = NULL;               /* (now the kept one's) */
-		} else if (redwood_gpu_ready()) {
-			redwood_gpu_unmap(b->address, b->size);
-			redwood_gpu_address_free(b->address, b->size);
-		}
-		if (b->memory != NULL) {
-			b->memory->release();
-		}
-		if (b->surface != NULL) {
-			MiniIOSurfaceDrop(b->surface);
-		}
-	}
-	b->memory = NULL;
-	b->surface = NULL;
-	fBufferCount--;
-	fBufferBytes -= b->size;
-}
-
-/* The buffers that were given back early and that the GPU is done with now: freed. With the lock held. */
-void
-RedwoodGPUUserClient::reap(void)
-{
-	for (uint32_t i = 0; i < fLeftCount;) {
-		struct gpu_left * left = &fLeft[i];
-
-		if (redwood_gpu_ready() && !redwood_gpu_done(left->fence)) {
-			i++;
-			continue;
-		}
-		if (left->surface == NULL && redwood_gpu_ready() &&
-		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
-			left->memory = NULL;
-		} else if (redwood_gpu_ready()) {
-			redwood_gpu_unmap(left->address, left->size);
-			redwood_gpu_address_free(left->address, left->size);
-		}
-		if (left->memory != NULL) {
-			left->memory->release();
-		}
-		if (left->surface != NULL) {
-			MiniIOSurfaceDrop(left->surface);
-		}
-		*left = fLeft[--fLeftCount];
-	}
-}
-
-IOReturn
-RedwoodGPUUserClient::clientClose(void)
-{
-	if (fBuffers != NULL) {
-		IOLockLock(gGPULock);
-		/* what the client had the GPU do last may still be going on, in these buffers */
-		if (redwood_gpu_ready()) {
-			gpuWait(redwood_gpu_last(), 1000);
-		}
-		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
-			if (fBuffers[i].memory != NULL) {
-				freeBuffer(&fBuffers[i]);
-			}
-		}
-		reap();
-		for (uint32_t i = 0; i < GPU_KEPT; i++) {
-			dropKept(&fKept[i]);
-		}
-		if (fLeftCount != 0) {
-			IOLog("RedwoodGPU: the GPU is not done with %u buffers of a program that is gone: they stay its own\n", fLeftCount);
-		}
-		IOLockUnlock(gGPULock);
-	}
-	if (!isInactive()) {
-		terminate();
-	}
-	return kIOReturnSuccess;
-}
-
-void
-RedwoodGPUUserClient::free(void)
-{
-	if (fBuffers != NULL) {
-		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
-		fBuffers = NULL;
-	}
-	IOUserClient::free();
-}
-
-struct gpu_buffer *
-RedwoodGPUUserClient::buffer(uint32_t handle)
-{
-	if (handle == 0 || handle > GPU_BUFFERS || fBuffers[handle - 1].memory == NULL) {
-		/* (a program that names a buffer it has given back draws into somebody else's next: worth knowing) */
-		if (handle != 0 && fStrangers++ < 16) {
-			IOLog("RedwoodGPU: buffer %u is asked for and is not there\n", handle);
-		}
-		return NULL;
-	}
-	return &fBuffers[handle - 1];
-}
-
-/*
- * A handle and addresses of the GPU's for `size` bytes of a memory descriptor, from byte `from`
- * of it on (wired memory; both in whole pages). With the lock held; NULL: there is no room.
- */
-struct gpu_buffer *
-RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle)
-{
-	struct gpu_buffer * b = NULL;
-	bool mapped = true;
-
-	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
-		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
-
-		if (fBuffers[i].memory == NULL) {
-			b = &fBuffers[i];
-			*handle = i + 1;
-			fNextBuffer = i + 1;
-			break;
-		}
-	}
-	if (b == NULL || (b->address = redwood_gpu_address(size)) == 0) {
-		IOLog("RedwoodGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
-		return NULL;
-	}
-	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
-		IOByteCount length = 0;
-		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
-
-		mapped = phys != 0 && redwood_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
-	}
-	redwood_gpu_mapped();
-	if (!mapped) {
-		redwood_gpu_unmap(b->address, size);
-		redwood_gpu_address_free(b->address, size);
-		IOLog("RedwoodGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
-		return NULL;
-	}
-	b->size = size;
-	b->flags = flags;
-	b->seed = 0;
-	b->pushed = 0;
-	b->seen = false;
-	b->fence = 0;
-	b->surface = NULL;
-	fBufferCount++;
-	fBufferBytes += size;
-	return b;
-}
-
-/* With the lock held. */
-void
-RedwoodGPUUserClient::dropKept(struct gpu_kept * k)
-{
-	if (k->memory == NULL) {
-		return;
-	}
-	if (redwood_gpu_ready()) {
-		redwood_gpu_unmap(k->address, k->size);
-		redwood_gpu_address_free(k->address, k->size);
-	}
-	k->memory->release();
-	k->memory = NULL;
-	fKeptBytes -= k->size;
-}
-
-/* With the lock held, the GPU done with the buffer: kept if it is worth it (those kept longest make way). */
-bool
-RedwoodGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags)
-{
-	struct gpu_kept * place = NULL;
-
-	if (gGPUKeep == 0 || size < GPU_KEEP_FROM || size > GPU_KEPT_BYTES / 4 || memory == NULL ||
-	    (kernel == NULL && OSDynamicCast(IOBufferMemoryDescriptor, memory) == NULL)) {
-		return false;
-	}
-	for (;;) {
-		struct gpu_kept * oldest = NULL;
-
-		place = NULL;
-		for (uint32_t i = 0; i < GPU_KEPT; i++) {
-			if (fKept[i].memory == NULL) {
-				place = place != NULL ? place : &fKept[i];
-			} else if (oldest == NULL || fKept[i].since < oldest->since) {
-				oldest = &fKept[i];
-			}
-		}
-		if (place != NULL && fKeptBytes + size <= GPU_KEPT_BYTES) {
-			break;
-		}
-		dropKept(oldest);
-	}
-	place->memory = memory;
-	place->kernel = kernel != NULL ? kernel : (uint8_t *) OSDynamicCast(IOBufferMemoryDescriptor, memory)->getBytesNoCopy();
-	place->address = address;
-	place->size = size;
-	place->flags = flags;
-	place->since = mach_absolute_time();
-	fKeptBytes += size;
-	return true;
-}
-
-IOReturn
-RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
-{
-	uint64_t size = round_page_64(request->size), began = mach_absolute_time();
-	struct gpu_buffer * b;
-	IOBufferMemoryDescriptor * memory;
-
-	if (size == 0 || size > GPU_BUFFER_MAX) {
-		return kIOReturnBadArgument;
-	}
-	/* one kept of this size and kind, if there is one (the one kept last: likeliest still in the caches' way) */
-	IOLockLock(gGPULock);
-	struct gpu_kept * found = NULL;
-	uint64_t old;
-
-	nanoseconds_to_absolutetime(GPU_KEPT_SECONDS * NSEC_PER_SEC, &old);
-	for (uint32_t i = 0; i < GPU_KEPT; i++) {
-		struct gpu_kept * k = &fKept[i];
-
-		if (k->memory != NULL && began - k->since > old) {
-			dropKept(k);
-		}
-
-		if (k->memory != NULL && k->size == size && k->flags == request->flags && (found == NULL || k->since > found->since)) {
-			found = k;
-		}
-	}
-	for (uint32_t n = 0; found != NULL && n < GPU_BUFFERS; n++) {
-		uint32_t h = (fNextBuffer + n) % GPU_BUFFERS;
-
-		if (fBuffers[h].memory == NULL) {
-			b = &fBuffers[h];
-			bzero(b, sizeof(*b));
-			b->memory = found->memory;
-			b->kernel = found->kernel;
-			b->address = found->address;
-			b->size = found->size;
-			b->flags = found->flags;
-			fNextBuffer = h + 1;
-			fBufferCount++;
-			fBufferBytes += size;
-			request->handle = h + 1;
-			found->memory = NULL;
-			fKeptBytes -= size;
-			gGPUStat.given_again++;
-			IOLockUnlock(gGPULock);
-			if (gGPUKeep == 2) {
-				bzero(b->kernel, (size_t) b->size);
-			}
-			return kIOReturnSuccess;
-		}
-	}
-	IOLockUnlock(gGPULock);
-	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
-	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
-	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
-	if (memory == NULL) {
-		IOLog("RedwoodGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
-		    fBufferBytes >> 20);
-		return kIOReturnNoMemory;
-	}
-	if (gGPUCached) {
-		redwood_gpu_to_memory(memory->getBytesNoCopy(), size);
-	}
-
-	IOLockLock(gGPULock);
-	b = newBuffer(memory, 0, size, request->flags, &request->handle);
-	if (b != NULL) {
-		b->memory = memory;
-		b->kernel = (uint8_t *) memory->getBytesNoCopy();
-		gGPUStat.made++;
-		gGPUStat.making += mach_absolute_time() - began;
-	}
-	IOLockUnlock(gGPULock);
-	if (b == NULL) {
-		memory->release();
-		return kIOReturnNoMemory;
-	}
-	return kIOReturnSuccess;
-}
-
-/*
- * The memory of an IOSurface as a buffer: its pixels, from the page after the surface's shared
- * state on (MiniIOSurface.h). The surface is held for as long as the buffer is there. A surface
- * that is a buffer of this client's already is that buffer again, as with Linux's handles: so
- * the client must not be giving that buffer back at the same moment (freedreno asks under the
- * lock it gives buffers back under). Asked only to describe (kRedwoodDescribe), no buffer is made.
- */
-IOReturn
-RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
-{
-	MiniIOSurface * s = MiniIOSurfaceCopy(request->surface);
-	struct gpu_buffer * b = NULL;
-	IOMemoryDescriptor * memory;
-	uint64_t size, began = mach_absolute_time();
-
-	if (s == NULL) {
-		return kIOReturnNotFound;
-	}
-	if (s->client != NULL) {
-		/* (memory of a program's own with a surface made around it: not in whole pages, and seldom in rows the GPU takes) */
-		MiniIOSurfaceDrop(s);
-		return kIOReturnUnsupported;
-	}
-	size = round_page_64(s->info.allocSize);
-	memory = IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut);
-	if (memory == NULL || size == 0 || size > GPU_BUFFER_MAX) {
-		OSSafeReleaseNULL(memory);
-		MiniIOSurfaceDrop(s);
-		return kIOReturnNoMemory;
-	}
-	request->size = size;
-	request->offset = s->info.offset;
-	request->rowBytes = s->info.bytesPerRow;
-	request->width = s->info.width;
-	request->height = s->info.height;
-	request->pixelFormat = s->info.pixelFormat;
-	request->planes = s->info.planeCount;
-	if (request->handle == kRedwoodDescribe) {
-		request->handle = 0;
-		memory->release();
-		MiniIOSurfaceDrop(s);
-		return kIOReturnSuccess;
-	}
-
-	IOLockLock(gGPULock);
-	for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
-		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
-			b = &fBuffers[i];
-			request->handle = i + 1;
-			break;
-		}
-	}
-	if (b != NULL) {
-		memory->release();
-		MiniIOSurfaceDrop(s);
-	} else if ((b = newBuffer(s->memory, PAGE_SIZE, size, 0, &request->handle)) != NULL) {
-		b->memory = memory;
-		b->kernel = s->kbase + PAGE_SIZE;
-		b->surface = s;
-		gGPUStat.surfaces++;
-	}
-	gGPUStat.taking += mach_absolute_time() - began;
-	IOLockUnlock(gGPULock);
-	if (b == NULL) {
-		memory->release();
-		MiniIOSurfaceDrop(s);
-		return kIOReturnNoMemory;
-	}
-	return kIOReturnSuccess;
-}
+#include "RedwoodGPUMemory.inc"
 
 IOReturn
 RedwoodGPUUserClient::gemInfo(struct msm_gem_info * request)
@@ -952,6 +568,11 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		goto out;
 	}
 	IOLockLock(gGPULock);
+	if (gGPUReported || !redwood_gpu_ready()) {
+		IOLockUnlock(gGPULock);
+		ret = kIOReturnNotReady;
+		goto out;
+	}
 	/*
 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
@@ -1004,6 +625,10 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		addresses[count] = b->address + cmds[i].submit_offset;
 		words[count++] = cmds[i].size / 4;
 	}
+	if (count == 0) {
+		IOLockUnlock(gGPULock);
+		goto out;
+	}
 	request->fence = redwood_gpu_submit(addresses, words, count);
 	/*
 	 * The ring is full and the core is not reading it: it has stopped. With gpu_recover=1 it is
@@ -1017,6 +642,11 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		if (!gGPUReported) {
 			request->fence = redwood_gpu_submit(addresses, words, count);
 		}
+	}
+	if (request->fence == 0) {
+		/* The backend may have published commands before the failure. Keep every mapped
+		 * descriptor, including buffers still carrying their previous fence. */
+		gGPUReported = true;
 	}
 	if (gpu_log && request->fence != 0) {
 		/* "tl: Q FENCE at US: N buffers, B of 4 MB or more, W words of commands": what was given (tl: q: what it took) */
@@ -1189,7 +819,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
 		return kIOReturnBadArgument;
 	}
-	if (!redwood_gpu_ready() && selector != kRedwoodShow) {
+	if ((gGPUReported || !redwood_gpu_ready()) && selector != kRedwoodShow) {
 		return kIOReturnNotReady;                       /* given back: the run is ending */
 	}
 	bzero(&r, sizeof(r));

@@ -174,9 +174,11 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 
 		absolutetime_to_nanoseconds(gGPUStat.making, &making);
 		absolutetime_to_nanoseconds(gGPUStat.allocating, &allocating);
-		IOLog("RedwoodGPU: buffers: %u made in %llu us each (%llu getting the memory), %u kept ones given again (%llu MB kept)\n",
+		IOLog("RedwoodGPU: buffers: %u made in %llu us each (%llu getting the memory; %u under 64 KB, %u under 1 MB, "
+		    "%u under 8 MB, %u larger), %u kept ones given again (%llu MB kept)\n",
 		    gGPUStat.made, gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0,
-		    gGPUStat.made ? allocating / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again, fKeptBytes >> 20);
+		    gGPUStat.made ? allocating / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.made_by_size[0], gGPUStat.made_by_size[1],
+		    gGPUStat.made_by_size[2], gGPUStat.made_by_size[3], gGPUStat.given_again, fKeptBytes >> 20);
 		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "

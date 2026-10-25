@@ -328,6 +328,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
 		gGPUStat.made++;
 		gGPUStat.making += mach_absolute_time() - began;
 		gGPUStat.allocating += allocated - began;
+		gGPUStat.made_by_size[size < (64u << 10) ? 0 : size < (1u << 20) ? 1 : size < (8u << 20) ? 2 : 3]++;
 	}
 	IOLockUnlock(gGPULock);
 	if (b == NULL) {

@@ -140,14 +140,17 @@ static bool redwood_platform_is_annibale() { return a830; }
 static bool ready, mapped_ok, unmap_ok, fence_done, recover_ok;
 static unsigned map_calls, unmap_calls, freed_addresses, done_calls, submit_calls, map_fail_at;
 static uint32_t submit_answer;
-static uint64_t next_address;
+static uint64_t next_address, last_base, base_phys, wrong_pages;
 static uint32_t gpu_log, gpu_va;
 static bool redwood_gpu_ready() { return ready; }
 static uint64_t redwood_gpu_address(uint64_t size) {
-    uint64_t result = next_address; next_address += size; return result;
+    uint64_t result = next_address; next_address += size; last_base = result; return result;
 }
 static void redwood_gpu_address_free(uint64_t, uint64_t) { ++freed_addresses; }
-static bool redwood_gpu_map(uint64_t, uint64_t, bool) {
+static bool redwood_gpu_map(uint64_t address, uint64_t phys, bool) {
+    /* every 4 KB of a buffer is entered at its own physical page */
+    if (address == last_base) base_phys = phys;
+    else wrong_pages += phys - base_phys != address - last_base;
     return ++map_calls != map_fail_at;
 }
 static bool redwood_gpu_mapped() { return mapped_ok; }
@@ -175,6 +178,7 @@ static void reset() {
     a830 = false; ready = mapped_ok = unmap_ok = fence_done = true;
     recover_ok = false;
     map_calls = unmap_calls = freed_addresses = done_calls = submit_calls = map_fail_at = 0;
+    wrong_pages = 0;
     submit_answer = 17; next_address = 0x40000000; now = 0;
     gGPUReported = gGPUCached = false; gGPUKeep = 0;
     IOBufferMemoryDescriptor::next_segment_limit = UINT64_MAX;
@@ -237,6 +241,13 @@ static void partial_map() {
     reset(); auto c = client(); IOBufferMemoryDescriptor::next_segment_limit = 1024;
     msm_gem_new request{PAGE_SIZE, 0, 0}; assert(c.gemNew(&request) == kIOReturnNoMemory);
     assert(map_calls == 0 && IOMemoryDescriptor::allocated.back()->freed); c.free();
+}
+static void segments() {
+    for (uint64_t limit : {uint64_t(4096), uint64_t(8192), uint64_t(PAGE_SIZE), UINT64_MAX}) {
+        reset(); auto c = client(); IOBufferMemoryDescriptor::next_segment_limit = limit;
+        allocate(c, 3 * PAGE_SIZE);
+        assert(map_calls == 3 * PAGE_SIZE / 4096 && wrong_pages == 0); c.free();
+    }
 }
 static void kept() {
     reset(); auto c = client(); gGPUKeep = 1; auto *b = allocate(c, GPU_KEEP_FROM); auto *m = b->memory;
@@ -317,9 +328,9 @@ static void display() {
     ready = true; assert(MiniIOSurfaceDrawn(&s, 0));
 }
 int main() {
-    healthy(); stopped(); failed_reap(); completed_reap(); failed_free(); partial_map(); kept();
+    healthy(); stopped(); failed_reap(); completed_reap(); failed_free(); partial_map(); segments(); kept();
     failed_surface(); surface_ownership(); full_pending(); failed_submit(); display(); reset();
-    printf("RedwoodGPU production lifecycle: 23 scenarios at %llu-byte pages passed\n", (unsigned long long)PAGE_SIZE);
+    printf("RedwoodGPU production lifecycle: 27 scenarios at %llu-byte pages passed\n", (unsigned long long)PAGE_SIZE);
 }
 '''
 

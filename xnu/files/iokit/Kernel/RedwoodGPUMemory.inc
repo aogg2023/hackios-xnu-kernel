@@ -157,11 +157,15 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
 		IOLog("RedwoodGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
 		return NULL;
 	}
-	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
+	/* one lookup for each physically contiguous run of the memory, one entry for each 4 KB of it */
+	for (uint64_t offset = 0; offset < size && mapped;) {
 		IOByteCount length = 0;
 		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
 
-		mapped = phys != 0 && (phys & 4095) == 0 && length >= 4096 && redwood_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
+		mapped = phys != 0 && (phys & 4095) == 0 && length >= 4096;
+		for (uint64_t run = 0; mapped && run + 4096 <= length && offset < size; run += 4096, offset += 4096) {
+			mapped = redwood_gpu_map(b->address + offset, phys + run, flags & MSM_BO_GPU_READONLY);
+		}
 	}
 	mapped = redwood_gpu_mapped() && mapped;
 	if (!mapped) {
@@ -314,6 +318,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
 	if (gGPUCached) {
 		redwood_gpu_to_memory(memory->getBytesNoCopy(), size);
 	}
+	uint64_t allocated = mach_absolute_time();
 
 	IOLockLock(gGPULock);
 	b = newBuffer(memory, 0, size, request->flags, &request->handle);
@@ -322,6 +327,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
 		b->kernel = (uint8_t *) memory->getBytesNoCopy();
 		gGPUStat.made++;
 		gGPUStat.making += mach_absolute_time() - began;
+		gGPUStat.allocating += allocated - began;
 	}
 	IOLockUnlock(gGPULock);
 	if (b == NULL) {

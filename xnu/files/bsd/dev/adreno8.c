@@ -55,6 +55,9 @@
  * adreno8_speed=N     GX operating point; only 1 (160 MHz) is exposed before SKU selection
  * adreno8_gmuclk=1    retain CX/MX votes, initialize GMU 650/HUB 200 MHz, then GMU 500
  *                  after START; requires touchscreen=0 wfi=0 wfe_mode=0; default uses the crystal
+ * adreno8_gmuclk=2    stage 5 only: highest supported CX/MX WRITE completion and PLL/RCG;
+ *                  same explicit zero parameters, no preceding ARC READ, no START;
+ *                  retain requests until cold reset
  * adreno8_return=1    return to the resident loader after cleanup
  *
  * Firmware family is gen80000, as loaded by Android and specified by the vendor gen8.0.0
@@ -79,7 +82,7 @@ uint32_t adreno8_skip_steps, adreno8_pause_ms = 2200, adreno8_fine, adreno8_watc
 
 uint32_t adreno8_speed_asked;                  /* adreno8_speed: 1 lowest (step 15) */
 
-uint32_t adreno8_gmu_from_pll;                 /* adreno8_gmuclk=1 */
+uint32_t adreno8_gmu_from_pll;                 /* adreno8_gmuclk */
 
 bool adreno8_gpu_stall;                        /* adreno8_gpu_stall=1 */
 
@@ -376,6 +379,10 @@ adreno8_init(void)
 	one = 0;
 	adreno8_gpu_stall = PE_parse_boot_argn("adreno8_gpu_stall", &one, sizeof(one)) && one == 1;
 	PE_parse_boot_argn("adreno8_skip", &adreno8_skip_steps, sizeof(adreno8_skip_steps));
+	if (adreno8_gmu_from_pll == 2 && (asked != 5 || only != 0 || adreno8_skip_steps != 0)) {
+		printf("adreno8: gmuclk=2 requires adreno8=5 without only or skip; no steps attempted\n");
+		return;
+	}
 	if (asked > count) {
 		asked = count;
 	}

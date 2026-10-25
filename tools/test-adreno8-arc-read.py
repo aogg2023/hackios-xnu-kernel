@@ -22,6 +22,7 @@ struct adreno8_block { const char *name; uint32_t phys, size; vm_offset_t base; 
 #define RPMH_LEVELS 64
 static bool adreno8_reset_required;
 static uint32_t adreno8_gmu_from_pll;
+static uint32_t adreno8_step = 5, adreno8_newest_step = 5;
 static bool PE_parse_boot_argn(const char *, void *, unsigned);
 static uint32_t adreno8_get(struct adreno8_block *, const char *, uint32_t);
 static void adreno8_put(struct adreno8_block *, const char *, uint32_t, uint32_t);

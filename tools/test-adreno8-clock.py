@@ -22,7 +22,8 @@ struct adreno8_block { const char *name; uint32_t phys, size; vm_offset_t base; 
 static uint32_t gpu[0x9800 / 4], gcc[0x80000 / 4];
 struct adreno8_block adreno8_gpucc = {"gpucc", 0x3d90000, sizeof(gpu), (uintptr_t)gpu};
 struct adreno8_block adreno8_gcc = {"gcc", 0x100000, sizeof(gcc), (uintptr_t)gcc};
-static bool adreno8_gmu_from_pll, adreno8_reset_required, resources, pending_latch;
+static uint32_t adreno8_gmu_from_pll, adreno8_step, adreno8_newest_step;
+static bool adreno8_reset_required, resources, pending_latch;
 static unsigned reads, writes, resource_calls, running, elapsed_us;
 static unsigned mode, drop_write, poison_read, pll_writes, rcg_updates;
 static struct { bool is_gpu; uint32_t offset, value; } history[128];
@@ -99,6 +100,7 @@ CASES = r'''
 static void reset(unsigned next) {
     memset(gpu,0,sizeof(gpu)); memset(gcc,0,sizeof(gcc)); memset(history,0,sizeof(history));
     resources=adreno8_reset_required=pending_latch=false; adreno8_gmu_from_pll=true;
+    adreno8_step=adreno8_newest_step=5;
     reads=writes=resource_calls=running=elapsed_us=drop_write=poison_read=pll_writes=rcg_updates=0;
     mode=next; clock_state=CLOCK_COLD;
     gpu[0]=0x100; gpu[4]=0x440000; gpu[6]=1; gpu[7]=2;
@@ -184,6 +186,18 @@ int main(void) {
     assert(adreno8_clock_started() && writes==done_writes);
     gpu[5]++; assert(!adreno8_clock_started()); closed();
 
+    for(unsigned bad=0;bad<2;bad++) {
+        reset(NORMAL); adreno8_gmu_from_pll=2;
+        if(bad) adreno8_step=14; else adreno8_newest_step=17;
+        assert(!adreno8_clock_boot() && !reads && !writes && !resource_calls);
+        closed();
+    }
+    reset(NORMAL); adreno8_gmu_from_pll=2;
+    assert(adreno8_clock_boot());
+    unsigned diagnostic_writes=writes, diagnostic_reads=reads;
+    assert(!adreno8_clock_started());
+    assert(writes==diagnostic_writes && reads==diagnostic_reads);
+    closed();
     for(unsigned fault=RESOURCE_FAIL;fault<=HUB_UPDATE_FAIL;fault++) {
         reset(fault); assert(!adreno8_clock_boot());
         if(fault==RESOURCE_FAIL) assert(!writes && !reads);
@@ -257,6 +271,89 @@ int main(void) {
 '''
 
 
+INIT_STUB = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+static uint32_t requested, selected, omitted, clock_mode;
+static uint32_t adreno8_pause_ms, adreno8_watch_seconds, adreno8_speed_asked;
+static uint32_t adreno8_gmu_from_pll, adreno8_gpu8_secure_mode, adreno8_fine;
+static uint32_t adreno8_skip_steps, adreno8_newest_step, adreno8_step;
+static bool adreno8_gpu8_keep, adreno8_gpu8_return, adreno8_gpu_stall, adreno8_cx_changed;
+static struct { uintptr_t base; } adreno8_gmu;
+static unsigned calls, holds, stopped, returned, last_stage, checks;
+static uint32_t visited;
+#define SECURE_MODE_TRANSLATION_B 4
+#define GMU_ALWAYS_ON_HI 0
+#define GMU_ALWAYS_ON_LO 4
+#define GMU_GENERAL_9 8
+#define GMU_AO_INTERRUPT_STATUS 12
+#define GMU_PWR_CLK_STATUS 16
+static int init_log(const char *format, ...) { (void)format; return 0; }
+#define printf init_log
+static bool PE_parse_boot_argn(const char *key, void *out, unsigned size) {
+    assert(size==4);
+    uint32_t value;
+    if(!strcmp(key,"adreno8")) value=requested;
+    else if(!strcmp(key,"adreno8_only")) value=selected;
+    else if(!strcmp(key,"adreno8_skip")) value=omitted;
+    else if(!strcmp(key,"adreno8_gmuclk")) value=clock_mode;
+    else if(!strcmp(key,"adreno8_keep")) value=1;
+    else if(!strcmp(key,"adreno8_watch")) value=0;
+    else return false;
+    memcpy(out,&value,sizeof(value)); return true;
+}
+static bool phase(unsigned number) {
+    assert(number==adreno8_step && number>last_stage && number<=23);
+    last_stage=number; visited|=1u<<(number-1); calls++; return true;
+}
+static void adreno8_hold(bool fine) { assert(!fine); holds++; }
+static void adreno8_smmu_cb_scan_ask(void) { assert(false); }
+static void adreno8_sleep_ms(uint32_t ms) { (void)ms; assert(false); }
+static uint32_t adreno8_rd(uintptr_t address) { (void)address; assert(false); return 0; }
+static void adreno8_gpu8_block_stop(void) { stopped++; }
+static void loader_return(void) { returned++; }
+'''
+
+INIT_CASES = r'''
+#undef printf
+static void check(uint32_t mode, uint32_t asked, uint32_t only, uint32_t skip, uint32_t expected) {
+    requested=asked; selected=only; omitted=skip; clock_mode=mode;
+    adreno8_gmu_from_pll=adreno8_skip_steps=adreno8_newest_step=adreno8_step=0;
+    adreno8_gpu8_keep=adreno8_gpu8_return=adreno8_cx_changed=false;
+    calls=holds=stopped=returned=last_stage=visited=0;
+    adreno8_init();
+    unsigned count=0;
+    for(unsigned bit=0;bit<23;bit++) count+=(expected>>bit)&1;
+    assert(visited==expected && calls==count && holds==count && !stopped && !returned);
+    checks++;
+}
+int main(void) {
+    check(2,5,0,0,0x1f);
+    const uint32_t rejected[][3]={
+        {5,14,0}, {5,5,0}, {5,0,1u<<4}, {14,0,0}, {14,5,0},
+        {23,0,0}, {UINT32_MAX,0,0}, {4,0,0}, {0,0,0}, {5,0,1u<<31}
+    };
+    for(unsigned i=0;i<sizeof(rejected)/sizeof(*rejected);i++)
+        check(2,rejected[i][0],rejected[i][1],rejected[i][2],0);
+    for(unsigned mode=0;mode<=1;mode++) {
+        check(mode,5,0,0,0x1f);
+        check(mode,14,0,0,0x3fff);
+        check(mode,5,14,0,1u<<13);
+        check(mode,14,5,0,1u<<4);
+        check(mode,14,0,1u<<4,0x3fff&~(1u<<4));
+        check(mode,UINT32_MAX,0,0,0x7fffff);
+        check(mode,5,0,1u<<31,0x1f);
+        check(mode,0,0,0,0);
+    }
+    printf("Sun init admission: %u production cases PASS\n",checks);
+    return 0;
+}
+'''
+
+
 def vendor_check(directory):
     gpu = (directory / "drivers/clk/qcom/gpucc-sun.c").read_text()
     gcc = (directory / "drivers/clk/qcom/gcc-sun.c").read_text()
@@ -284,9 +381,9 @@ def main():
         (path / "adreno8_private.h").write_text(STUB)
         (path / "adreno8_rpmh_private.h").write_text('#include "adreno8_private.h"\n')
         (path / "adreno8_clock_private.h").write_text((DEV / "adreno8_clock_private.h").read_text())
-        def run(label, content, success=True):
+        def run(label, content, success=True, cases=CASES):
             src, binary = path / (label + ".c"), path / label
-            src.write_text(content + CASES)
+            src.write_text(content + cases)
             subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
                             "-fno-omit-frame-pointer", "-I", str(path), str(src), "-o", str(binary)],
                            check=True, capture_output=True, text=True)
@@ -316,12 +413,34 @@ def main():
             ("no-inherited-GMU-parent-check", 'if (gmu_parent != 0 && gmu_parent != 2 && gmu_parent != 5 && gmu_parent != 6)', 'if (false)'),
             ("no-inherited-HUB-range-check", 'if (hub_parent != 0 && (hub_source & 0x371f) != 0x505)',
              '(void)hub_parent; if (false)'),
+            ("diagnostic-wrong-stage", 'if (adreno8_gmu_from_pll == 2 && (adreno8_step != 5 || adreno8_newest_step != 5))', 'if (false)'),
+            ("diagnostic-enters-START", 'if (adreno8_gmu_from_pll != 1) return clock_fail("stage-5-only clock diagnostic cannot enter START");', ''),
             ("parent-gate-before-source-check", '!pll_configure() || !hub_parent()', '!hub_parent() || !pll_configure()'),
         ]
         for label, before, after in mutations:
             assert before in production, label
             run(label, production.replace(before, after, 1), success=False)
         print("Sun clock mutations rejected:", len(mutations))
+
+        init = re.search(r"\nvoid\nadreno8_init\(void\)\n\{.*?\n\}",
+                         (DEV / "adreno8.c").read_text(), re.S).group()
+        entries = init.split("each[])(void) = {", 1)[1].split("};", 1)[0]
+        names = re.findall(r"\badreno8_\w+\b", entries)
+        assert len(names) == 23 and len(set(names)) == 23
+        phases = "\n".join(f"static bool {name}(void) {{ return phase({i}); }}"
+                           for i, name in enumerate(names, 1))
+        run("init-admission", INIT_STUB + phases + init, cases=INIT_CASES)
+        admission_mutations = [
+            ("asked", "asked != 5 || ", ""),
+            ("only", "only != 0 || ", ""),
+            ("skip", "adreno8_skip_steps != 0", "false"),
+        ]
+        for label, before, after in admission_mutations:
+            assert init.count(before) == 1, label
+            changed = init.replace(before, after, 1)
+            run("init-admission-" + label, INIT_STUB + phases + changed,
+                success=False, cases=INIT_CASES)
+        print("Sun init admission mutations rejected:", len(admission_mutations))
 
 
 if __name__ == "__main__":

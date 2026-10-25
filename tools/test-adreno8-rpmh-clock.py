@@ -131,7 +131,7 @@ static void setup(void) {
     for(unsigned i=3;i<8;i++) regs[(0xd00+i*0x2a0+0x28)/4]=1;
     switch(scenario) {
     case 1: adreno8_gmu_from_pll=0; break;
-    case 2: adreno8_gmu_from_pll=2; break;
+    case 2: adreno8_gmu_from_pll=3; break;
     case 9: regs[0]=0x30700; break;
     case 10: regs[1]=UINT32_MAX; break;
     case 11: regs[1]|=1u<<24; break;
@@ -197,12 +197,175 @@ int main(int argc,char **argv) {
 '''
 
 
-def run(source, target, cases, reject=False):
+HIGHEST_MODEL = r'''
+#include "adreno8_rpmh.c"
+#undef printf
+static uint32_t regs[0x10000/4], before[0x10000/4], votes[2];
+static uint8_t raw[2][34];
+static unsigned scenario, fail_at, reads, writes, lookups, triggers, voltage_writes, polls, tx_polls;
+static bool done, triggered, poison, prior_read;
+static unsigned rail;
+static bool PE_parse_boot_argn(const char *name,void *out,unsigned size) {
+    assert(size==4); *(uint32_t *)out=0;
+    if(!strcmp(name,"adreno8_arc_read")) { *(uint32_t *)out=1; return true; }
+    unsigned n=!strcmp(name,"touchscreen")?0:!strcmp(name,"wfi")?1:2;
+    assert(n!=2 || !strcmp(name,"wfe_mode"));
+    if(scenario==3+2*n) return false;
+    if(scenario==4+2*n) *(uint32_t *)out=1;
+    return true;
+}
+static void adreno8_settle(void) {}
+static void adreno8_sleep_us(uint32_t us) { assert(us==100); }
+static uint32_t adreno8_rpmh_lookup(const char *name,uint16_t *levels,unsigned *count,
+                                  const uint8_t **data,unsigned *length) {
+    unsigned r=!strcmp(name,"cx.lvl")?0:1;
+    assert(!r || !strcmp(name,"mx.lvl")); assert(lookups++==r);
+    const uint16_t values[]={0,16,64,128,192,256,320,384,416,448,480};
+    memcpy(levels,values,sizeof(values)); *count=r?10:11;
+    if((scenario==22 && !r) || (scenario==23 && r)) *count=0;
+    if(scenario==24 && !r) levels[10]--;
+    if(scenario==25 && r) levels[9]--;
+    if(scenario==26 && r) levels[4]--;
+    if(data) {
+        assert(length); *data=raw[r]; *length=scenario==1?32:2*(r?10:11);
+        if(scenario==27 && r) { *length=32; raw[r][30]=1; }
+        if(scenario==28 && r) *length=21;
+        if(scenario==29 && r) *length=34;
+        if(scenario==30 && r) *length=18;
+        if(scenario==31 && r) *data=NULL;
+        if(scenario==32 && r) *length=0;
+        if(scenario==63 && r) raw[r][8]--;
+    } else assert(prior_read && !length);
+    if((scenario==20 && !r) || (scenario==21 && r)) return 0x30004;
+    if(scenario==33 && r) return 0;
+    if(scenario==34 && r) return 0x30000;
+    return 0x30000+0x10*r;
+}
+static uint32_t adreno8_get(struct adreno8_block *b,const char *name,uint32_t off) {
+    assert(!poison && b->phys==0x16520000 && b->size==0x10000 && off<b->size && !(off&3));
+    assert(off!=ARC_RESPONSE || prior_read);
+    b->base=0x100000; reads++;
+    if((scenario==56 && !strcmp(name,"irq status after request")) ||
+       (scenario==57 && off==ARC_COMMAND_STATUS) ||
+       (((scenario==58 && triggers==1) || (scenario==59 && triggers==2)) &&
+        !strcmp(name,"irq enable before restore"))) return UINT32_MAX;
+    if((scenario==60 && !strcmp(name,"irq enable before request")) ||
+       (scenario==61 && !strcmp(name,"irq enable before restore"))) regs[ARC_IRQ_ENABLE/4]|=1u<<5;
+    return regs[off/4];
+}
+static void adreno8_put(struct adreno8_block *b,const char *name,uint32_t off,uint32_t value) {
+    (void)name; assert(!poison && adreno8_reset_required && b->phys==0x16520000);
+    assert(off==ARC_CONTROL || off==ARC_ENABLE || off==ARC_MSGID || off==ARC_ADDRESS ||
+        off==ARC_DATA || off==ARC_WAIT || off==ARC_IRQ_ENABLE || off==ARC_IRQ_CLEAR);
+    assert(!triggered || done || (off==ARC_CONTROL && value==(ARC_AMC_ENABLE|ARC_AMC_TRIGGER)));
+    writes++;
+    if(off==ARC_MSGID) assert(value==(prior_read?0x108u:0x10108u));
+    if(off==ARC_ADDRESS) assert(value==0x30000 || value==0x30010);
+    if(off==ARC_DATA) {
+        assert(!prior_read && lookups==2);
+        assert(value==(regs[ARC_ADDRESS/4]==0x30000?10u:9u)); voltage_writes++;
+    }
+    if(fail_at==writes) { regs[off/4]=value^1; return; }
+    if(off==ARC_IRQ_CLEAR) {
+        assert(done && value==ARC_TCS_BIT);
+        if(scenario!=62) regs[ARC_IRQ_STATUS/4]&=~value;
+        return;
+    }
+    if(off==ARC_CONTROL && value==(ARC_AMC_ENABLE|ARC_AMC_TRIGGER)) {
+        assert(regs[ARC_CONTROL/4]==ARC_AMC_ENABLE && !(regs[ARC_IRQ_STATUS/4]&ARC_TCS_BIT));
+        assert(regs[ARC_ENABLE/4]==1 && regs[ARC_WAIT/4]==unsigned(!prior_read));
+        assert(lookups==2 || prior_read);
+        rail=regs[ARC_ADDRESS/4]==0x30000?0:1;
+        triggered=true; done=false; tx_polls=0; triggers++;
+    }
+    regs[off/4]=value;
+}
+static uint32_t adreno8_rd(vm_offset_t addr) {
+    assert(addr==0x100000+ARC_IRQ_STATUS && triggered && !poison);
+    reads++; polls++; tx_polls++;
+    if((scenario==54 && triggers==1) || (scenario==55 && triggers==2)) { poison=true; return UINT32_MAX; }
+    bool timeout=(scenario==50 && triggers==1) || (scenario==51 && triggers==2);
+    if(tx_polls==3 && !timeout) {
+        done=true;
+        if(!prior_read) votes[rail]=regs[ARC_DATA/4];
+        regs[ARC_IRQ_STATUS/4]|=ARC_TCS_BIT|4;
+        regs[ARC_COMMAND_STATUS/4]=((scenario==52 && triggers==1) || (scenario==53 && triggers==2))?1u<<8:ARC_COMMAND_DONE;
+        regs[ARC_STATUS/4]=1; regs[ARC_RESPONSE/4]=0;
+    }
+    return regs[ARC_IRQ_STATUS/4];
+}
+static void setup(void) {
+    adreno8_gmu_from_pll=2;
+    regs[0]=0x30800; regs[1]=0x04010100; regs[3]=0x800c8104;
+    regs[ARC_CONTROL/4]=ARC_AMC_ENABLE;
+    regs[0xd28/4]=regs[0xfc8/4]=regs[0x1268/4]=1;
+    regs[ARC_IRQ_ENABLE/4]=scenario==2?3:1;
+    for(unsigned i=3;i<8;i++) regs[(0xd00+i*0x2a0+0x28)/4]=1;
+    const uint16_t values[]={0,16,64,128,192,256,320,384,416,448,480};
+    for(unsigned r=0;r<2;r++) for(unsigned j=0;j<(r?10u:11u);j++) {
+        raw[r][2*j]=values[j]&255; raw[r][2*j+1]=values[j]>>8;
+    }
+    switch(scenario) {
+    case 9: adreno8_step=4; break;
+    case 10: adreno8_newest_step=6; break;
+    case 12: arc_state=ARC_CLOSED; break;
+    case 13: adreno8_gmu_from_pll=3; break;
+    case 35: regs[0]=0x30700; break;
+    case 36: regs[1]|=1u<<24; break;
+    case 37: regs[0xd28/4]=0; break;
+    case 38: regs[0xfc8/4]=0; break;
+    case 39: regs[0x1268/4]=0; break;
+    case 40: regs[ARC_ENABLE/4]=1; break;
+    case 41: regs[ARC_WAIT/4]=1; break;
+    case 42: regs[ARC_CONTROL/4]|=ARC_AMC_TRIGGER; break;
+    case 43: regs[ARC_IRQ_STATUS/4]=ARC_TCS_BIT; break;
+    case 44: regs[(0xd00+3*0x2a0+0x2c)/4]=1; break;
+    case 45: regs[(0xd00+5*0x2a0+0x24)/4]=1; break;
+    }
+    if(scenario==11) {
+        prior_read=true; assert(adreno8_rpmh_arc_read()); prior_read=false;
+        reads=writes=lookups=triggers=polls=voltage_writes=0;
+    }
+    memcpy(before,regs,sizeof(regs));
+}
+int main(int argc,char **argv) {
+    assert(argc>=2); scenario=atoi(argv[1]); if(argc>2)fail_at=atoi(argv[2]); setup();
+    bool result=adreno8_rpmh_clock_prepare();
+    if(fail_at) assert(!result && writes==fail_at && adreno8_reset_required);
+    else assert(result==(scenario<=2 || scenario==61));
+    if(scenario>=3 && scenario<=13) assert(!reads && !writes && !lookups);
+    if((scenario>=20 && scenario<=45) || scenario==63) assert(!writes && !triggers);
+    if(result) {
+        assert(lookups==2 && triggers==2 && voltage_writes==2 && writes==34);
+        assert(votes[0]==10 && votes[1]==9 && adreno8_reset_required);
+        assert(regs[ARC_CONTROL/4]==ARC_AMC_ENABLE && !regs[ARC_ENABLE/4] && !regs[ARC_WAIT/4]);
+        assert(regs[ARC_IRQ_STATUS/4]==4 && regs[ARC_IRQ_ENABLE/4]==((scenario==2?3u:1u)|(scenario==61?1u<<5:0)));
+    }
+    if(scenario>=50 && scenario<=55) {
+        assert(triggers==(scenario%2+1) && voltage_writes==triggers);
+        if(scenario<=51) assert(tx_polls==100000 && !done);
+        if(scenario>=54) assert(tx_polls==1 && !done);
+    }
+    if((scenario>=56 && scenario<=59) || scenario==62) assert(triggers==(scenario==59?2u:1u));
+    if(scenario==60) assert(!triggers && voltage_writes==1);
+    for(unsigned i=0;i<0x10000/4;i++) {
+        unsigned off=4*i;
+        if(off!=ARC_IRQ_ENABLE && off!=ARC_IRQ_STATUS && !(off>=ARC_WAIT && off<=ARC_RESPONSE)) assert(regs[i]==before[i]);
+    }
+    unsigned r=reads,w=writes,l=lookups;
+    assert(!adreno8_rpmh_clock_prepare());
+    if(arc_state==ARC_CLOSED) assert(!adreno8_rpmh_arc_read());
+    assert(reads==r && writes==w && lookups==l);
+}
+'''
+
+
+def run(source, target, cases, reject=False, model=MODEL):
     fixture = runpy.run_path(str(ROOT / "tools/test-adreno8-arc-read.py"))
     (target / "adreno8_private.h").write_text(fixture["HEADER"])
     (target / "adreno8_rpmh_private.h").write_text((DEV / "adreno8_rpmh_private.h").read_text())
     (target / "adreno8_rpmh.c").write_text(source)
-    (target / "check.cpp").write_text(MODEL)
+    (target / "check.cpp").write_text(model)
     binary = target / "check"
     subprocess.run(["c++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
                     "-Wno-missing-field-initializers", "-fsanitize=address,undefined",
@@ -229,7 +392,7 @@ def main():
         ("allow_solver", "(solver & (1u << 24)) == 0", "true", (11,)),
         ("skip_sleep_guard", 'i = 3; i < 8', 'i = 8; i < 8', (13,)),
         ("ignore_touch", 'zero != 0', 'false', (4,)),
-        ("repeat", "adreno8_gmu_from_pll != 1 || arc_state == ARC_CLOSED", "adreno8_gmu_from_pll != 1", (0,)),
+        ("repeat", "adreno8_gmu_from_pll > 2 || arc_state == ARC_CLOSED", "adreno8_gmu_from_pll > 2", (0,)),
         ("irq_peer_loss", "irq & ~(ARC_TCS_BIT & ~irq_before)", "irq_before", (49,)),
         ("write_read_message", "write ? 0x10108u : 0x108u", "0x108u", (0,)),
         ("timeout_cleanup", 'printf("adreno8: ARC transaction completion unconfirmed;',
@@ -245,10 +408,28 @@ def main():
         for name, old, new, case in mutations:
             assert production.count(old) == 1, name
             run(production.replace(old, new, 1), target, [case], True)
+        highest_cases = [(n,) for n in (*range(14), *range(20,46), *range(50,64))]
+        highest_cases += [(0,n) for n in range(1,35) if n not in (10,15,27,32)]
+        run(production, target, highest_cases, model=HIGHEST_MODEL)
+        highest_mutations = [
+            ("highest_stage", "adreno8_step != 5 || adreno8_newest_step != 5 || read_used", "adreno8_newest_step != 5 || read_used", (9,)),
+            ("highest_newest", "adreno8_step != 5 || adreno8_newest_step != 5 || read_used", "adreno8_step != 5 || read_used", (10,)),
+            ("highest_prior_read", "adreno8_newest_step != 5 || read_used", "adreno8_newest_step != 5 || (read_used && false)", (11,)),
+            ("highest_map", "memcmp(votes[i].levels, expected, count * sizeof(expected[0])) != 0", "false", (24,)),
+            ("highest_padding", "level != (j < count ? expected[j] : 0)", "false && level != (j < count ? expected[j] : 0)", (27,)),
+            ("highest_length", "length > 32 ||", "", (29,)),
+            ("highest_selector", "votes[i].selector = count - 1;", "votes[i].selector = 3;", (0,)),
+            ("highest_missing_ack", "if (!arc_transfer(&votes[i], true)) return false;", "if (false) return false;", (0,)),
+            ("highest_arc_read", "if (!arc_transfer(&votes[i], true)) return false;", "if (!arc_transfer(&votes[i], false)) return false;", (0,)),
+        ]
+        for name, old, new, case in highest_mutations:
+            assert production.count(old) == 1, name
+            run(production.replace(old, new, 1), target, [case], True, HIGHEST_MODEL)
         unreadable_irq = production.replace('irq != 0xffffffffu && (irq & ARC_TCS_BIT)', '(irq & ARC_TCS_BIT)', 1)
         unreadable_irq = unreadable_irq.replace('irq == 0xffffffffu || !(irq & ARC_TCS_BIT)', '!(irq & ARC_TCS_BIT)', 1)
         assert unreadable_irq != production
         run(unreadable_irq, target, [(60,)], True)
+    print(f"ARC highest stage 5: {len(highest_cases)} production scenarios PASS; {len(highest_mutations)} mutations rejected")
     print(f"ARC ACTIVE CX/MX: {len(cases)} production scenarios PASS; {len(mutations) + 1} mutations rejected")
 
 

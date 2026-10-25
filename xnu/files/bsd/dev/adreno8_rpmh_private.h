@@ -10,7 +10,10 @@ bool adreno8_rpmh_arc_read(void);
 
 /* gmuclk=1 requires explicit touchscreen/wfi/wfe_mode=0 and empty sleep/wake/fast
  * TCSes. Read this boot's CX/MX votes, retain max(inherited, level 128), confirm
- * each ACTIVE vote before clocks start, and keep it until cold reset. Once only. */
+ * each ACTIVE vote before clocks start, and keep it until cold reset. Once only.
+ * gmuclk=2 permits only stage 5 from COLD without a preceding ARC read. Validate
+ * both live CMD DB maps, then request their highest legal selectors using WRITE
+ * completion without resource READ. The same explicit parameters and TCS guards apply. */
 bool adreno8_rpmh_clock_prepare(void);
 
 #endif

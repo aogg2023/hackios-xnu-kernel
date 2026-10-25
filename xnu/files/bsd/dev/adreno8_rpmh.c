@@ -168,7 +168,7 @@ arc_resource_read(const char *resource, struct arc_vote *vote)
 		return false;
 	}
 	if (!arc_transfer(vote, false)) return false;
-	printf("adreno8: ARC %s inherited selector %u, level %u; read completed, host cold reset required\n",
+	printf("adreno8: ARC %s response selector %u, level %u; read completed, host cold reset required\n",
 	    resource, vote->selector, vote->levels[vote->selector]);
 	return true;
 }
@@ -207,8 +207,10 @@ adreno8_rpmh_clock_prepare(void)
 	const char *arguments[] = {"touchscreen", "wfi", "wfe_mode"};
 
 	if (adreno8_gmu_from_pll == 0) return true;
-	if (adreno8_gmu_from_pll != 1 || arc_state == ARC_CLOSED) return false;
+	if (adreno8_gmu_from_pll > 2 || arc_state == ARC_CLOSED) return false;
+	bool highest = adreno8_gmu_from_pll == 2, read_used = arc_state != ARC_COLD;
 	arc_state = ARC_CLOSED;
+	if (highest && (adreno8_step != 5 || adreno8_newest_step != 5 || read_used)) return false;
 	for (unsigned i = 0; i < 3; i++) {
 		if (!PE_parse_boot_argn(arguments[i], &zero, sizeof(zero)) || zero != 0) {
 			printf("adreno8: ARC clock votes require explicit %s=0\n", arguments[i]);
@@ -224,6 +226,36 @@ adreno8_rpmh_clock_prepare(void)
 		    arc_read("inactive TCS control", base + 0x24) != 0 ||
 		    arc_read("inactive TCS status", base + 0x28) != 1 ||
 		    arc_read("inactive TCS enable", base + 0x2c) != 0) return false;
+	}
+	if (highest) {
+		/* The live Sun DT allows ARC LEVEL_MAX on CX/MX. Validate the complete
+		 * observed CMD DB maps before selecting their highest legal corners.
+		 * rpmhpd.c uses level_count-1 before sync_state; rpmh_write completes
+		 * on the response IRQ without a resource READ. This stage-5 diagnostic
+		 * keeps that completion contract and leaves physical rail state unmeasured. */
+		static const uint16_t expected[] = {0, 16, 64, 128, 192, 256, 320, 384, 416, 448, 480};
+		for (unsigned i = 0; i < 2; i++) {
+			const uint8_t *data = NULL;
+			unsigned length = 0, count = i == 0 ? 11 : 10;
+			votes[i].address = adreno8_rpmh_lookup(names[i], votes[i].levels, &votes[i].count, &data, &length);
+			if (votes[i].address != 0x30000u + i * 0x10u || votes[i].count != count ||
+			    !data || length < 2 * count || length > 32 || (length & 1) ||
+			    memcmp(votes[i].levels, expected, count * sizeof(expected[0])) != 0) {
+				printf("adreno8: ARC highest-corner diagnostic has an unknown %s CMD DB map\n", names[i]);
+				return false;
+			}
+			for (unsigned j = 0; j < length / 2; j++) {
+				uint16_t level = (uint16_t)(data[2 * j] | data[2 * j + 1] << 8);
+				if (level != (j < count ? expected[j] : 0)) return false;
+			}
+			votes[i].selector = count - 1;
+		}
+		for (unsigned i = 0; i < 2; i++) {
+			if (!arc_transfer(&votes[i], true)) return false;
+			printf("adreno8: ARC %s highest legal selector %u level %u WRITE completed; retained until cold reset\n",
+			    names[i], votes[i].selector, votes[i].levels[votes[i].selector]);
+		}
+		return true;
 	}
 	/* gpucc-sun.c uses VDD_LOW (level 128) on both rails for GMU 650 MHz.
 	 * Keep any higher inherited DRV2 vote, including after the switch to 500 MHz. */

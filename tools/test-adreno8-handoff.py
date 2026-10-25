@@ -71,8 +71,6 @@ world = r'''
 /* The queue world from the hwsched test: host arrays for the four HFI
  * buffers, a small GMU register window, and an injected firmware that
  * answers every pre-START message and then sends the kind-5 MEM_ALLOC. */
-struct block { vm_offset_t base; };
-static struct block adreno8_gmu;
 static uint32_t table[1024], commands[1024], responses[1024], debug[1024], gmu_regs[4];
 static bool adreno8_direct_ring;
 static vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd;

@@ -26,6 +26,8 @@ adreno8_smmu_layout(void)
 {
 	uint32_t idr0 = adreno8_get(&adreno8_smmu, "idr0", SMMU_IDR0), idr1 = adreno8_get(&adreno8_smmu, "idr1", SMMU_IDR1);
 
+	if (adreno8_direct_ring && (idr0 == ~0u || idr1 == ~0u)) return false;
+
 	adreno8_smmu_page = idr1 >> 31 ? 0x10000 : 0x1000;
 	adreno8_smmu_pages = 2u << (idr1 >> 28 & 7);
 	adreno8_smmu_contexts = idr1 & 0xff;
@@ -124,6 +126,54 @@ adreno8_smmu_cb_scan_after_step9(void)
 	adreno8_cb_scan("post-step-9");
 }
 
+/* Early ordinary-mode diagnostic, before this driver enables any context.
+ * NSNH covers unlocked Non-secure non-Hyp entries and may over-invalidate
+ * (Arm IHI 0062D.c 9.6.29). This scan covers only SMRs visible to HLOS;
+ * secure-world reservations stay outside its checks. No route/context or Hyp write.
+ * Fixed MiCode arm-smmu.c writes QCOM_DUMMY_VAL to both WO commands. */
+static bool
+adreno8_smmu_early_ns_tlb(void)
+{
+	uint32_t reset, gx, status;
+	uint64_t start, elapsed;
+
+	if (adreno8_gmu_space.is_on || adreno8_gpu_space.is_on || adreno8_secure_space.is_on) {
+		printf("adreno8: %u: early NS TLB invalidation requires all owned contexts off\n", adreno8_step);
+		return false;
+	}
+	reset = adreno8_get(&adreno8_gmu, "early NS TLB CM3 reset", GMU_CM3_SYSRESET);
+	gx = adreno8_get(&adreno8_gmu, "early NS TLB GX status", GMU_PWR_CLK_STATUS);
+	if (reset == ~0u || !(reset & 1) || gx == ~0u || (gx & 3) != 3) {
+		printf("adreno8: %u: early NS TLB invalidation requires CM3 reset and GX off\n", adreno8_step);
+		return false;
+	}
+	for (uint32_t i = 0; i < adreno8_smmu_matches; i++) {
+		if (adreno8_get(&adreno8_smmu, "early NS TLB SMR", SMMU_SMR(i)) & SMR_VALID) {
+			printf("adreno8: %u: early NS TLB invalidation rejected visible match %u\n", adreno8_step, i);
+			return false;
+		}
+	}
+	adreno8_reset_required = true;
+	adreno8_settle();
+	adreno8_put(&adreno8_smmu, "early NS TLB invalidate", SMMU_TLBIALLNSNH, ~0u);
+	adreno8_settle();
+	adreno8_put(&adreno8_smmu, "early NS TLB sync", SMMU_TLBGSYNC, ~0u);
+	start = mach_absolute_time();
+	for (;;) {
+		status = adreno8_rd(adreno8_smmu.base + SMMU_TLBGSTATUS);
+		if (status == ~0u) break;
+		if (!(status & 1)) {
+			adreno8_settle();
+			printf("adreno8: %u: early NS TLB global sync completed, status %#x\n", adreno8_step, status);
+			return true;
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);
+		if (elapsed >= 100000000ull) break;
+	}
+	printf("adreno8: %u: early NS TLB global sync failed, status %#x\n", adreno8_step, status);
+	return false;
+}
+
 bool
 adreno8_step_smmu_read(void)
 {
@@ -174,7 +224,7 @@ adreno8_step_smmu_read(void)
 		adreno8_cbscan_done = true;
 		adreno8_cb_scan("after step 8");
 	}
-	return true;
+	return !adreno8_direct_ring || adreno8_smmu_early_ns_tlb();
 }
 
 /* The 4 KiB granule and physical-range constants live in adreno8_private.h so

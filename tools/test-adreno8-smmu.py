@@ -17,6 +17,7 @@ constants = "\n".join(
     if line.startswith(("#define SMMU_", "#define PTE_", "#define SCTLR_", "#define TCR_",
                         "#define TCR2_", "#define MAIR0_", "#define FSR_", "#define SMR_", "#define STAGE_1",
                         "#define GMU_CONTEXT", "#define GMU_MATCH", "#define GMU_STREAM",
+                        "#define GMU(n)", "#define GMU_CM3_SYSRESET", "#define GMU_PWR_CLK_STATUS",
                         "#define SECURE_CONTEXT", "#define SECURE_STREAM",
                         "#define SECURE_MATCH", "#define SECURE_MODE_"))
 )
@@ -64,6 +65,9 @@ static void parse_stall(void) {
 }
 extern uint32_t adreno8_gpu8_secure_mode; /* defined by the memory harness; unused by the SMMU tests */
 ''' + structures + "\n" + constants + r'''
+static struct adreno8_block adreno8_gmu;
+static bool adreno8_reset_required;
+extern struct adreno8_gpu_space adreno8_gmu_space, adreno8_secure_space;
 /* One record per cache-clean call: address, length, and a snapshot of the
  * first bytes (up to the cap). The secure handover tests check the cleanup
  * order per SCM call against these events; cleans larger than the cap record

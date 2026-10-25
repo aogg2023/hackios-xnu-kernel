@@ -6,6 +6,11 @@
 extern struct adreno8_block adreno8_smmu;
 extern uint32_t adreno8_smmu_page, adreno8_smmu_pages;
 
+/* Arm IHI 0062D.c 9.6.21/22/29; fixed MiCode arm-smmu.h uses these offsets. */
+#define SMMU_TLBIALLNSNH         0x68
+#define SMMU_TLBGSYNC            0x70
+#define SMMU_TLBGSTATUS          0x74
+
 #define SMMU_S2CR_FAULT          (2u << 16)
 #define SMMU_S2CR_SHCFG_NSH      (3u << 8)
 #define SMMU_CB_ACTLR            0x04

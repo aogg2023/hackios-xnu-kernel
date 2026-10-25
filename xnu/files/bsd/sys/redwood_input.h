@@ -42,6 +42,8 @@ void redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 
 /* Block legacy register access unless the loader describes redwood or QEMU. */
 bool redwood_platform_blocks_legacy_drivers(void);
+/* The loader's GIC description of annibale, whose EPSS and RPMh blocks a redwood driver does drive. */
+bool redwood_platform_is_annibale(void);
 void redwood_input_init(void);
 void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */

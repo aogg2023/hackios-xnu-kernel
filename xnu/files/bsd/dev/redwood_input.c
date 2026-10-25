@@ -81,6 +81,28 @@ redwood_platform_blocks_legacy_drivers(void)
 	return !redwood && !qemu;
 }
 
+/* The same description again, for the phone whose own blocks some redwood drivers do belong
+ * to: annibale's GIC is at 0x16000000 inside a block that starts at 0x00400000 and its
+ * redistributor span is 0x200000, so its reg entry reads
+ * {0x15C00000, 0x10000, 0x15C40000, 0x200000}. Taken from the loader's device tree, as above,
+ * so nothing is read from hardware to answer this. */
+bool
+redwood_platform_is_annibale(void)
+{
+	DTEntry entry;
+	const void *property;
+	unsigned int size;
+
+	if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess ||
+	    SecureDTGetProperty(entry, "reg", &property, &size) != kSuccess || size != 4 * sizeof(uint64_t)) {
+		return false;
+	}
+	const uint64_t *reg = property;
+
+	return pe_arm_get_soc_base_phys() == 0x00400000 && reg[1] == 0x10000 && reg[3] == 0x200000 &&
+	    reg[0] == 0x15C00000 && reg[2] == 0x15C40000;
+}
+
 static LCK_GRP_DECLARE(touch_lck_grp, "redwood-touch");
 static LCK_MTX_DECLARE(touch_lock, &touch_lck_grp);
 static struct redwood_touch touch_queue[TOUCH_QUEUE];

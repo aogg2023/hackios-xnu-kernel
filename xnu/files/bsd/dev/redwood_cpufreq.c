@@ -560,7 +560,13 @@ redwood_cpufreq_init(void)
 	const ml_topology_info_t *topology = ml_get_topology_info();
 	uint32_t enabled = 0, cores[EPSS_DOMAINS] = { 0 }, before, here;
 
-	if (redwood_platform_blocks_legacy_drivers()) {
+	/* The guard separates redwood and QEMU from everything else, so on annibale it would
+	 * skip the single write that raises this phone's cores: both phones put the EPSS
+	 * frequency groups and the RPMh sequencer at the same addresses, and this driver
+	 * only ever asks for the top row. Annibale's own GIC description is therefore
+	 * accepted here. The shared guard itself is left alone, so every other redwood
+	 * driver stays off this SoC; this initialisation still needs cpufreq=1. */
+	if (redwood_platform_blocks_legacy_drivers() && !redwood_platform_is_annibale()) {
 		printf("cpufreq: legacy RPMh/EPSS initialization skipped by platform guard\n");
 		return;
 	}

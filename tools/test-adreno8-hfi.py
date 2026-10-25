@@ -114,8 +114,8 @@ int main(void) {
     uint32_t *resp = table + ADRENO8_HFI_HEADER(1);
     reset(0);
     assert(table[1] == 210 && table[2] == 6 && table[3] == 12 && table[4] == 3 && table[5] == 3);
-    assert(cmd[1] == 0x60007000 && resp[1] == 0x60008000);
-    assert(table[ADRENO8_HFI_HEADER(2) + 1] == 0x60009000);
+    assert(cmd[1] == 0x60006350 && resp[1] == 0x60007350);
+    assert(table[ADRENO8_HFI_HEADER(2) + 1] == 0x60008350);
     for (unsigned q = 0; q < 3; q++) assert(table[ADRENO8_HFI_HEADER(q) + 2] == q);
     for (unsigned i = ADRENO8_HFI_HEADER(3); i < 210; i++) assert(table[i] == 0);
     assert(adreno8_queue_write(msg, 3));

@@ -36,6 +36,7 @@ adreno8_block_new(struct adreno8_gpu_block *b, const char *name, uint32_t addres
 {
 	const struct adreno8_gpu_block *fixed[2] = { &adreno8_gmu_log, &adreno8_gmu_hfi };
 	uint32_t rounded;
+	kern_return_t allocation;
 
 	if (b->memory || size == 0 || size > GMU_BLOCK_CAP || (address & 0xfff) ||
 	    adreno8_fw_region(address, size) != ADRENO8_FW_MEMORY) {
@@ -55,8 +56,15 @@ adreno8_block_new(struct adreno8_gpu_block *b, const char *name, uint32_t addres
 			return false;
 		}
 	}
-	if (kmem_alloc(kernel_map, (vm_offset_t *)&b->memory, (vm_size_t)((size + PAGE_MASK) & ~PAGE_MASK),
-	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+	/* HFI queues cross allocation pages within one uncached physical mapping. */
+	if (b == &adreno8_gmu_hfi) {
+		allocation = kmem_alloc_contig(kernel_map, &b->memory, (vm_size_t)((size + PAGE_MASK) & ~PAGE_MASK),
+		    PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT);
+	} else {
+		allocation = kmem_alloc(kernel_map, &b->memory, (vm_size_t)((size + PAGE_MASK) & ~PAGE_MASK),
+		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT);
+	}
+	if (allocation != KERN_SUCCESS) {
 		printf("adreno8: %u: no kernel memory for the GMU's %#x bytes\n", adreno8_step, size);
 		b->memory = 0;
 		return false;
@@ -336,7 +344,7 @@ static const struct {
 	uint32_t address, size;
 } adreno8_gmu_fixed[] = {
 	{ "log",   0x60002000, 0x4000 },        /* where its firmware writes what it has to say (GENERAL_8) */
-	{ "hfi",   0x60006000, 0x4000 },        /* queue table, then command queue, then response queue */
+	{ "hfi",   0x60006000, ADRENO8_HFI_ALLOC_BYTES },
 };
 
 /* Types 1 and 7 reserve value bytes; other zero-size records contain metadata. */
@@ -384,16 +392,16 @@ adreno8_step_gmu_space(void)
 		return false;
 	}
 	adreno8_hfi_init_table((uint32_t *)adreno8_gmu_hfi.memory, adreno8_gmu_hfi.address);
-	adreno8_to_memory(adreno8_gmu_hfi.memory, 4096);
+	adreno8_to_memory(adreno8_gmu_hfi.memory, ADRENO8_HFI_TABLE_DWORDS * 4u);
 
-	adreno8_announce("uncached views of the queues and the log: the GMU writes while our cache can only guess");
-	adreno8_hfi_view_table = ml_io_map_wcomb(kvtophys(adreno8_gmu_hfi.memory), 4096);
-	adreno8_hfi_view_cmd = ml_io_map_wcomb(kvtophys(adreno8_gmu_hfi.memory + 4096), 4096);
-	adreno8_hfi_view_resp = ml_io_map_wcomb(kvtophys(adreno8_gmu_hfi.memory + 2 * 4096), 4096);
-	adreno8_hfi_view_debug = ml_io_map_wcomb(kvtophys(adreno8_gmu_hfi.memory + 3 * 4096), 4096);
-	if (!adreno8_hfi_view_table || !adreno8_hfi_view_cmd || !adreno8_hfi_view_resp || !adreno8_hfi_view_debug) {
+	adreno8_announce("map uncached CPU views of the HFI buffer and GMU log");
+	adreno8_hfi_view_table = ml_io_map_wcomb(kvtophys(adreno8_gmu_hfi.memory), adreno8_gmu_hfi.size);
+	if (!adreno8_hfi_view_table) {
 		return false;
 	}
+	adreno8_hfi_view_cmd = adreno8_hfi_view_table + ADRENO8_HFI_QUEUE_OFFSET(0);
+	adreno8_hfi_view_resp = adreno8_hfi_view_table + ADRENO8_HFI_QUEUE_OFFSET(1);
+	adreno8_hfi_view_debug = adreno8_hfi_view_table + ADRENO8_HFI_QUEUE_OFFSET(2);
 	for (unsigned i = 0; i < 4; i++) {
 		adreno8_log_view[i] = ml_io_map_wcomb(kvtophys(adreno8_gmu_log.memory + i * 4096), 4096);
 		if (!adreno8_log_view[i]) {

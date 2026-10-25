@@ -38,6 +38,7 @@ source = r'''
 #define kernel_map 0
 typedef uintptr_t vm_offset_t;
 typedef size_t vm_size_t;
+typedef int kern_return_t;
 struct adreno8_gpu_block { const char *name; uint32_t address, size; vm_offset_t memory; };
 struct adreno8_block { const char *name; uint32_t phys, size; vm_offset_t base; };
 struct adreno8_gpu_block adreno8_gmu_demands[GMU_BLOCKS], adreno8_gmu_log, adreno8_gmu_hfi;
@@ -53,6 +54,11 @@ static uint32_t registers[0x68000 / 4], gpu_registers[0x10000 / 4], rsc_register
 static int kmem_alloc(int map, vm_offset_t *memory, vm_size_t size, int flags, int tag) {
     if (fail_allocation) return 1;
     *memory = (uintptr_t)calloc(1, size); allocations++; return *memory ? 0 : 1;
+}
+static int kmem_alloc_contig(int map, vm_offset_t *memory, vm_size_t size,
+    vm_offset_t mask, unsigned pnum_mask, unsigned pnum_end, int flags, int tag) {
+    assert(mask == PAGE_MASK && !pnum_mask && !pnum_end);
+    return kmem_alloc(map, memory, size, flags, tag);
 }
 static uint64_t kvtophys(vm_offset_t memory) { return memory; }
 static bool adreno8_cx_ready(void) { return true; }

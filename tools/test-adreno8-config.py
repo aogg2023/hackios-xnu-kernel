@@ -39,7 +39,8 @@ source = r'''
 ''' + constants + r'''
 struct adreno8_block { unsigned base; };
 static struct adreno8_block adreno8_gpucc, adreno8_gcc = {0x10000};
-static unsigned adreno8_step, writes, branches, gemnoc_sleeps, gemnoc_ready_after;
+static struct adreno8_block adreno8_cx_misc = {0x88000};
+static unsigned adreno8_step, writes, branches, gemnoc_sleeps, gemnoc_ready_after, ahb_reads;
 static uint32_t regs[0x90000 / 4], adreno8_gmu_from_pll;
 static bool reject_gemnoc;
 static bool accept = true;
@@ -69,7 +70,12 @@ static void adreno8_sleep_us(unsigned us) {
 }
 static uint64_t mach_absolute_time(void) { return 0; }
 static void absolutetime_to_nanoseconds(uint64_t t, uint64_t *ns) { *ns = 0; }
-static uint32_t adreno8_get(struct adreno8_block *b, const char *n, uint32_t off) { return regs[(b->base + off) / 4]; }
+static uint32_t adreno8_get(struct adreno8_block *b, const char *n, uint32_t off) {
+    if (b == &adreno8_cx_misc) {
+        assert(off >= 0x40 && off <= 0x50 && !(off & 3)); ahb_reads++;
+    }
+    return regs[(b->base + off) / 4];
+}
 static uint32_t adreno8_rd(unsigned off) { return regs[off / 4]; }
 static void adreno8_put(struct adreno8_block *b, const char *n, uint32_t off, uint32_t value) {
     regs[(b->base + off) / 4] = value; writes++;
@@ -161,6 +167,13 @@ int main(void) {
     assert(regs[GPUCC_GMU_RCGR / 4 + 1] == 0x100000);
     clock_boot_ok = true; branches = 0;
     assert(adreno8_step_clocks() && clock_boot_calls == 2 && branches > 1);
+    assert(ahb_reads == 10);
+    for (unsigned i = 0; i < 5; i++) {
+        uint32_t *control = &regs[(adreno8_cx_misc.base + 0x40 + 4 * i) / 4];
+        *control = UINT32_MAX; unsigned before = ahb_reads;
+        assert(!adreno8_step_clocks() && ahb_reads == before + i + 1);
+        *control = 0;
+    }
 }
 '''
 with tempfile.TemporaryDirectory(prefix="adreno8-config-") as directory:

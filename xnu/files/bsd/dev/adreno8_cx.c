@@ -632,6 +632,11 @@ adreno8_step_clocks(void)
 	adreno8_get(&adreno8_gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR);
 	adreno8_get(&adreno8_gpucc, "gpu_cc_gmu bcr", GPUCC_GMU_BCR);
 	adreno8_get(&adreno8_gpucc, "ahb", GPUCC_AHB_CBCR);
+	/* gen8_reg.h: CX_MISC AHB timeout controls, observed without writes. */
+	static const char *const ahb[] = {"AHB timeout AON", "AHB timeout GMU", "AHB timeout CP",
+		"AHB timeout VBIF SMMU", "AHB timeout HOST"};
+	for (unsigned i = 0; i < sizeof(ahb) / sizeof(ahb[0]); i++)
+		if (adreno8_get(&adreno8_cx_misc, ahb[i], 0x40 + 4 * i) == 0xffffffffu) return false;
 	return true;
 }
 

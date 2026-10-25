@@ -1,5 +1,5 @@
 /* SM8750 GMU memory, firmware loading, startup and diagnostics. */
-#include "adreno8_private.h"
+#include "adreno8_memory_private.h"
 
 #define printf adreno8_say
 
@@ -30,6 +30,7 @@ bool adreno8_gmu_runs, adreno8_gmu_talks, adreno8_fw_loaded, adreno8_rsc_woken_b
 vm_offset_t adreno8_log_view[4];               /* the GMU's log, uncached: it writes while our caches guess */
 
 vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd, adreno8_hfi_view_resp, adreno8_hfi_view_debug;
+static const struct adreno8_memory *adreno8_gmu_vrb;
 
 bool
 adreno8_block_new(struct adreno8_gpu_block *b, const char *name, uint32_t address, uint32_t size)
@@ -347,6 +348,37 @@ static const struct {
 	{ "hfi",   0x60006000, ADRENO8_HFI_ALLOC_BYTES },
 };
 
+/* gen8_hwsched_gmu_memory_init publishes both buffers before CM3 starts.
+ * The shared allocator owns their pages and mappings until cold reset. */
+static bool
+adreno8_gmu_hwsched_memory(void)
+{
+	const uint32_t prot = ADRENO8_MEM_READ | ADRENO8_MEM_WRITE | ADRENO8_MEM_PRIV;
+	struct adreno8_memory *vrb = adreno8_gmu_alloc("gmu vrb", 4096, 4096, prot);
+	struct adreno8_memory *trace;
+	uint32_t *bank, *header;
+
+	if (!vrb || !(trace = adreno8_gmu_alloc("gmu trace", 16384, 4096, prot)))
+		return false;
+	bank = (uint32_t *)vrb->memory;
+	header = (uint32_t *)trace->memory;
+	bank[0] = vrb->size / 4;
+	bank[2] = trace->gmu_address;
+	/* gmu_core_trace_header_init host inputs; other fields retain their zero allocation values. */
+	header[1] = 0x40000001; /* drop mode, header version 1 */
+	header[2] = 80; /* buffer threshold in percent */
+	header[3] = trace->size;
+	header[8] = trace->gmu_address; /* low dword of the 64-bit cookie */
+	header[10] = 5; /* trace timeout in milliseconds */
+	header[11] = 1; /* HWSCHED log type */
+	if (!adreno8_memory_publish(trace, 0, 48) || !adreno8_memory_publish(vrb, 0, vrb->size))
+		return false;
+	adreno8_gmu_vrb = vrb;
+	printf("adreno8: GMU VRB %#x size %#x, trace %#x size %#x published before CM3 start\n",
+	    vrb->gmu_address, vrb->size, trace->gmu_address, trace->size);
+	return true;
+}
+
 /* Types 1 and 7 reserve value bytes; other zero-size records contain metadata. */
 
 bool
@@ -420,6 +452,9 @@ adreno8_step_gmu_space(void)
 		if (!adreno8_space_map_block(&adreno8_gmu_space, &adreno8_gmu_demands[i])) {
 			return false;
 		}
+	}
+	if (!adreno8_gmu_hwsched_memory()) {
+		return false;
 	}
 	if (!adreno8_space_on(&adreno8_gmu_space, GMU_STREAM, GMU_MATCH)) {
 		return false;
@@ -526,8 +561,8 @@ adreno8_step_gmu_start(void)
 		return false;
 	}
 	if (!adreno8_fw_loaded || !adreno8_gmu_space.is_on || !adreno8_gmu_log.memory || !adreno8_gmu_hfi.memory ||
-	    adreno8_gmu_runs || !(adreno8_rd(adreno8_gmu.base + GMU_CM3_SYSRESET) & 1)) {
-		printf("adreno8: %u: GMU start requires verified firmware, mapped memory and asserted CM3 reset\n", adreno8_step);
+	    !adreno8_gmu_vrb || adreno8_gmu_runs || !(adreno8_rd(adreno8_gmu.base + GMU_CM3_SYSRESET) & 1)) {
+		printf("adreno8: %u: GMU start requires verified firmware, mapped memory, published VRB and asserted CM3 reset\n", adreno8_step);
 		return false;
 	}
 	if (!adreno8_scm_gpu_init()) {
@@ -556,7 +591,7 @@ adreno8_step_gmu_start(void)
 		}
 	}
 
-	/* gen8_gmu_register_config for gen8_0_0; optional VRB and BCL features remain disabled. */
+	/* gen8_gmu_register_config; BCL remains disabled. */
 	adreno8_put(&adreno8_gmu, "initial RPMh power state", GMU_RPMH_POWER_STATE, 0xf);
 	adreno8_put(&adreno8_gmu, "falnext intf", GMU_CX_FALNEXT_INTF, 1);
 	adreno8_put(&adreno8_gmu, "fal intf", GMU_CX_FAL_INTF, 1);
@@ -573,6 +608,12 @@ adreno8_step_gmu_start(void)
 	adreno8_put(&adreno8_gpu, "gbif cx config", GPU_GBIF_CX_CONFIG, GPU_GBIF_CX_VALUE);
 	adreno8_put(&adreno8_gmu, "GMU GBIF QoS", GMU_MRC_GBIF_QOS, 0x33);
 	adreno8_put(&adreno8_gpu, "clear GBIF halt", GPU_GBIF_HALT, 1u << 3);
+	adreno8_put(&adreno8_gmu, "GMU virtual register bank", GMU_GENERAL_11, adreno8_gmu_vrb->gmu_address);
+	adreno8_settle();
+	if (adreno8_get(&adreno8_gmu, "GMU virtual register bank readback", GMU_GENERAL_11) != adreno8_gmu_vrb->gmu_address) {
+		printf("adreno8: GMU VRB address readback failed; CM3 remains in reset\n");
+		return false;
+	}
 	adreno8_put(&adreno8_gmu, "clear log write index", GMU_GENERAL_9, 0);
 	/* annibale's live DT identifies gen8_0_1 (chip ID 0x44050001).
 	 * Vendor ADRENO_GMU_REV encodes major/minor/patch in bits 31:8. */

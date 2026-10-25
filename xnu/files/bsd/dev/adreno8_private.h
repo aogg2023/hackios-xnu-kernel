@@ -171,6 +171,7 @@ struct adreno8_gpu_space {
 #define GMU_GENERAL_8           GMU(0x1f9c8)    /* where the GMU's log is, and its pages minus one */
 #define GMU_GENERAL_9           GMU(0x1f9c9)    /* ... and how far it has written */
 #define GMU_GENERAL_10          GMU(0x1f9ca)    /* which chip the firmware is told it runs on */
+#define GMU_GENERAL_11          GMU(0x1f9cb)    /* GMU VA of the virtual register bank */
 #define GMU_AO_INTERRUPT_CLR    GMU(0x23b04)
 #define GMU_AO_INTERRUPT_STATUS GMU(0x23b05)    /* bit 0 watchdog bit, bit 3 fence error, bit 5 bus error */
 #define GMU_AO_INTERRUPT_MASK   GMU(0x23b06)

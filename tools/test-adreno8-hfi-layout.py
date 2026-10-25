@@ -90,7 +90,7 @@ struct adreno8_block { vm_offset_t base; };
 struct adreno8_gpu_block adreno8_gmu_demands[GMU_BLOCKS], adreno8_gmu_log, adreno8_gmu_hfi;
 static struct adreno8_block adreno8_gmu;
 static struct { bool is_on; } adreno8_gmu_space;
-static unsigned adreno8_gmu_demand_count, adreno8_step, contiguous_calls, maps, smmu_calls;
+static unsigned adreno8_gmu_demand_count, adreno8_step, contiguous_calls, maps, smmu_calls, hwsched_memory_calls;
 static unsigned barriers, publications, doorbells;
 static bool fail_contiguous, fail_mapping;
 static vm_offset_t adreno8_log_view[4], adreno8_hfi_view_table, adreno8_hfi_view_cmd;
@@ -105,6 +105,9 @@ static int adreno8_say(const char *format, ...) { return 0; }
 static void adreno8_announce(const char *format, ...) {}
 static bool adreno8_cx_ready(void) { return true; }
 static bool adreno8_read_firmware(void) { return true; }
+static bool adreno8_gmu_hwsched_memory(void) {
+    assert(!adreno8_gmu_space.is_on && smmu_calls >= 3); hwsched_memory_calls++; return true;
+}
 static uint64_t kvtophys(vm_offset_t memory) { return memory; }
 static int kmem_alloc(int map, vm_offset_t *memory, vm_size_t size, int flags, int tag) {
     assert(!(size & PAGE_MASK));
@@ -158,7 +161,7 @@ static void release(void) {
     memset(&adreno8_gmu_log, 0, sizeof(adreno8_gmu_log));
     memset(&adreno8_gmu_hfi, 0, sizeof(adreno8_gmu_hfi));
     adreno8_hfi_view_table = adreno8_hfi_view_cmd = adreno8_hfi_view_resp = adreno8_hfi_view_debug = 0;
-    contiguous_calls = maps = smmu_calls = 0; adreno8_gmu_space.is_on = false;
+    contiguous_calls = maps = smmu_calls = hwsched_memory_calls = 0; adreno8_gmu_space.is_on = false;
 }
 int main(void) {
     _Alignas(16) uint8_t table[4096], expected[4096];
@@ -184,6 +187,7 @@ int main(void) {
     assert(adreno8_gmu_hfi.memory && adreno8_gmu_log.memory && !adreno8_hfi_view_cmd); release();
     fail_mapping = false;
     assert(adreno8_step_gmu_space() && contiguous_calls == 1 && maps == 5 && adreno8_gmu_space.is_on);
+    assert(hwsched_memory_calls == 1);
     assert(adreno8_hfi_view_table == adreno8_gmu_hfi.memory);
     assert(adreno8_hfi_view_cmd == adreno8_hfi_view_table + HFI_QUEUE_OFFSET(0));
     assert(adreno8_hfi_view_resp == adreno8_hfi_view_table + HFI_QUEUE_OFFSET(1));

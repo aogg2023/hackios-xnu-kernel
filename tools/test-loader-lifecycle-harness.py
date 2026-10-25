@@ -130,6 +130,8 @@ static const char *sound_data;
 /* ---- stubs for LC-USB / LC-POLL / LC-EXC ---- */
 #define USB_EP_OUT 0x01
 #define USB_EP_IN  0x81
+#define USB_CHUNK (1024 * 1024)   /* block-external, mirrored; the driver pins it below and the */
+                                  /* wiring check pins the production #define to the same value */
 static uint8_t rx_store[1024], tx_store[1024];
 static uint8_t *usb_rx_buf = rx_store, *usb_tx_buf = tx_store;
 /* The event/status/link enums and the event union arrive verbatim from the production
@@ -140,17 +142,25 @@ _Static_assert(UsbDeviceEventNoEvent == 0 && UsbDeviceEventDeviceStateChange == 
 _Static_assert(UsbDeviceStateConnected == 0 && UsbDeviceStateDisconnected == 1, "usb link state raw numbers");
 _Static_assert(UsbDeviceTransferStatusActive == 0 && UsbDeviceTransferStatusCompleteOK == 1 && UsbDeviceTransferStatusCancelled == 2 && UsbDeviceTransferStatusCompleteError == 3, "usb transfer status raw numbers");
 _Static_assert(sizeof(usb_device_event_data) == 64 && sizeof(((usb_device_event_data *)0)->transfer) == 24 && offsetof(usb_device_event_data, transfer.status) == 0 && offsetof(usb_device_event_data, transfer.endpoint_index) == 4 && offsetof(usb_device_event_data, transfer.bytes_completed) == 8 && offsetof(usb_device_event_data, transfer.data_buffer) == 16, "event union keeps raw[8] and the 24-byte transfer record");
+@DESCSET@
 struct h_usb {
 	efi_status (*handle_event)(uint32_t *msg, uint64_t *size, usb_device_event_data *data);
 	efi_status (*send)(uint8_t endpoint, uint64_t len, void *buf);
+	efi_status (*stop)(void);
+	efi_status (*abort_xfer)(uint8_t endpoint);
+	efi_status (*set_endpoint_stall_state)(uint8_t endpoint, uint8_t state);
+	efi_status (*start_ex)(usb_device_descriptor_set *set);
+	efi_status (*allocate_transfer_buffer)(uint64_t size, void **buffer);
 };
 static struct h_usb *USB;
+static usb_device_descriptor_set usb_desc_set;   /* the set the production usb_start() filled */
 static int usb_connected = 1, block_enabled = 1;
 static const struct kernel_live *running_live;
 static int ev_calls, ev_sends, ev_after, ev_change, ev_msg, ev_change_state, ev_err, ev_status = -1;
 static uint8_t ev_ep = USB_EP_IN;
 static uint64_t ev_bytes = 4096, ev_step, ev_size, ev_no_events;
 static int ev_size_set;   /* without it the call reports a full payload; with it even size 0 is explicit */
+static int ev_cancel_first;   /* report Cancelled for this many calls, then ev_status */
 static void *ev_out_buf, *ev_in_buf, *ev_buf;   /* ev_status -1 = CompleteOK, ev_buf 0 = the sent buffer */
 static efi_status ev_handle(uint32_t *msg, uint64_t *size, usb_device_event_data *data)
 {
@@ -174,7 +184,9 @@ static efi_status ev_handle(uint32_t *msg, uint64_t *size, usb_device_event_data
 	*msg = (uint32_t)ev_msg;
 	*size = ev_size_set ? ev_size : sizeof(*data);
 	if (ev_msg == UsbDeviceEventTransferNotification) {
-		data->transfer.status = ev_status < 0 ? UsbDeviceTransferStatusCompleteOK : (uint32_t)ev_status;
+		data->transfer.status = (ev_cancel_first && ev_calls <= ev_cancel_first)
+		    ? UsbDeviceTransferStatusCancelled
+		    : (ev_status < 0 ? UsbDeviceTransferStatusCompleteOK : (uint32_t)ev_status);
 		data->transfer.endpoint_index = ev_ep;
 		data->transfer.bytes_completed = ev_bytes;
 		data->transfer.data_buffer = ev_buf ? ev_buf : (ev_ep == USB_EP_OUT ? ev_out_buf : ev_in_buf);
@@ -188,7 +200,15 @@ static efi_status ev_send(uint8_t endpoint, uint64_t len, void *buf)
 	(void)len;
 	return 0;
 }
-static struct h_usb h_usb = { ev_handle, ev_send };
+static int ab_calls, st_calls, sp_calls, se_calls, at_calls;
+static efi_status ab_status, st_status, sp_status, se_status;
+static efi_status ev_stop(void) { sp_calls++; return sp_status; }
+static efi_status ev_abort(uint8_t endpoint) { ab_calls++; (void)endpoint; return ab_status; }
+static efi_status ev_stall(uint8_t endpoint, uint8_t state) { st_calls++; (void)endpoint; (void)state; return st_status; }
+static efi_status ev_start_ex(usb_device_descriptor_set *set) { se_calls++; (void)set; return se_status; }
+static uint64_t at_size;
+static efi_status ev_alloc(uint64_t size, void **buffer) { at_calls++; at_size = size; (void)buffer; return 0; }
+static struct h_usb h_usb = { ev_handle, ev_send, ev_stop, ev_abort, ev_stall, ev_start_ex, ev_alloc };
 static char fb_got[128];
 static int fb_calls, fb_armed;
 static void fb_command(const char *cmd)
@@ -480,10 +500,16 @@ static void usb_clean(void) {
 	USB = &h_usb; usb_connected = kernel_resources_held = 1;
 	firmware_fault = 0; running_live = NULL;
 	usb_rx_queued = usb_out_owned = usb_in_owned = usb_out_lost = usb_in_lost = usb_out_invalid = usb_in_invalid = 0;
+	usb_in_since = 0; usb_in_recoveries = 0;
 	ev_calls = ev_sends = ev_after = ev_change = ev_change_state = 0;
 	ev_msg = UsbDeviceEventNoEvent; ev_step = clk_freq / 10; clk_now = 0;
 	ev_err = 0; ev_status = -1; ev_size = 0; ev_size_set = 0; ev_no_events = 0; ev_buf = NULL;
+	ev_cancel_first = 0;
 	ev_out_buf = ev_in_buf = NULL; usb_out_buf = NULL; usb_out_len = 0; usb_in_buf = NULL; usb_in_len = 0;
+	ab_calls = st_calls = sp_calls = se_calls = at_calls = 0; at_size = 0;
+	ab_status = st_status = sp_status = se_status = 0;
+	h_usb.stop = ev_stop; h_usb.start_ex = ev_start_ex; h_usb.abort_xfer = ev_abort;
+	h_usb.set_endpoint_stall_state = ev_stall; h_usb.allocate_transfer_buffer = ev_alloc;
 }
 static void sc_usb(void)
 {
@@ -492,11 +518,12 @@ static void sc_usb(void)
 	CK(r == -1, "usb_held_bounded_exit");
 	CK(ev_calls <= 60 && ev_calls > 20, "usb_held_bounded_time");
 	CK(pets >= 2, "usb_held_feeds_watchdog");
-	/* nothing held and no fault: waiting for the next command is the job, no timeout */
+	/* nothing held and no fault: the wait still ends, on the longer idle budget, and the link
+	 * stays up because no cable event ended it (the old rule waited until one did) */
 	kernel_resources_held = 0;
-	ev_calls = 0; ev_after = 80; ev_step = 1;
+	ev_calls = 0; ev_step = clk_freq / 20;
 	r = usb_wait(USB_EP_OUT, 1);
-	CK(r == -1 && ev_calls == 81, "usb_idle_keeps_waiting");
+	CK(r == -1 && ev_calls > 150 && ev_calls < 260 && usb_connected == 1, "usb_idle_bounded_exit");
 	/* a verified completion for the submitted request answers with its length; a
 	 * notification for another endpoint does not end the wait */
 	ev_calls = ev_after = 0;
@@ -514,6 +541,8 @@ static void sc_usb_owner(void)
 	usb_clean();
 	int64_t r = (memcpy(tx_store, "AA", 2), usb_tx((const uint8_t *)"AB", 2));
 	CK(r == -1 && usb_in_owned == 1 && usb_in_lost == 0, "usb_tx_timeout_keeps");
+	usb_in_invalid = 0;  /* a live transfer: the veto applies, the recovery ladder stays out */
+	usb_in_since = clk_now;
 	tx_store[0] = 'Z';   /* sentinel: the owned buffer must not be overwritten while owned */
 	r = usb_tx((const uint8_t *)"CD", 2);
 	CK(r == -1 && ev_sends == 1 && tx_store[0] == 'Z', "usb_tx_owned_no_resend_no_overwrite");
@@ -575,6 +604,86 @@ static void sc_usb_owner(void)
 	ev_sends = 0; poll_once();
 	CK(ev_sends == 0 && usb_out_lost == 1, "usb_poll_lost_send_refused");
 }
+/* a reply the host walked away from: the wait expires in the held state and the record stays
+ * owned and marked, which is the state the sampler met on the phone */
+static void usb_wedge_in(void)
+{
+	usb_clean();
+	kernel_resources_held = 1;
+	ev_step = clk_freq / 10;
+	memcpy(tx_store, "AB", 2);
+	CK(usb_tx((const uint8_t *)"AB", 2) == -1 && usb_in_owned == 1 && usb_in_invalid == 1,
+	   "recover_setup_wedged");
+}
+static void sc_usb_recover(void)
+{
+	/* level 1: the abort's own Cancelled terminal ends the record, no halt cycle is needed */
+	usb_wedge_in();
+	ev_calls = 0; ev_sends = 0; ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN;
+	ev_cancel_first = 1; ev_status = -1; ev_bytes = 4;
+	CK(usb_tx((const uint8_t *)"OKAY", 4) == 4, "recover_level1_resends");
+	CK(ab_calls == 1 && st_calls == 0 && sp_calls == 0 && se_calls == 0, "recover_level1_only_abort");
+	CK(usb_in_owned == 0 && usb_in_invalid == 0, "recover_level1_record_clear");
+
+	/* level 2: the abort ends nothing, the halt pair is taken as the end of the request */
+	usb_wedge_in();
+	ev_calls = 0; ev_sends = 0; ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN;
+	ev_no_events = 3; ev_status = -1; ev_bytes = 4;
+	CK(usb_tx((const uint8_t *)"OKAY", 4) == 4, "recover_level2_resends");
+	CK(ab_calls == 1 && st_calls == 2 && sp_calls == 0, "recover_level2_halt_pair");
+	CK(usb_in_owned == 0 && usb_in_invalid == 0, "recover_level2_record_clear");
+
+	/* level 3: abort and halt both fail, the device stack is started again */
+	usb_wedge_in();
+	ev_calls = 0; ev_sends = 0; ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN;
+	/* both calls fail with the error bit set, as a status from this firmware does */
+	ev_no_events = 3; ev_status = -1; ev_bytes = 4;
+	ab_status = 0x8000000000000001ULL; st_status = 0x8000000000000001ULL;
+	CK(usb_tx((const uint8_t *)"OKAY", 4) == 4, "recover_level3_resends");
+	CK(ab_calls == 1 && st_calls == 1 && sp_calls == 1 && se_calls == 1 && at_calls == 2,
+	   "recover_level3_rebuild_ran");
+	CK(at_size == USB_CHUNK, "recover_level3_buffer_size");
+	CK(usb_in_owned == 0 && usb_in_lost == 0 && usb_in_invalid == 0, "recover_level3_record_clear");
+
+	/* a young record is left alone: its transfer may still be running */
+	usb_clean(); kernel_resources_held = 1; ev_step = clk_freq / 10;
+	CK(usb_tx((const uint8_t *)"AB", 2) == -1, "recover_young_setup");
+	usb_in_invalid = 0;                        /* owned and young, as a live transfer looks */
+	usb_in_since = clk_now;
+	ev_calls = 0;
+	CK(usb_tx((const uint8_t *)"CD", 2) == -1 && ab_calls == 0 && st_calls == 0,
+	   "recover_young_kept");
+
+	/* owned without the invalid mark, old enough: the unbounded wait's branch never set that
+	 * mark, so the age alone has to carry the decision */
+	usb_wedge_in();
+	usb_in_invalid = 0;
+	clk_now += (USB_IN_STALE_SECONDS + 1) * clk_freq;
+	ev_calls = 0; ev_sends = 0; ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN;
+	ev_no_events = 3; ev_status = -1; ev_bytes = 4;
+	CK(usb_tx((const uint8_t *)"OKAY", 4) == 4 && st_calls == 2, "recover_by_age_alone");
+
+	/* the command boundary recovers too, so the loop keeps taking the next command */
+	usb_wedge_in();
+	ev_calls = 0; ev_sends = 0; ev_no_events = 60;
+	CK(usb_rx(rx_store, 64) == -1 && ab_calls == 1 && usb_in_owned == 0,
+	   "recover_at_command_boundary");
+
+	/* the ladder is bounded: past the limit the record stays and the reply is refused */
+	usb_wedge_in();
+	usb_in_recoveries = USB_IN_RECOVER_LIMIT;
+	ev_calls = 0; ev_sends = 0; ev_no_events = 60;
+	CK(usb_tx((const uint8_t *)"OKAY", 4) == -1 && ab_calls == 0 && st_calls == 0,
+	   "recover_limit_refuses");
+
+	/* a channel the structural rule isolated is not undone by this ladder */
+	usb_clean(); kernel_resources_held = 1;
+	usb_in_owned = 1; usb_in_lost = 1; usb_in_invalid = 1;
+	clk_now += (USB_IN_STALE_SECONDS + 1) * clk_freq;
+	ev_calls = 0; ev_sends = 0;
+	CK(usb_tx((const uint8_t *)"OKAY", 4) == -1 && ab_calls == 0 && se_calls == 0,
+	   "recover_skips_isolated");
+}
 static void sc_fault(void)
 {
 	kernel_resources_held = active_watch = 0; firmware_fault = 1;
@@ -613,8 +722,10 @@ static void sc_fb(void)
 	 * the timeout left the transfer owned, neither reply form may write over them */
 	usb_clean();
 	memset(tx_store, 0xa5, sizeof(tx_store));
-	fb_reply("OKAY", "base");   /* one send, no confirmation: owned and lost from here on */
+	fb_reply("OKAY", "base");   /* one send, no confirmation: owned from here on */
 	CK(usb_in_owned == 1 && usb_in_lost == 0 && ev_sends == 1, "fb_first_timeout");
+	usb_in_invalid = 0;         /* a live transfer: neither reply form may write over it */
+	usb_in_since = clk_now;
 	uint8_t saved[128];
 	memcpy(saved, tx_store, sizeof(saved));
 	fb_reply_data(0x1234);
@@ -622,6 +733,10 @@ static void sc_fb(void)
 	fb_reply("FAIL", "next");
 	CK(memcmp(saved, tx_store, sizeof(saved)) == 0, "fb_lost_reply_preserves");
 	CK(ev_sends == 1, "fb_lost_no_resend");
+	/* once the ladder has ended the record, the buffer is the loader's again */
+	usb_in_invalid = 1;
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_bytes = 5; ev_no_events = 3;
+	CK(usb_tx((const uint8_t *)"again", 5) == 5 && ev_sends == 2, "fb_after_recovery_reuses");
 	/* hard limit: a long text never packs past the local buffer (code 4 + text up to 63) */
 	usb_clean();
 	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_bytes = 63;
@@ -750,7 +865,7 @@ static void sc_usb_guard(void)
 int main(void)
 {
 	sc_psci_spec(); sc_cpu_on(); sc_commands(); sc_enter(); sc_watch(); sc_return(); sc_collect();
-	sc_write_logs(); sc_usb(); sc_usb_owner(); sc_fb(); sc_usb_notify(); sc_usb_guard(); sc_fault(); sc_repeat();
+	sc_write_logs(); sc_usb(); sc_usb_owner(); sc_usb_recover(); sc_fb(); sc_usb_notify(); sc_usb_guard(); sc_fault(); sc_repeat();
 	if (fail_count == 0) { printf("production logic: lifecycle checks passed\n"); } else { printf("%d failures\n", fail_count); }
 	return fail_count > 127 ? 127 : fail_count;
 }

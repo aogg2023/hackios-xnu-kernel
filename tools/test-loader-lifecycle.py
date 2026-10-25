@@ -12,7 +12,14 @@ with nothing, and only the recorded buffer and length may take over a queued rec
 The review-2 rules run as full sequences in sc_usb_dyn: the owned record vetoes every resubmit
 path, a timeout or disconnect marks the request undeliverable so its late terminal only
 releases it, the link wait (endpoint 0xff) ends on Connected so the command loop submits, and
-an overlong Cancelled isolates instead of releasing. PSCI expectations are raw spec numbers written independently
+an overlong Cancelled isolates instead of releasing.
+Two later rules have their own sequences. The wait is bounded in every state (three seconds
+held, running or faulted, ten in a plain command loop), so no host can keep the loader away
+from the commands that end the state. And an IN record whose terminal never comes is
+recovered at the two boundaries where nothing is in flight (sc_usb_recover): abort_xfer and
+the Cancelled terminal it asks for, then a halt cycle, then a restart of the device stack,
+each level only after the one before it failed, the whole ladder bounded per session, and a
+young record or a structurally isolated one left untouched. PSCI expectations are raw spec numbers written independently
 (TF-A include/lib/psci/psci.h, PSCI_RET_*), asserted against the constants inside the
 extracted block, so a wrong constant fails instead of passing on a shared value.
 The USB event/status/link enums and the event union are injected verbatim from
@@ -100,7 +107,7 @@ MUTATIONS = [
 	("mut_whitelist", "onissue_", "\treturn status == PSCI_E_NOT_SUPPORTED || status == PSCI_E_INVALID_PARAMS ||\n\t    status == PSCI_E_DENIED || status == PSCI_E_INVALID_ADDRESS;", "\treturn status != 0;"),
 	("mut_already_on_const", "psci_spec_", "#define PSCI_E_ALREADY_ON       (-4)", "#define PSCI_E_ALREADY_ON       (-6)"),
 	("mut_write_gate", "wlog_", "\tbio = ((kernel_resources_held || firmware_fault) && !active_watch) ? NULL : find_log_partition();", "\tbio = (kernel_resources_held && !active_watch) ? NULL : find_log_partition();"),
-	("mut_usb_bound", "usb_held_", "if ((running_live != NULL || kernel_resources_held || firmware_fault) && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {", "if (running_live != NULL && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {"),
+	("mut_usb_bound", "usb_idle_bounded_exit", "\t\tuint64_t limit = (running_live != NULL || kernel_resources_held || firmware_fault)\n\t\t    ? 3 * freq : USB_IDLE_WAIT_SECONDS * freq;", "\t\tuint64_t limit = (running_live != NULL || kernel_resources_held || firmware_fault)\n\t\t    ? 3 * freq : ~(uint64_t)0;   /* mutation: the plain command loop waits for ever again */"),
 	("mut_enter_early", "bridge_", "\tif (status == 0) {\n\t\t/* the exemption covers the formal watch this answer opens", "\tif (1) {   /* rev1 bug: open on every answer */\n\t\t/* the exemption covers the formal watch this answer opens"),
 	("mut_exc_keep", "fault_entry_revokes", "\tactive_watch = 0;\n\tif (kernel_resources_held) {\n\t\theld_irq_mask();", "\tif (kernel_resources_held) {\n\t\theld_irq_mask();"),
 	("m_exc_entry_mask", "fault_entry_masks", "\t\theld_irq_mask();\n\t\tfirmware_fault = 1;", "\t\tfirmware_fault = 1;"),
@@ -130,6 +137,8 @@ MUTATIONS = [
 	("m_ignore_other", "usb_cancel_frees", '\t\tusb_notification(0, &data, &n);\n\t\treturn;\n\t}\n\tif (data.transfer.endpoint_index != USB_EP_OUT) {', '\t\treturn;   /* mutation: the IN terminal is dropped unread */\n\t}\n\tif (data.transfer.endpoint_index != USB_EP_OUT) {'),
 	("m_cancel_bound", "dyn_", "\t\tif (data->transfer.bytes_completed > sub_len) {\n\t\t\tusb_stop_endpoint(out, \"Cancelled over a length that was not submitted\");\n\t\t\treturn -1;   /* overlong like an over-OK: structurally unsound, nothing releases */\n\t\t}\n", ""),
 	("m_isolation_frees", "usb_guard_buf", '\t\t\tusb_out_lost = 1;\n\t\t}', '\t\t\tusb_out_lost = 1;\n\t\t\tusb_out_owned = 0;   /* mutation: the isolation forgets the buffer */\n\t\t}'),
+	("m_recover_no_age", "recover_young_kept", "\tif (!usb_in_invalid && usb_in_since != 0 && age < USB_IN_STALE_SECONDS) {\n\t\treturn -1;      /* young: its transfer may still be running, nothing to recover */\n\t}\n", ""),
+	("m_recover_no_abort", "recover_level1_only_abort", "\tif (USB->abort_xfer != NULL) {\n\t\t(void)USB->abort_xfer(USB_EP_IN);\n\t\tif (!usb_recover_drain(freq / 4)) {", "\tif (0) {\n\t\t(void)USB->abort_xfer(USB_EP_IN);\n\t\tif (!usb_recover_drain(freq / 4)) {"),
 	("mut_ev_deadline", "usb_notify_", "@DEADLINE_SWAP@"),
 	("m_aff_negative_pending", "ret_bad", '\t\t\tif (state == 0 || state == 2) {   /* on, or being started: the race may still settle */', '\t\t\tif (state != 1) {   /* mutation: an error is polled like a settling race */'),
 	("m_aff_reask_off", "ret_aff_settles", '\t\t\tif (off_seen[i]) {\n\t\t\t\tcontinue;   /* an off core is never asked again */\n\t\t\t}\n', ''),
@@ -175,6 +184,8 @@ def build_c(src):
                          ("@FAULT_SERVE@", macro_value(src, "FAULT_SERVE_SECONDS")),
                          ("@SELFTEST@", macro_value(src, "CHECKPOINT_SELFTEST")), ("@MAGIC2@", macro_value(src, "KERNEL_LIVE_MAGIC2")),
                          ("@LIVE@", struct_copy(src, "kernel_live")), ("@EXC@", exc), ("@USB@", usb),
+                         ("@DESCSET@", re.search(r"typedef struct \{[^}]*\} usb_device_descriptor_set;",
+                                                 read(EFIH), re.S).group(0)),
                          ("@PSCI@", _harness2.PSCI_STUB)):
         prelude = prelude.replace(token, value)
     return prelude + "\n" + "\n".join(blocks) + "\n" + SCENARIOS + "\n"
@@ -184,7 +195,7 @@ def deadline_swap(src):
     and pet block. Both slices live inside the same for(;;) scope, so the swap always
     compiles; a completion that arrives at the deadline is thrown away by the mutant."""
     a0 = src.index("\t\t/* a completion in hand is verified before the budget")
-    mid = src.index("\t\t/* with a kernel running", a0)
+    mid = src.index("\t\t/* the wait is bounded in every state", a0)
     a1 = src.index("\t\tif (READ_SYSREG(CNTVCT_EL0) - last_pet > freq) {\n\t\t\tlast_pet = READ_SYSREG(CNTVCT_EL0);\n\t\t\twdt_pet();\n\t\t}\n", mid)
     a1 += len("\t\tif (READ_SYSREG(CNTVCT_EL0) - last_pet > freq) {\n\t\t\tlast_pet = READ_SYSREG(CNTVCT_EL0);\n\t\t\twdt_pet();\n\t\t}\n")
     ev, rest = src[a0:mid], src[mid:a1]
@@ -292,17 +303,28 @@ def wiring_checks(src):
     ck("((kernel_resources_held || firmware_fault) && !active_watch) ? NULL : find_log_partition()" in blk_w, "write_gate_line")
     ck(src.count("find_log_partition()") == 1, "one_partition_query")
     blk_u = extract(src, "LC-USB")
-    ck("if ((running_live != NULL || kernel_resources_held || firmware_fault) && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {" in blk_u, "usb_bound_line")
+    ck("? 3 * freq : USB_IDLE_WAIT_SECONDS * freq;" in blk_u and blk_u.count("began > limit") == 1,
+       "usb_bound_line")
+    ck(blk_u.count('usb_recover_in("') == 2 and "static int\nusb_recover_in(const char *why)" in blk_u,
+       "recover_defined_and_called_twice")
+    ck(0 < blk_u.find('usb_recover_in("a reply")') < blk_u.find("memcpy(usb_tx_buf"), "recover_before_reply")
+    ck(0 < blk_u.find('usb_recover_in("the next command")') < blk_u.find("if (usb_out_lost) {"),
+       "recover_before_command")
+    ck("usb_in_since = READ_SYSREG(CNTVCT_EL0);" in blk_u and blk_u.count("usb_in_since") >= 3, "submit_stamp")
+    ck(0 < blk_u.find("USB->abort_xfer(USB_EP_IN)") < blk_u.find("set_endpoint_stall_state(USB_EP_IN, 1)")
+       < blk_u.find("usb_rebuild()"), "recover_level_order")
+    ck("usb_in_recoveries >= USB_IN_RECOVER_LIMIT" in blk_u, "recover_bounded")
+    ck("USB_CHUNK    (1024 * 1024)" in src and "#define USB_CHUNK (1024 * 1024)" in PRELUDE, "chunk_mirror")
     ck("queues a fresh receive" not in src, "no_recovery_overclaim")
     ck(0 < blk_u.find("if (usb_out_lost) {") < blk_u.find("USB->send(USB_EP_OUT, len, buf)"), "rx_guard_first")
-    ck(0 < blk_u.find("if (usb_in_lost || usb_in_owned) {") < blk_u.find("memcpy(usb_tx_buf"), "tx_guard_first")
+    ck(0 < blk_u.find("if (usb_in_lost) {") < blk_u.find("memcpy(usb_tx_buf"), "tx_guard_first")
     blk_p = extract(src, "LC-POLL")
     ck("!usb_rx_queued && !usb_out_lost && !usb_out_owned && usb_connected" in blk_p, "poll_lost_guard")
     ck("usb_notification(0, &data, &n);" in blk_p, "poll_books_in_terminal")
     ck("usb_notification(1, &data, &n) != 1" in blk_p, "poll_confirms")
     ck("static int\nusb_notification(" in blk_u, "shared_rule_defined")
     ck("usb_notification(data.transfer.endpoint_index == USB_EP_OUT, &data, &bytes)" in blk_u, "wait_uses_shared_rule")
-    ck(0 < blk_u.find("usb_notification(data.transfer.endpoint_index ==") < blk_u.find("began > 3 * freq"), "completion_before_deadline")
+    ck(0 < blk_u.find("usb_notification(data.transfer.endpoint_index ==") < blk_u.find("began > limit"), "completion_before_deadline")
     ck(blk_u.count("data_buffer != sub") == 1 and "data->transfer.status > UsbDeviceTransferStatusCompleteError" in blk_u, "verify_checks_present")
     # usb_notification bounds the byte count of each terminal branch separately; the two
     # checks serve different paths and both must stay:
@@ -329,7 +351,11 @@ def wiring_checks(src):
        and "usb_out_buf = usb_rx_buf;" in blk_p, "record_submit")
     ck("a failed call delivered no event to read" in blk_u and "no event to act on" in blk_p, "handle_error_gated")
     ck(0 < blk_u.find("usb_out_lost : usb_in_lost") < blk_u.find("!usb_out_owned"), "lost_guard_first")
-    ck(0 <= blk_u.find("if (size < sizeof(data.transfer))") < blk_u.find("data.transfer.endpoint_index =="), "wait_size_before_fields")
+    i_wait = blk_u.find("static int64_t\nusb_wait(uint8_t endpoint, int deliver)")
+    i_rx = blk_u.find("static int64_t\nusb_rx(")
+    wait_body = blk_u[i_wait:i_rx]
+    ck(0 <= i_wait < i_rx and 0 <= wait_body.find("if (size < sizeof(data.transfer))")
+       < wait_body.find("data.transfer.endpoint_index =="), "wait_size_before_fields")
     ck(0 <= blk_p.find("if (size < sizeof(data.transfer))") < blk_p.find("data.transfer.endpoint_index !="), "poll_size_before_fields")
     ck(0 <= blk_u.find("if (size >= sizeof(data.device_state))") < blk_u.find("data.device_state =="), "wait_size_before_state")
     ck(0 <= blk_p.find("if (size >= sizeof(data.device_state))") < blk_p.find("data.device_state =="), "poll_size_before_state")

@@ -50,6 +50,7 @@ typedef size_t vm_size_t;
 static int kernel_map;
 static unsigned adreno8_step;
 static bool adreno8_gpu_stall;
+static bool adreno8_direct_ring;
 static bool bootarg_present;
 static uint32_t bootarg_value;
 static bool PE_parse_boot_argn(const char *name, void *out, int size) {

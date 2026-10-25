@@ -8,6 +8,9 @@ extern uint32_t adreno8_smmu_page, adreno8_smmu_pages;
 
 #define SMMU_S2CR_FAULT          (2u << 16)
 #define SMMU_S2CR_SHCFG_NSH      (3u << 8)
+#define SMMU_CB_ACTLR            0x04
+/* Linux arm-smmu-qcom.c at efbda69d92e6: PREFETCH_DEEP | CPRE | CMTLB. */
+#define SMMU_GPU_ACTLR           0x303u
 #define SMMU_TCR2_TBI            (1u << 5 | 1u << 6)
 #define SMMU_PTE_XN              (3ULL << 53)
 #define SMMU_PTE_REQUIRED        (3ULL | 1ULL << 10 | 1ULL << 11)

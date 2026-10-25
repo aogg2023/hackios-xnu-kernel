@@ -707,6 +707,8 @@ adreno8_space_registers(struct adreno8_gpu_space *space)
 	ok &= adreno8_get(&adreno8_smmu, "cb ttbr1, high", cb + SMMU_CB_TTBR1 + 4) == 0;
 	ok &= adreno8_get(&adreno8_smmu, "cb mair0", cb + SMMU_CB_MAIR0) == MAIR0_NORMAL;
 	ok &= adreno8_get(&adreno8_smmu, "cb mair1", cb + SMMU_CB_MAIR1) == 0;
+	if (adreno8_direct_ring && space == &adreno8_gpu_space && space->context == 0)
+		ok &= adreno8_get(&adreno8_smmu, "cb actlr", cb + SMMU_CB_ACTLR) == SMMU_GPU_ACTLR;
 	if (!ok) {
 		printf("adreno8: %u: context %u register verification failed\n", adreno8_step, space->context);
 	}
@@ -783,6 +785,12 @@ adreno8_space_on(struct adreno8_gpu_space *space, uint32_t stream, uint32_t matc
 	if (adreno8_get(&adreno8_smmu, "cb sctlr disabled", cb + SMMU_CB_SCTLR) != 0) {
 		goto fail;
 	}
+	if (adreno8_direct_ring && space == &adreno8_gpu_space && space->context == 0) {
+		adreno8_put(&adreno8_smmu, "cb actlr", cb + SMMU_CB_ACTLR, SMMU_GPU_ACTLR);
+		adreno8_settle();
+		if (adreno8_get(&adreno8_smmu, "cb actlr readback", cb + SMMU_CB_ACTLR) != SMMU_GPU_ACTLR)
+			goto fail;
+	}
 	adreno8_put(&adreno8_smmu, "cb a2r", adreno8_smmu_page + SMMU_CBA2R(space->context), 1);
 	adreno8_put(&adreno8_smmu, "cb bar", adreno8_smmu_page + SMMU_CBAR(space->context), STAGE_1);
 	adreno8_put(&adreno8_smmu, "cb tcr2", cb + SMMU_CB_TCR2, TCR2_39_BITS);
@@ -811,9 +819,9 @@ adreno8_space_on(struct adreno8_gpu_space *space, uint32_t stream, uint32_t matc
 	    adreno8_space_faulted(space)) {
 		goto fail;
 	}
-	if (space == &adreno8_gpu_space) {
+	if (space == &adreno8_gpu_space && !adreno8_direct_ring) {
 		/* Compare the inherited CB0 ACTLR with the vendor's per-stream configuration. */
-		adreno8_get(&adreno8_smmu, "gpu cb actlr", cb + 0x04);
+		adreno8_get(&adreno8_smmu, "gpu cb actlr", cb + SMMU_CB_ACTLR);
 	}
 	printf("adreno8: %u: %s translation enabled: stream %u, context %u, root PA %#llx\n", adreno8_step,
 	    space->name, stream, space->context, space->tables[0].phys);

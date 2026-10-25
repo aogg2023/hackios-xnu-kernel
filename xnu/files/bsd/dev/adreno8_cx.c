@@ -257,6 +257,52 @@ adreno8_dep_vote(uint32_t level, uint32_t *vote)
 	return true;
 }
 
+static bool
+adreno8_rsc_read(void)
+{
+	/* Live K90 DT: Apps RSC reg[2], DRV2, eight TCS at d00 + n*2a0.
+	 * rpmh-rsc.c selects the register layout from ID, never from DRV number.
+	 * This observation does not claim ownership and performs no MMIO writes. */
+	static struct adreno8_block rsc = { "apps-rsc-drv2", 0x16520000, 0x10000 };
+	uint32_t id = adreno8_get(&rsc, "id", 0);
+	uint32_t major = (id >> 16) & 0xff, minor = (id >> 8) & 0xff;
+	uint32_t solver = adreno8_get(&rsc, "solver config", 4);
+	uint32_t config = adreno8_get(&rsc, "parent child config", 0xc);
+	uint32_t count = (config >> 12) & 0x3f, ncpt = (config >> 27) & 0x1f;
+
+	printf("adreno8: Apps RSC DRV2 version %u.%u, solver=%u, TCS=%u commands=%u; read-only\n",
+	    major, minor, (solver >> 24) & 1, count, ncpt);
+	if (id == 0 || id == 0xffffffffu || (major != 2 && major != 3) ||
+	    config == 0xffffffffu || count < 8 || ncpt == 0 || ncpt > 16) {
+		printf("adreno8: Apps RSC layout is not supported by this read-only probe\n");
+		return false;
+	}
+	adreno8_get(&rsc, "irq enable", 0xd00);
+	adreno8_get(&rsc, "irq status", 0xd04);
+	for (unsigned n = 0; n < 8; n++) {
+		uint32_t base = 0xd00 + n * 0x2a0;
+		uint32_t control = major >= 3 ? 0x24 : 0x14;
+		uint32_t command = major >= 3 ? 0x34 : 0x30;
+		uint32_t stride = major >= 3 ? 24 : 20;
+		uint32_t wait = adreno8_get(&rsc, "tcs wait", base + control - 4);
+		uint32_t ctrl = adreno8_get(&rsc, "tcs control", base + control);
+		uint32_t status = adreno8_get(&rsc, "tcs status", base + control + 4);
+		uint32_t enable = adreno8_get(&rsc, "tcs enable", base + control + 8);
+		printf("adreno8: Apps RSC TCS%u %s wait=%#x ctrl=%#x status=%#x enable=%#x\n",
+		    n, n < 3 ? "active" : n < 5 ? "sleep" : n < 7 ? "wake" : "fast",
+		    wait, ctrl, status, enable);
+		for (unsigned c = 0; c < ncpt; c++) {
+			if (!(enable & (1u << c))) continue;
+			uint32_t at = base + command + c * stride;
+			uint32_t msg = adreno8_get(&rsc, "command msgid", at);
+			uint32_t addr = adreno8_get(&rsc, "command address", at + 4);
+			uint32_t data = adreno8_get(&rsc, "command data", at + 8);
+			printf("adreno8: Apps RSC TCS%u cmd%u msg=%#x addr=%#x data=%#x\n", n, c, msg, addr, data);
+		}
+	}
+	return true;
+}
+
 bool
 adreno8_step_outside(void)
 {
@@ -295,7 +341,7 @@ adreno8_step_outside(void)
 	if (adreno8_cmd_db == NULL) {
 		printf("adreno8: %u: no list to read messages from: steps 13 on will fail\n", adreno8_step);
 	}
-	return true;
+	return adreno8_rsc_read();
 }
 
 /* ---- step 2: the GPU's clock controller, as left ------------------------------------------------------- */

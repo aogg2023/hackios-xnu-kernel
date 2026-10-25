@@ -15,9 +15,10 @@ HASHES = {
     "adreno-gpulist.h": "7faff3fd1afc101dd1db984a9ca632ce884e8406fa856d4f60632e281077f3f6",
     "gen8_reg.h": "e85cb422ed221896433afcd6d931fd129f4c8e2edb730d15dfc1fc71c9aa51e2",
     "adreno_pm4types.h": "f66d80cd679aa0e0dd032f230bf960a964dfda282944bcb32c6643d1ebe5d731",
+    "sun-gpu.dtsi": "b91bf41b0f6e8f75ea39601a3949debfbbc3b83cb7b52c11142bb6625840bade",
 }
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--vendor-dir", required=True, type=Path, help=f"graphics-kernel sources at {PIN}")
+parser.add_argument("--vendor-dir", required=True, type=Path, help=f"graphics-kernel sources and sun-gpu.dtsi at {PIN}")
 parser.add_argument("--firmware-dir", type=Path, default=ROOT.parent / "hackios-xnu-userland/firmware-gen8")
 args = parser.parse_args()
 vendor = {}
@@ -25,6 +26,27 @@ for name, expected in HASHES.items():
     data = (args.vendor_dir / name).read_bytes()
     assert hashlib.sha256(data).hexdigest() == expected, f"unexpected vendor input: {name}"
     vendor[name] = data.decode()
+
+# https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750/blob/d50b305f7da9e14715a25120a4ac7b1a4b8b97c3/vendor/qcom/opensource/graphics-devicetree/gpu/sun-gpu.dtsi#L32-L40
+gpu_node = vendor["sun-gpu.dtsi"].split("&msm_gpu {", 1)[1]
+cells = [int(n, 16) for n in re.findall(r"0x[0-9a-f]+", re.search(r"\breg\s*=\s*(.*?);", gpu_node, re.S)[1])]
+names = re.findall(r'"([^"]+)"', re.search(r"\breg-names\s*=\s*(.*?);", gpu_node, re.S)[1])
+assert len(cells) == 2 * len(names)
+resources = dict(zip(names, zip(cells[::2], cells[1::2])))
+gpu_phys, gpu_size = resources["kgsl_3d0_reg_memory"]
+for name, (phys, size) in resources.items():
+    if name != "kgsl_3d0_reg_memory":
+        assert gpu_phys + gpu_size <= phys or phys + size <= gpu_phys, name
+
+# Use the production mapping declarations; an independent test-only size hid the 64 KiB mapping.
+gmu_source = (DEV / "adreno8_gmu.c").read_text()
+block_declarations = ""
+for name, base in (("gpu", 0x10000000), ("gmu", 0x20000000)):
+    initializer = re.search(r"struct adreno8_block adreno8_" + name + r"\s*=\s*\{([^}]+)\};", gmu_source)[1]
+    phys, size = [int(n, 16) for n in re.findall(r"0x[0-9a-f]+", initializer)]
+    if name == "gpu":
+        assert (phys, size) == (gpu_phys, gpu_size), "GPU mapping differs from kgsl_3d0_reg_memory"
+    block_declarations += f"struct adreno8_block adreno8_{name} = {{{initializer}, {base}}};\n"
 
 registers = dict(re.findall(r"^#define\s+(GEN8_\w+)\s+(0x[0-9a-fA-F]+|[0-9]+)\s*(?:/\*.*)?$", vendor["gen8_reg.h"], re.M))
 reference = "#define BIT(n) (1u << (n))\n"
@@ -68,8 +90,7 @@ typedef uintptr_t vm_offset_t;
 typedef unsigned int uint;
 struct adreno8_block { const char *name; uint32_t phys, size; vm_offset_t base; };
 struct adreno8_gpu_space;
-struct adreno8_block adreno8_gpu = { "gpu", 0, 0x40000, 0x10000000 };
-struct adreno8_block adreno8_gmu = { "gmu", 0, 0x68000, 0x20000000 };
+''' + block_declarations + f"enum {{ GPU_MAPPING_SIZE = {gpu_size} }};\n" + r'''
 bool adreno8_reset_required;
 int adreno8_say(const char *fmt, ...) { (void)fmt; return 0; }
 uint32_t adreno8_rd(vm_offset_t);
@@ -81,6 +102,7 @@ const uint8_t *redwood_image_file(const char *, const char *, uint64_t *, int *)
 ''' + constants + '\n#include "adreno8_gpu.c"\n#undef printf\n' + reference + r'''
 static uint32_t gpu_regs[8][0x10000], gmu_regs[0x1a000], current_pipe;
 static unsigned gx_reads, gx_writes, raw_calls, allocation_count, publish_count;
+static uint32_t max_gx_offset;
 static bool smmu_ok = true, hfi_ok = true, oob_ok = true, clock_ok = true;
 static bool raw_ok = true, idle_ok = true, memory_on, smmu_after_raw, corrupt_scratch, acquire_ok = true;
 static struct adreno8_memory allocations[4];
@@ -92,8 +114,9 @@ uint32_t adreno8_rd(vm_offset_t address)
 {
     if (address >= adreno8_gmu.base && address < adreno8_gmu.base + adreno8_gmu.size)
         return gmu_regs[(address - adreno8_gmu.base) / 4];
-    assert(address >= adreno8_gpu.base && address < adreno8_gpu.base + adreno8_gpu.size);
+    assert(address >= adreno8_gpu.base && address + 4 <= adreno8_gpu.base + adreno8_gpu.size && !(address & 3));
     gx_reads++;
+    if (address - adreno8_gpu.base > max_gx_offset) max_gx_offset = address - adreno8_gpu.base;
     uint32_t reg = (address - adreno8_gpu.base) / 4;
     if (reg == GEN8_CP_APERTURE_CNTL_HOST) return current_pipe << 12;
     if (reg == GEN8_RBBM_CGC_P2S_STATUS) return clock_ok;
@@ -112,8 +135,9 @@ void adreno8_wr(vm_offset_t address, uint32_t value)
         if (reg == GMU_GMU2HOST_CLR / 4) gmu_regs[GMU_GMU2HOST_INFO / 4] &= ~value;
         return;
     }
-    assert(address >= adreno8_gpu.base && address < adreno8_gpu.base + adreno8_gpu.size);
+    assert(address >= adreno8_gpu.base && address + 4 <= adreno8_gpu.base + adreno8_gpu.size && !(address & 3));
     gx_writes++;
+    if (address - adreno8_gpu.base > max_gx_offset) max_gx_offset = address - adreno8_gpu.base;
     uint32_t reg = (address - adreno8_gpu.base) / 4;
     if (reg == GEN8_CP_APERTURE_CNTL_HOST) { current_pipe = value >> 12; assert(current_pipe < 8); }
     else gpu_regs[current_pipe][reg] = value;
@@ -205,6 +229,7 @@ static void reset(void)
     memset(allocations, 0, sizeof(allocations)); memset(gpu_regs, 0, sizeof(gpu_regs)); memset(gmu_regs, 0, sizeof(gmu_regs));
     gpu_state = GPU_COLD; sqe = aqe = powerup = scratch = NULL; oob_requested = oob_acked = false;
     gx_reads = gx_writes = raw_calls = allocation_count = publish_count = current_pipe = 0;
+    max_gx_offset = 0; adreno8_gpu.size = GPU_MAPPING_SIZE;
     smmu_ok = hfi_ok = oob_ok = clock_ok = raw_ok = idle_ok = acquire_ok = true;
     smmu_after_raw = corrupt_scratch = memory_on = adreno8_reset_required = false;
     gmu_regs[GMU_PWR_CLK_STATUS / 4] = 3;
@@ -235,6 +260,13 @@ int main(int argc, char **argv)
     assert(A8_CP_SW_MASK == CP_SW_FAULT_STATUS_MASK_PIPE);
     assert(A8_CP_HW_MASK == CP_HW_FAULT_STATUS_MASK_PIPE);
     assert(A8_CP_GLOBAL_MASK == CP_INTERRUPT_STATUS_MASK_GLOBAL);
+    for (unsigned i = 0; i < A8_COUNT(a8_noncontext); i++) assert(a8_noncontext[i].reg < adreno8_gpu.size / 4);
+    for (unsigned i = 0; i < A8_COUNT(a8_protected); i++) assert(a8_protected[i].reg < adreno8_gpu.size / 4);
+    for (unsigned i = 0; i < A8_COUNT(a8_bicubic); i++) assert(a8_bicubic[i].reg < adreno8_gpu.size / 4);
+    for (unsigned i = 0; i < A8_COUNT(a8_powerup); i++) assert(a8_powerup[i] < adreno8_gpu.size / 4);
+    for (unsigned i = 0; i < A8_COUNT(a8_powerup_ifpc); i++) assert(a8_powerup_ifpc[i] < adreno8_gpu.size / 4);
+    for (unsigned i = 0; i < A8_COUNT(a8_powerup_ext); i++) assert(a8_powerup_ext[i].reg < adreno8_gpu.size / 4);
+    for (unsigned i = 0; i < A8_COUNT(a8_ao_hwcg); i++) assert(GMU(a8_ao_hwcg[i].reg) <= adreno8_gmu.size - 4);
     for (unsigned opcode = 0; opcode < 128; opcode++)
         for (unsigned words = 0; words < 1024; words++) assert(adreno8_pm4_type7(opcode,words) == cp_type7_packet(opcode,words));
     uint32_t words[10]; memset(words, 0xa5, sizeof(words));
@@ -256,6 +288,24 @@ int main(int argc, char **argv)
     assert(adreno8_gpu_secure_exit() && adreno8_gpu_scratch_test());
     assert(gpu_state == GPU_TESTED && oob_acked && adreno8_reset_required && raw_calls == 3);
     assert(gmu_regs[GMU_HOST2GMU_SET / 4] == 1u << 30);
+    assert(gpu_regs[0][GEN8_UCHE_CCHE_GC_GMEM_RANGE_MIN_LO] == 0x04000000);
+    assert(max_gx_offset == 4 * GEN8_RBBM_SECVID_TSB_CNTL && max_gx_offset == 0x3e00c);
+
+    reset(); gpu_write(adreno8_gpu.size / 4 - 1, 0x12345678);
+    assert(gpu_read(adreno8_gpu.size / 4 - 1) == 0x12345678 && gpu_state != GPU_FAILED);
+    const uint32_t bad_registers[] = { GPU_MAPPING_SIZE / 4, 0x50000 / 4, 0x40000000, UINT32_MAX };
+    for (unsigned i = 0; i < A8_COUNT(bad_registers); i++) {
+        reset(); gpu_write(bad_registers[i], 1);
+        assert(gpu_state == GPU_FAILED && !gx_reads && !gx_writes);
+        gpu_write(0, 1); assert(!gpu_read(0) && !gx_reads && !gx_writes);
+        reset(); assert(!gpu_read(bad_registers[i]));
+        assert(gpu_state == GPU_FAILED && !gx_reads && !gx_writes);
+    }
+    reset(); prepare(); adreno8_gpu.size = 0x10000;
+    assert(!adreno8_gpu_cp_init() && gpu_state == GPU_FAILED && !raw_calls);
+    assert(max_gx_offset < 0x10000);
+    reset(); prepare(); assert(gpu_oob_get()); adreno8_gpu.size = 4;
+    assert(!gpu_raw(words, 10, "invalid status register") && gpu_state == GPU_FAILED && !raw_calls);
 
     reset(); prepare(); oob_ok = false;
     assert(!adreno8_gpu_cp_init() && !gx_reads && !gx_writes && adreno8_reset_required);
@@ -277,7 +327,7 @@ int main(int argc, char **argv)
     reset(); prepare(); assert(adreno8_gpu_cp_init() && adreno8_gpu_secure_exit());
     acquire_ok = false; assert(!adreno8_gpu_scratch_test() && gpu_state == GPU_FAILED);
     reset(); free(files[0]); free(files[1]);
-    puts("gen8.0.0 vendor tables, PM4, firmware, startup ordering and failure retention passed");
+    puts("gen8.0.0 vendor aperture/tables, bounded MMIO, PM4, firmware and startup failures passed");
     return 0;
 }
 '''

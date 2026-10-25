@@ -33,12 +33,24 @@ gpu_fail(const char *what)
 static uint32_t
 gpu_read(uint32_t reg)
 {
+	if (gpu_state == GPU_FAILED)
+		return 0;
+	if (!adreno8_gpu.base || reg >= adreno8_gpu.size / sizeof(uint32_t)) {
+		gpu_fail("register read outside mapped aperture");
+		return 0;
+	}
 	return adreno8_rd(adreno8_gpu.base + 4u * reg);
 }
 
 static void
 gpu_write(uint32_t reg, uint32_t value)
 {
+	if (gpu_state == GPU_FAILED)
+		return;
+	if (!adreno8_gpu.base || reg >= adreno8_gpu.size / sizeof(uint32_t)) {
+		gpu_fail("register write outside mapped aperture");
+		return;
+	}
 	adreno8_wr(adreno8_gpu.base + 4u * reg, value);
 }
 
@@ -49,7 +61,7 @@ gpu_aperture(uint32_t pipe)
 	adreno8_settle();
 	if (gpu_read(GEN8_CP_APERTURE_CNTL_HOST) != pipe << 12)
 		return gpu_fail("aperture readback");
-	return true;
+	return gpu_state != GPU_FAILED;
 }
 
 static bool
@@ -58,7 +70,7 @@ gpu_pipe_write(uint32_t pipe, uint32_t reg, uint32_t value)
 	if (!gpu_aperture(pipe))
 		return false;
 	gpu_write(reg, value);
-	return true;
+	return gpu_state != GPU_FAILED;
 }
 
 static bool
@@ -78,6 +90,8 @@ gpu_status_ok(void)
 		return gpu_fail("power, HFI or translation check");
 	interrupt = gpu_read(GEN8_RBBM_INT_0_STATUS);
 	cp = gpu_read(GEN8_CP_INTERRUPT_STATUS_GLOBAL);
+	if (gpu_state == GPU_FAILED)
+		return false;
 	if ((interrupt & A8_GPU_ERROR_MASK) || (cp & A8_CP_GLOBAL_MASK)) {
 		printf("adreno8: GPU fault: RBBM_INT=%#x CP_GLOBAL=%#x\n", interrupt, cp);
 		return gpu_fail("CP status");

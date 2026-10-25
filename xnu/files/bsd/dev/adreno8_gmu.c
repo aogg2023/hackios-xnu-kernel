@@ -14,7 +14,8 @@
 
 struct adreno8_block adreno8_gmu = { "gmu", 0x03d37000, 0x68000 };
 
-struct adreno8_block adreno8_gpu = { "gpu", 0x03d00000, 0x10000 };   /* the 3D core's front door and the gbif's CX side */
+/* sun-gpu.dtsi at d50b305f7da9: kgsl_3d0_reg_memory, ending before gmu_ao_blk_dec0. */
+struct adreno8_block adreno8_gpu = { "gpu", 0x03d00000, 0x40000 };
 
 /* where the memory the firmware asks for lives: the addresses are the firmware's, in its space */
 

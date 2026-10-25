@@ -53,14 +53,18 @@ bo_range(uint64_t address, uint64_t size)
 	    size <= ADRENO8_GPU_IOVA_END - address;
 }
 
+/* Every page below this address was in use when last looked at: a search for room starts here. */
+static uint32_t bo_free_from = ADRENO8_GPU_IOVA_START;
+
 uint64_t
 adreno8_bo_reserve(uint64_t size)
 {
-	uint32_t address;
+	uint32_t address, from = bo_free_from;
 	if (!adreno8_bo_ready()) return 0;
 	if (!bo_range(ADRENO8_GPU_IOVA_START, size) ||
-	    !adreno8_space_find_range(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START,
-	    ADRENO8_GPU_IOVA_END, (uint32_t)size, SMMU_GRANULE, &address)) {
+	    (!adreno8_space_find_range(&adreno8_gpu_space, from, ADRENO8_GPU_IOVA_END, (uint32_t)size, SMMU_GRANULE, &address) &&
+	    (from == ADRENO8_GPU_IOVA_START || !adreno8_space_find_range(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START,
+	    ADRENO8_GPU_IOVA_END, (uint32_t)size, SMMU_GRANULE, &address)))) {
 		bo_fail("IOVA reservation");
 		return 0;
 	}
@@ -74,6 +78,11 @@ adreno8_bo_reserve(uint64_t size)
 	}
 	for (uint64_t at = 0; at < size; at += SMMU_GRANULE)
 		*adreno8_space_entry(&adreno8_gpu_space, address + at) = ADRENO8_PTE_EXTERNAL;
+	/* (the pages it passes over stay in use until a release brings it back below them) */
+	for (uint64_t *entry; bo_free_from < ADRENO8_GPU_IOVA_END &&
+	    (entry = adreno8_space_entry(&adreno8_gpu_space, bo_free_from)) != NULL && *entry != 0;
+	    bo_free_from += SMMU_GRANULE) {
+	}
 	return address;
 }
 
@@ -160,5 +169,6 @@ adreno8_bo_release(uint64_t address, uint64_t size)
 	}
 	for (uint64_t at = 0; at < size; at += SMMU_GRANULE)
 		*adreno8_space_entry(&adreno8_gpu_space, (uint32_t)(address + at)) = 0;
+	if (address < bo_free_from) bo_free_from = (uint32_t)address;
 	return true;
 }

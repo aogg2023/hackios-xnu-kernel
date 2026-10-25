@@ -176,6 +176,12 @@ int main(int argc, char **argv) {
     pending_entry = NULL;
     assert(adreno8_bo_release(address, size) && *first == 0);
     assert(adreno8_bo_reserve(4096) == address);
+    if (size == 3 * 4096) {
+        /* first fit from the lowest free page: the freed hole fills up, a larger request goes past it */
+        assert(adreno8_bo_reserve(4096) == address + 4096);
+        assert(adreno8_bo_reserve(8192) == next + 4096);
+        assert(adreno8_bo_reserve(4096) == address + 8192);
+    }
     assert(*adreno8_space_entry(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START) == startup_pte);
     assert(adreno8_space_entry(&adreno8_gpu_space, next) &&
         *adreno8_space_entry(&adreno8_gpu_space, next) == ADRENO8_PTE_EXTERNAL);

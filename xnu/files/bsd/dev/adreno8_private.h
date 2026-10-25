@@ -81,6 +81,7 @@ struct adreno8_gpu_space {
 	uint32_t context;
 	struct adreno8_space_table tables[1024];
 	unsigned table_count;
+	uint16_t leaf_slot[2048];                 /* each 2 MB's level-2 table, as its index in tables[] + 1; 0: not looked up yet */
 	unsigned secure_tables;           /* pages already assigned to {HLOS read/write, CP_PIXEL read} */
 	bool is_on;
 };

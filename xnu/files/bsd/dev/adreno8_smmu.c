@@ -254,11 +254,22 @@ struct adreno8_gpu_space adreno8_secure_space = { "secure", SECURE_CONTEXT };
 
 static bool adreno8_space_sync(struct adreno8_gpu_space *space);
 
+/* A level-2 table is remembered by its index (leaf_slot) and checked again before it is trusted. */
 static struct adreno8_space_table *
 adreno8_space_table(struct adreno8_gpu_space *space, unsigned level, uint32_t index)
 {
+	uint16_t *slot = level == 2 && index < sizeof(space->leaf_slot) / sizeof(space->leaf_slot[0]) ?
+	    &space->leaf_slot[index] : NULL;
+
+	if (slot != NULL && *slot != 0 && *slot <= space->table_count &&
+	    space->tables[*slot - 1].level == 2 && space->tables[*slot - 1].index == index) {
+		return &space->tables[*slot - 1];
+	}
 	for (unsigned i = 0; i < space->table_count; i++) {
 		if (space->tables[i].level == level && space->tables[i].index == index) {
+			if (slot != NULL) {
+				*slot = (uint16_t)(i + 1);
+			}
 			return &space->tables[i];
 		}
 	}

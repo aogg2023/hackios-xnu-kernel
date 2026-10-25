@@ -544,12 +544,13 @@ ddr_raise(void)
  * tree: CPU0-5 clocks = <&scmi_perf 0>, CPU6-7 <&scmi_perf 1>).
  *
  * Boot-arg cpufreq=2 only reports: the protocol, every domain with its levels and the level it
- * is at, how fast a chain of adds runs, and every 30 s the temperatures. cpufreq=1 also asks
- * for the sustained level (the highest the firmware says can be kept up; the top one if it names
- * none of those it describes) of each domain with a core of ours, and watches that cluster's temperature
- * once a second: at 95 C (the stock thermal-hal-config trip of cpu-1-*) the domain goes back
- * to the level the boot loader left, below 90 C (that trip's 5 C hysteresis) up again;
- * without a valid reading it is not raised.
+ * is at, how fast a chain of adds runs, and every 30 s the temperatures. cpufreq=1 also asks,
+ * for each domain with a core of ours, for the fastest level at or under the sustained frequency
+ * the firmware gives (on annibale its sustained level index names another level: 4320 MHz for
+ * 4089.6) and under boot-arg cpufreq_mhz=N if given, and watches that cluster's temperature
+ * every 100 ms: at 70 C the domain goes back to the level the boot loader left, under 60 C up
+ * again; without a valid reading it is not raised. (Far under the stock trips, 95 C for
+ * cpu-1-*: the phone is not to get near those while this is tried.)
  *
  * Channel layout: Linux drivers/firmware/arm_scmi/shmem.c; doorbell: drivers/mailbox/
  * qcom-cpucp-mbox.c (TX_MBOX_CMD(chan) + 4; any value); addresses: the stock device tree
@@ -586,8 +587,9 @@ ddr_raise(void)
  * reading in its low 12 bits, signed, in tenths of a degree, bit 21 set when valid). */
 #define TSENS_STATUS(sensor)    (0xa0 + 4 * (sensor))
 #define TSENS_VALID             (1u << 21)
-#define HOT_TENTHS              950
-#define COOL_TENTHS             900
+#define HOT_TENTHS              700
+#define COOL_TENTHS             600
+#define WATCH_MS                100
 static const struct {
 	const char *name;
 	vm_offset_t phys;
@@ -730,7 +732,8 @@ temperatures(char *line, size_t size)
 static void
 perf_describe(uint32_t domain, uint32_t version)
 {
-	uint32_t out[SHMEM_WORDS], words, attributes, sustained, levels = 0, top = 0, top_key = 0, target, level = 0, limits[2] = { 0, 0 };
+	uint32_t out[SHMEM_WORDS], words, attributes, ceiling, levels = 0, best = 0, best_key = 0, low = 0, low_key = 0, level = 0;
+	uint32_t limits[2] = { 0, 0 }, mhz = 0;
 	uint32_t entry = version >= 0x40000 ? 5 : 3;    /* words a level takes (4.0 adds a frequency and an index) */
 	char name[17] = { 0 }, list[200];
 	bool indexing, found = false;
@@ -744,13 +747,16 @@ perf_describe(uint32_t domain, uint32_t version)
 		return;
 	}
 	attributes = out[0];
-	sustained = out[3];
+	ceiling = out[2];
+	if (PE_parse_boot_argn("cpufreq_mhz", &mhz, sizeof(mhz)) && mhz != 0 && (ceiling == 0 || mhz * 1000 < ceiling)) {
+		ceiling = mhz * 1000;
+	}
 	indexing = entry == 5 && (attributes & PERF_LEVEL_INDEXING);
 	if (words >= 8) {
 		memcpy(name, &out[4], 16);
 	}
 	tell("cpufreq: SCMI domain %u \"%s\": attributes %#x, rate limit %u us, sustained %u kHz at level %u\n", domain, name,
-	    attributes, out[1], out[2], sustained);
+	    attributes, out[1], out[2], out[3]);
 	list[0] = 0;
 	for (uint32_t index = 0; levels < 256;) {
 		uint32_t in[2] = { domain, index }, returned, remaining;
@@ -769,11 +775,15 @@ perf_describe(uint32_t domain, uint32_t version)
 			const uint32_t *e = &out[1 + i * entry];
 			uint32_t key = indexing ? e[4] : e[0], khz = entry == 5 && e[3] != 0 ? e[3] : e[0];
 
-			if (levels + i == 0 || e[0] > top) {
-				top = e[0];
-				top_key = key;
+			if (levels + i == 0 || khz < low) {
+				low = khz;
+				low_key = key;
 			}
-			found = found || key == sustained;
+			if ((ceiling == 0 || khz <= ceiling) && (!found || khz > best)) {
+				best = khz;
+				best_key = key;
+				found = true;
+			}
 			if (at < (int)sizeof(list) - 16) {
 				at += snprintf(list + at, sizeof(list) - at, " %u/%u", khz / 1000, key);
 			}
@@ -787,14 +797,13 @@ perf_describe(uint32_t domain, uint32_t version)
 	status = perf_level(domain, &level);
 	words = 2;
 	scmi_call(PERF_LIMITS_GET, &domain, 1, limits, &words);
-	target = found ? sustained : top_key;
 	tell("cpufreq: SCMI domain %u: %u levels (MHz/%s):%s\n", domain, levels, indexing ? "index" : "value", list);
-	tell("cpufreq: SCMI domain %u: at %u (status %d), limits %u to %u; would ask for %u\n", domain, level, status,
-	    limits[1], limits[0], target);
+	tell("cpufreq: SCMI domain %u: at %u (status %d), limits %u to %u; would ask for %u (%u MHz)\n", domain, level, status,
+	    limits[1], limits[0], found ? best_key : low_key, (found ? best : low) / 1000);
 	if (domain < PERF_DOMAINS && status == 0 && levels != 0 && (attributes & PERF_LEVEL_SET_ALLOWED)) {
 		perf_domain[domain].known = true;
 		perf_domain[domain].boot_level = level;
-		perf_domain[domain].top = target;
+		perf_domain[domain].top = found ? best_key : low_key;
 	}
 }
 
@@ -817,8 +826,8 @@ thermal_thread(void *arg, wait_result_t wr __unused)
 {
 	bool control = arg != NULL;
 
-	for (uint32_t second = 1;; second++) {
-		delay_for_interval(1000, NSEC_PER_MSEC);
+	for (uint32_t tick = 1;; tick++) {
+		delay_for_interval(WATCH_MS, NSEC_PER_MSEC);
 		for (uint32_t d = 0; control && d < PERF_DOMAINS; d++) {
 			int32_t t = 0;
 			bool valid = tsens_hottest(d, &t);
@@ -834,7 +843,7 @@ thermal_thread(void *arg, wait_result_t wr __unused)
 				perf_raise(d, true);
 			}
 		}
-		if (second % 30 == 0) {
+		if (tick % (30000 / WATCH_MS) == 0) {
 			char line[160];
 
 			temperatures(line, sizeof(line));

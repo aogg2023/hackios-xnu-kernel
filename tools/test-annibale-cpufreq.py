@@ -31,10 +31,10 @@ typedef struct { unsigned int num_cpus; ml_topology_cpu_t cpus[2]; } ml_topology
 #define __builtin_arm_dsb(kind) ((void)0)
 
 static uint32_t shmem[0x80], doorbell[0xc0], tsens[3][0x80];
-static uint32_t version = 0x40000, levels = 20, batch = 8, boot_level = 2, sustained = 17, indexing = 1;
+static uint32_t version = 0x40000, levels = 20, batch = 8, boot_level = 2, sustained = 17, sustained_khz = 3100000, indexing = 1;
 static uint32_t level[2], sets, set_domain[16], set_level[16], deny_set, never_free;
-static uint32_t mode, membench, threads, seconds, stop_after, benches;
-static int32_t schedule[64];            /* cluster 1 temperature for each second, tenths; < -1000: invalid */
+static uint32_t mode, membench, cap_mhz, threads, seconds, stop_after, benches;
+static int32_t schedule[64];            /* cluster 1 temperature for each watch, tenths; < -1000: invalid */
 static void *thread_arg;
 static uint64_t now_ns;
 static jmp_buf out_of_thread;
@@ -55,6 +55,7 @@ static bool PE_parse_boot_argn(const char *name, void *value, int size)
     (void)size;
     if (!strcmp(name, "cpufreq") && mode) { *(uint32_t *)value = mode; return true; }
     if (!strcmp(name, "membench") && membench) { *(uint32_t *)value = membench; return true; }
+    if (!strcmp(name, "cpufreq_mhz") && cap_mhz) { *(uint32_t *)value = cap_mhz; return true; }
     return false;
 }
 static vm_offset_t ml_io_map(vm_offset_t phys, unsigned long size)
@@ -90,7 +91,7 @@ static void firmware(void)
     case 0x0: out[0] = version; words = 1; break;
     case 0x1: out[0] = 2; words = 4; break;
     case 0x3:
-        out[0] = 0x6a000000 & (indexing ? ~0u : ~(1u << 25)); out[1] = 0; out[2] = 3100000; out[3] = sustained;
+        out[0] = 0x6a000000 & (indexing ? ~0u : ~(1u << 25)); out[1] = 0; out[2] = sustained_khz; out[3] = sustained;
         memcpy(&out[4], in[0] ? "cpu6\0\0\0\0\0\0\0\0\0\0\0\0" : "cpu0\0\0\0\0\0\0\0\0\0\0\0\0", 16);
         words = 8; break;
     case 0x4: {
@@ -120,7 +121,7 @@ static void firmware(void)
 
 static void delay_for_interval(uint32_t interval, uint64_t scale)
 {
-    if (interval == 1000 && scale == NSEC_PER_MSEC) {
+    if (interval == 100 && scale == NSEC_PER_MSEC) {
         if (++seconds > stop_after)
             longjmp(out_of_thread, 1);
         set_temperature(1, schedule[seconds]);
@@ -134,8 +135,8 @@ static void reset(uint32_t m)
     memset(shmem, 0, sizeof(shmem));
     shmem[1] = 1;
     level[0] = level[1] = boot_level;
-    sets = deny_set = never_free = seconds = threads = benches = membench = 0;
-    version = 0x40000; levels = 20; batch = 8; sustained = 17; indexing = 1;
+    sets = deny_set = never_free = seconds = threads = benches = membench = cap_mhz = 0;
+    version = 0x40000; levels = 20; batch = 8; sustained = 17; sustained_khz = 3100000; indexing = 1;
     mode = m;
     memset(perf_domain, 0, sizeof(perf_domain));
     for (unsigned g = 0; g < 3; g++) set_temperature(g, 400);
@@ -155,22 +156,23 @@ int main(void)
     /* only reports: nothing is set, the watch runs without control */
     reset(2);
     annibale_cpufreq();
-    assert(sets == 0 && threads == 1 && thread_arg == NULL && perf_domain[1].top == 17 && perf_domain[1].boot_level == boot_level);
+    assert(sets == 0 && threads == 1 && thread_arg == NULL && perf_domain[1].boot_level == boot_level);
+    assert(perf_domain[1].top == 14);       /* 3100 MHz, the sustained frequency (index 17 is another level) */
     assert(perf_domain[1].ours && !perf_domain[0].ours);
-    for (unsigned i = 0; i < 64; i++) schedule[i] = 990;
+    for (unsigned i = 0; i < 64; i++) schedule[i] = 690;
     run_thread(40);
     assert(sets == 0);
 
     /* raised at boot when cool, only the cluster with our cores */
     reset(1);
     annibale_cpufreq();
-    assert(sets == 1 && set_domain[0] == 1 && set_level[0] == 17 && perf_domain[1].raised && thread_arg != NULL);
+    assert(sets == 1 && set_domain[0] == 1 && set_level[0] == 14 && perf_domain[1].raised && thread_arg != NULL);
 
-    /* hot: back to the boot loader's level; 92 C: stays there; below 90 C: up again */
-    for (unsigned i = 0; i < 64; i++) schedule[i] = 600;
-    schedule[3] = 950; schedule[4] = 920; schedule[5] = 905; schedule[6] = 899;
+    /* 70 C: back to the boot loader's level; 65 C: stays there; under 60 C: up again */
+    for (unsigned i = 0; i < 64; i++) schedule[i] = 500;
+    schedule[3] = 700; schedule[4] = 650; schedule[5] = 605; schedule[6] = 599;
     run_thread(8);
-    assert(sets == 3 && set_level[1] == boot_level && set_level[2] == 17 && perf_domain[1].raised);
+    assert(sets == 3 && set_level[1] == boot_level && set_level[2] == 14 && perf_domain[1].raised);
 
     /* no valid reading while raised: down, and not up again without one */
     reset(1);
@@ -181,20 +183,30 @@ int main(void)
 
     /* too warm at boot: not raised until it cools */
     reset(1);
-    set_temperature(1, 930);
+    set_temperature(1, 650);
     annibale_cpufreq();
     assert(sets == 0);
-    for (unsigned i = 0; i < 64; i++) schedule[i] = i < 3 ? 930 : 700;
+    for (unsigned i = 0; i < 64; i++) schedule[i] = i < 3 ? 650 : 450;
     run_thread(4);
-    assert(sets == 1 && set_level[0] == 17);
+    assert(sets == 1 && set_level[0] == 14);
 
-    /* a sustained level that is not among those described: the top one */
+    /* cpufreq_mhz=2000: the fastest level under it; under every level: the slowest */
     reset(1);
-    sustained = 99;
+    cap_mhz = 2000;
+    annibale_cpufreq();
+    assert(sets == 1 && set_level[0] == 8);
+    reset(1);
+    cap_mhz = 100;
+    annibale_cpufreq();
+    assert(sets == 1 && set_level[0] == 0);
+
+    /* no sustained frequency given: the top level */
+    reset(1);
+    sustained_khz = 0;
     annibale_cpufreq();
     assert(sets == 1 && set_level[0] == 19);
 
-    /* a refused request is not repeated every second */
+    /* a refused request is not repeated */
     reset(1);
     deny_set = 1;
     annibale_cpufreq();
@@ -203,19 +215,19 @@ int main(void)
     run_thread(10);
     assert(sets == 0);
 
-    /* SCMI 3.x levels (three words each, by value), one per answer; the sustained one among them, then not */
+    /* SCMI 3.x levels (three words each, by value), one per answer */
     reset(1);
-    version = 0x30000; batch = 1; indexing = 0; sustained = 3100000; level[1] = 1100000;
+    version = 0x30000; batch = 1; indexing = 0; level[1] = 1100000;
     annibale_cpufreq();
     assert(sets == 1 && set_level[0] == 3100000 && perf_domain[1].boot_level == 1100000);
     reset(1);
-    version = 0x30000; batch = 1; levels = 5; indexing = 0; sustained = 3100000;
+    version = 0x30000; batch = 1; levels = 5; indexing = 0;
     annibale_cpufreq();
-    assert(perf_domain[1].top == 300000 + 4 * 200000 && sets == 1 && set_level[0] == 1100000);
+    assert(sets == 1 && set_level[0] == 1100000);
 
     /* 4.0 without level indexing: values */
     reset(1);
-    indexing = 0; sustained = 3100000;
+    indexing = 0;
     annibale_cpufreq();
     assert(sets == 1 && set_level[0] == 3100000);
 

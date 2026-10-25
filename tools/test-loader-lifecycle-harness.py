@@ -160,6 +160,8 @@ static int ev_calls, ev_sends, ev_after, ev_change, ev_msg, ev_change_state, ev_
 static uint8_t ev_ep = USB_EP_IN;
 static uint64_t ev_bytes = 4096, ev_step, ev_size, ev_no_events;
 static int ev_size_set;   /* without it the call reports a full payload; with it even size 0 is explicit */
+static usb_device_event_data ev_prefix;
+static int ev_prefix_pending;   /* one event before the repeating event, for endpoint interleaving */
 static int ev_cancel_first;   /* report Cancelled for this many calls, then ev_status */
 static void *ev_out_buf, *ev_in_buf, *ev_buf;   /* ev_status -1 = CompleteOK, ev_buf 0 = the sent buffer */
 static efi_status ev_handle(uint32_t *msg, uint64_t *size, usb_device_event_data *data)
@@ -168,6 +170,13 @@ static efi_status ev_handle(uint32_t *msg, uint64_t *size, usb_device_event_data
 	clk_now += ev_step;
 	if (ev_err) {
 		return 1;   /* the call itself failed: a correct consumer must read none of the outputs */
+	}
+	if (ev_prefix_pending) {
+		ev_prefix_pending = 0;
+		*msg = UsbDeviceEventTransferNotification;
+		*size = sizeof(*data);
+		*data = ev_prefix;
+		return 0;
 	}
 	/* the cap keeps a mutation from hanging: past it every event reports a link loss */
 	if (ev_change || (ev_after && ev_calls > ev_after) || ev_calls > 400) {
@@ -500,11 +509,11 @@ static void usb_clean(void) {
 	USB = &h_usb; usb_connected = kernel_resources_held = 1;
 	firmware_fault = 0; running_live = NULL;
 	usb_rx_queued = usb_out_owned = usb_in_owned = usb_out_lost = usb_in_lost = usb_out_invalid = usb_in_invalid = 0;
-	usb_in_since = 0; usb_in_recoveries = 0;
+	usb_in_since = 0; usb_in_recoveries = 0; usb_in_abort_requested = 0; usb_command_bytes = -1;
 	ev_calls = ev_sends = ev_after = ev_change = ev_change_state = 0;
 	ev_msg = UsbDeviceEventNoEvent; ev_step = clk_freq / 10; clk_now = 0;
 	ev_err = 0; ev_status = -1; ev_size = 0; ev_size_set = 0; ev_no_events = 0; ev_buf = NULL;
-	ev_cancel_first = 0;
+	ev_cancel_first = ev_prefix_pending = 0;
 	ev_out_buf = ev_in_buf = NULL; usb_out_buf = NULL; usb_out_len = 0; usb_in_buf = NULL; usb_in_len = 0;
 	ab_calls = st_calls = sp_calls = se_calls = at_calls = 0; at_size = 0;
 	ab_status = st_status = sp_status = se_status = 0;
@@ -541,7 +550,7 @@ static void sc_usb_owner(void)
 	usb_clean();
 	int64_t r = (memcpy(tx_store, "AA", 2), usb_tx((const uint8_t *)"AB", 2));
 	CK(r == -1 && usb_in_owned == 1 && usb_in_lost == 0, "usb_tx_timeout_keeps");
-	usb_in_invalid = 0;  /* a live transfer: the veto applies, the recovery ladder stays out */
+	usb_in_invalid = 0;  /* a live transfer: the veto applies before the abort age */
 	usb_in_since = clk_now;
 	tx_store[0] = 'Z';   /* sentinel: the owned buffer must not be overwritten while owned */
 	r = usb_tx((const uint8_t *)"CD", 2);
@@ -563,7 +572,7 @@ static void sc_usb_owner(void)
 	CK(r == -1 && usb_in_owned == 0 && usb_in_lost == 0, "usb_late_ok_recycled");
 	/* an OUT receive that times out hands the buffer back to the queue rule */
 	usb_clean();
-	r = usb_rx(rx_store, 64);
+	r = usb_rx(rx_store, 64, 0);
 	CK(r == -1 && usb_out_lost == 0 && usb_rx_queued == 0 && usb_out_owned == 1 && usb_out_invalid == 1, "usb_rx_timeout_marks_record");
 	ev_sends = 0; ev_change = 1; ev_change_state = UsbDeviceStateConnected; poll_once();
 	CK(ev_sends == 0 && usb_out_owned == 1, "usb_poll_owned_no_resend");
@@ -600,7 +609,7 @@ static void sc_usb_owner(void)
 	usb_clean(); poll_once();
 	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_calls = ev_sends = 0;
 	ev_buf = tx_store; ev_bytes = 2;
-	CK(usb_rx(usb_rx_buf, 511) == -1 && usb_out_lost == 1 && usb_rx_queued == 0, "usb_wait_isolate_unqueued");
+	CK(usb_rx(usb_rx_buf, 511, 0) == -1 && usb_out_lost == 1 && usb_rx_queued == 0, "usb_wait_isolate_unqueued");
 	ev_sends = 0; poll_once();
 	CK(ev_sends == 0 && usb_out_lost == 1, "usb_poll_lost_send_refused");
 }
@@ -617,72 +626,126 @@ static void usb_wedge_in(void)
 }
 static void sc_usb_recover(void)
 {
-	/* level 1: the abort's own Cancelled terminal ends the record, no halt cycle is needed */
+	/* An abort request cannot release or overwrite the submitted buffer, even on success. */
 	usb_wedge_in();
-	ev_calls = 0; ev_sends = 0; ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN;
-	ev_cancel_first = 1; ev_status = -1; ev_bytes = 4;
-	CK(usb_tx((const uint8_t *)"OKAY", 4) == 4, "recover_level1_resends");
-	CK(ab_calls == 1 && st_calls == 0 && sp_calls == 0 && se_calls == 0, "recover_level1_only_abort");
-	CK(usb_in_owned == 0 && usb_in_invalid == 0, "recover_level1_record_clear");
+	ev_calls = ev_sends = 0;
+	CK(usb_tx((const uint8_t *)"OKAY", 4) == -1, "recover_abort_keeps_reply_pending");
+	CK(ab_calls == 1 && usb_in_owned && usb_in_invalid && usb_in_abort_requested,
+	   "recover_abort_requested_once");
+	CK(ev_calls == 0 && ev_sends == 0 && !memcmp(tx_store, "AB", 2),
+	   "recover_abort_consumes_no_events_or_bytes");
+	CK(usb_tx((const uint8_t *)"OKAY", 4) == -1 && ab_calls == 1,
+	   "recover_repoll_no_repeat_abort");
+	CK(st_calls == 0 && sp_calls == 0 && se_calls == 0 && at_calls == 0,
+	   "recover_no_halt_restart_or_allocation");
 
-	/* level 2: the abort ends nothing, the halt pair is taken as the end of the request */
+	/* OUT can carry reboot while IN still belongs to the controller. The recovery helper
+	 * must leave the event for usb_wait and keep the receive buffer's identity unchanged. */
+	memcpy(rx_store, "reboot", 6);
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 6;
+	CK(usb_rx(rx_store, 64, 0) == 6 && !memcmp(usb_rx_buf, "reboot", 6),
+	   "recover_out_command_delivered");
+	CK(usb_in_owned && usb_out_owned == 0 && usb_rx_buf == rx_store && usb_tx_buf == tx_store,
+	   "recover_out_leaves_in_owned_and_buffers_stable");
+
+	/* A normal completion or cancellation is handled by the existing verified rule. */
+	ev_ep = USB_EP_IN; ev_bytes = 2; ev_status = UsbDeviceTransferStatusCancelled;
+	CK(usb_wait(USB_EP_IN, 0) == -1 && !usb_in_owned && !usb_in_invalid,
+	   "recover_verified_cancel_releases");
+	ev_bytes = 4; ev_status = UsbDeviceTransferStatusCompleteOK;
+	CK(usb_tx((const uint8_t *)"OKAY", 4) == 4 && !usb_in_abort_requested,
+	   "recover_new_reply_resets_abort_mark");
 	usb_wedge_in();
-	ev_calls = 0; ev_sends = 0; ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN;
-	ev_no_events = 3; ev_status = -1; ev_bytes = 4;
-	CK(usb_tx((const uint8_t *)"OKAY", 4) == 4, "recover_level2_resends");
-	CK(ab_calls == 1 && st_calls == 2 && sp_calls == 0, "recover_level2_halt_pair");
-	CK(usb_in_owned == 0 && usb_in_invalid == 0, "recover_level2_record_clear");
+	(void)usb_abort_stale_in("test");
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_bytes = 2;
+	CK(usb_wait(USB_EP_IN, 0) == -1 && !usb_in_owned,
+	   "recover_verified_complete_releases_without_delivery");
 
-	/* level 3: abort and halt both fail, the device stack is started again */
-	usb_wedge_in();
-	ev_calls = 0; ev_sends = 0; ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN;
-	/* both calls fail with the error bit set, as a status from this firmware does */
-	ev_no_events = 3; ev_status = -1; ev_bytes = 4;
-	ab_status = 0x8000000000000001ULL; st_status = 0x8000000000000001ULL;
-	CK(usb_tx((const uint8_t *)"OKAY", 4) == 4, "recover_level3_resends");
-	CK(ab_calls == 1 && st_calls == 1 && sp_calls == 1 && se_calls == 1 && at_calls == 2,
-	   "recover_level3_rebuild_ran");
-	CK(at_size == USB_CHUNK, "recover_level3_buffer_size");
-	CK(usb_in_owned == 0 && usb_in_lost == 0 && usb_in_invalid == 0, "recover_level3_record_clear");
+	/* An IN terminal can precede the OUT completion in the same receive wait. */
+	for (int bad = 0; bad < 3; bad++) {
+		usb_wedge_in();
+		ev_prefix_pending = 1;
+		ev_prefix.transfer.endpoint_index = USB_EP_IN;
+		ev_prefix.transfer.status = UsbDeviceTransferStatusCancelled;
+		ev_prefix.transfer.data_buffer = bad == 1 ? rx_store : tx_store;
+		ev_prefix.transfer.bytes_completed = bad == 2 ? 3 : 2;
+		ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 6;
+		CK(usb_rx(rx_store, 64, 0) == 6 && usb_in_owned == (bad != 0) && usb_in_lost == (bad != 0),
+		   "recover_interleaved_in_terminal_then_out");
+	}
 
-	/* a young record is left alone: its transfer may still be running */
+	/* Abort support and success are optional: OUT and its bounded wait remain usable. */
+	for (int no_abort = 0; no_abort < 2; no_abort++) {
+		usb_wedge_in();
+		if (no_abort) { h_usb.abort_xfer = NULL; } else { ab_status = 0x8000000000000001ULL; }
+		ev_calls = 0; ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 6;
+		CK(usb_rx(rx_store, 64, 0) == 6 && usb_in_owned && ab_calls == !no_abort,
+		   "recover_abort_unavailable_out_still_received");
+		ev_msg = UsbDeviceEventNoEvent; ev_calls = 0;
+		CK(usb_rx(rx_store, 64, 0) == -1 && ev_calls > 20 && ev_calls < 60,
+		   "recover_no_terminal_wait_still_bounded");
+	}
+
+	/* Malformed abort notifications use the same buffer and length checks as any terminal. */
+	for (int overlong = 0; overlong < 2; overlong++) {
+		usb_wedge_in();
+		(void)usb_abort_stale_in("test");
+		ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN;
+		ev_status = UsbDeviceTransferStatusCancelled; ev_bytes = overlong ? 3 : 2;
+		ev_buf = overlong ? NULL : rx_store;
+		CK(usb_wait(USB_EP_IN, 0) == -1 && usb_in_owned && usb_in_lost,
+		   "recover_bad_cancel_keeps_buffer_isolated");
+		ev_buf = NULL; ev_ep = USB_EP_OUT; ev_bytes = 6; ev_status = UsbDeviceTransferStatusCompleteOK;
+		CK(usb_rx(rx_store, 64, 0) == 6 && usb_in_owned,
+		   "recover_isolated_in_keeps_out_usable");
+	}
+
 	usb_clean(); kernel_resources_held = 1; ev_step = clk_freq / 10;
 	CK(usb_tx((const uint8_t *)"AB", 2) == -1, "recover_young_setup");
-	usb_in_invalid = 0;                        /* owned and young, as a live transfer looks */
+	usb_in_invalid = 0;
 	usb_in_since = clk_now;
 	ev_calls = 0;
-	CK(usb_tx((const uint8_t *)"CD", 2) == -1 && ab_calls == 0 && st_calls == 0,
+	CK(usb_tx((const uint8_t *)"CD", 2) == -1 && ab_calls == 0,
 	   "recover_young_kept");
 
-	/* owned without the invalid mark, old enough: the unbounded wait's branch never set that
-	 * mark, so the age alone has to carry the decision */
-	usb_wedge_in();
-	usb_in_invalid = 0;
+	usb_wedge_in(); usb_in_invalid = 0;
 	clk_now += (USB_IN_STALE_SECONDS + 1) * clk_freq;
-	ev_calls = 0; ev_sends = 0; ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN;
-	ev_no_events = 3; ev_status = -1; ev_bytes = 4;
-	CK(usb_tx((const uint8_t *)"OKAY", 4) == 4 && st_calls == 2, "recover_by_age_alone");
+	CK(usb_abort_stale_in("test") == -1 && ab_calls == 1 && usb_in_owned,
+	   "recover_by_age_only_requests_abort");
 
-	/* the command boundary recovers too, so the loop keeps taking the next command */
-	usb_wedge_in();
-	ev_calls = 0; ev_sends = 0; ev_no_events = 60;
-	CK(usb_rx(rx_store, 64) == -1 && ab_calls == 1 && usb_in_owned == 0,
-	   "recover_at_command_boundary");
-
-	/* the ladder is bounded: past the limit the record stays and the reply is refused */
-	usb_wedge_in();
-	usb_in_recoveries = USB_IN_RECOVER_LIMIT;
-	ev_calls = 0; ev_sends = 0; ev_no_events = 60;
-	CK(usb_tx((const uint8_t *)"OKAY", 4) == -1 && ab_calls == 0 && st_calls == 0,
+	usb_wedge_in(); usb_in_recoveries = USB_IN_RECOVER_LIMIT;
+	CK(usb_abort_stale_in("test") == -1 && ab_calls == 0 && usb_in_owned,
 	   "recover_limit_refuses");
-
-	/* a channel the structural rule isolated is not undone by this ladder */
-	usb_clean(); kernel_resources_held = 1;
-	usb_in_owned = 1; usb_in_lost = 1; usb_in_invalid = 1;
-	clk_now += (USB_IN_STALE_SECONDS + 1) * clk_freq;
-	ev_calls = 0; ev_sends = 0;
-	CK(usb_tx((const uint8_t *)"OKAY", 4) == -1 && ab_calls == 0 && se_calls == 0,
+	usb_wedge_in(); usb_in_lost = 1;
+	CK(usb_abort_stale_in("test") == -1 && ab_calls == 0 && usb_in_owned,
 	   "recover_skips_isolated");
+}
+/* Command waits are polls of one receive, whereas a timed-out data receive is abandoned. */
+static void sc_usb_idle_command(void)
+{
+	const char *commands[] = { "getvar:result", "reboot" };
+	for (int held = 0; held < 2; held++) {
+		for (unsigned c = 0; c < sizeof(commands) / sizeof(commands[0]); c++) {
+			usb_clean(); kernel_resources_held = held;
+			for (int round = 0; round < 4; round++) {
+				ev_calls = 0;
+				CK(usb_rx(rx_store, 511, 1) == -1 && usb_out_owned && !usb_out_invalid,
+				   "idle_command_wait_preserves_delivery");
+			}
+			CK(clk_now > 10 * clk_freq && ev_sends == 1, "idle_command_held_over_ten_seconds");
+			uint64_t len = strlen(commands[c]);
+			memcpy(rx_store, commands[c], len);
+			ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = len;
+			CK(usb_rx(rx_store, 511, 1) == (int64_t)len && !memcmp(rx_store, commands[c], len)
+			    && !usb_out_owned && ev_sends == 1, "idle_first_command_delivered");
+		}
+	}
+	/* The mode, rather than a buffer size heuristic, determines late-byte delivery. */
+	usb_clean();
+	CK(usb_rx(rx_store, 511, 0) == -1 && usb_out_invalid, "idle_data_timeout_stays_invalid");
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 6;
+	CK(usb_rx(rx_store, 511, 1) == -1 && !usb_out_owned && !usb_out_invalid,
+	   "idle_abandoned_data_not_delivered_as_command");
 }
 static void sc_fault(void)
 {
@@ -733,10 +796,12 @@ static void sc_fb(void)
 	fb_reply("FAIL", "next");
 	CK(memcmp(saved, tx_store, sizeof(saved)) == 0, "fb_lost_reply_preserves");
 	CK(ev_sends == 1, "fb_lost_no_resend");
-	/* once the ladder has ended the record, the buffer is the loader's again */
+	/* A verified terminal must end the old request before a new reply can reuse its buffer. */
 	usb_in_invalid = 1;
-	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_bytes = 5; ev_no_events = 3;
-	CK(usb_tx((const uint8_t *)"again", 5) == 5 && ev_sends == 2, "fb_after_recovery_reuses");
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_bytes = 8;
+	CK(usb_wait(USB_EP_IN, 0) == -1 && !usb_in_owned, "fb_terminal_releases_old_reply");
+	ev_bytes = 5;
+	CK(usb_tx((const uint8_t *)"again", 5) == 5 && ev_sends == 2, "fb_after_terminal_reuses");
 	/* hard limit: a long text never packs past the local buffer (code 4 + text up to 63) */
 	usb_clean();
 	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_IN; ev_bytes = 63;
@@ -851,21 +916,21 @@ static void sc_usb_guard(void)
 	CK(usb_wait(USB_EP_IN, 1) == -1 && usb_in_owned == 0 && usb_in_lost == 0 && ev_calls <= 60, "usb_duplicate_ok_noop");
 	/* foreign parameters may not take over the queued request: refused, record and ownership kept */
 	usb_clean(); poll_once();
-	r = usb_rx(rx_store, 64);
+	r = usb_rx(rx_store, 64, 0);
 	CK(r == -1 && usb_rx_queued == 1 && usb_out_owned == 1 && usb_out_lost == 0 && ev_sends == 1, "usb_guard_reuse_refused");
 	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 300; strcpy((char *)rx_store, "long"); fb_calls = 0; poll_once();
 	CK(fb_calls == 1 && usb_out_lost == 0 && usb_rx_queued == 0, "usb_guard_reuse_record_kept");
 	/* the caller holding the recorded buffer and length takes the queued request over */
 	usb_clean(); poll_once();
 	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 4; strcpy((char *)rx_store, "take");
-	r = usb_rx(rx_store, 511);
+	r = usb_rx(rx_store, 511, 0);
 	CK(r == 4 && usb_rx_queued == 0 && usb_out_owned == 0 && ev_sends == 1, "usb_guard_reuse_takeover");
 }
 
 int main(void)
 {
 	sc_psci_spec(); sc_cpu_on(); sc_commands(); sc_enter(); sc_watch(); sc_return(); sc_collect();
-	sc_write_logs(); sc_usb(); sc_usb_owner(); sc_usb_recover(); sc_fb(); sc_usb_notify(); sc_usb_guard(); sc_fault(); sc_repeat();
+	sc_write_logs(); sc_usb(); sc_usb_owner(); sc_usb_recover(); sc_usb_idle_command(); sc_usb_command_interleaved(); sc_fb(); sc_usb_notify(); sc_usb_guard(); sc_fault(); sc_repeat();
 	if (fail_count == 0) { printf("production logic: lifecycle checks passed\n"); } else { printf("%d failures\n", fail_count); }
 	return fail_count > 127 ? 127 : fail_count;
 }

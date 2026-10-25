@@ -13,13 +13,12 @@ The review-2 rules run as full sequences in sc_usb_dyn: the owned record vetoes 
 path, a timeout or disconnect marks the request undeliverable so its late terminal only
 releases it, the link wait (endpoint 0xff) ends on Connected so the command loop submits, and
 an overlong Cancelled isolates instead of releasing.
-Two later rules have their own sequences. The wait is bounded in every state (three seconds
-held, running or faulted, ten in a plain command loop), so no host can keep the loader away
-from the commands that end the state. And an IN record whose terminal never comes is
-recovered at the two boundaries where nothing is in flight (sc_usb_recover): abort_xfer and
-the Cancelled terminal it asks for, then a halt cycle, then a restart of the device stack,
-each level only after the one before it failed, the whole ladder bounded per session, and a
-young record or a structurally isolated one left untouched. PSCI expectations are raw spec numbers written independently
+The wait is bounded in every state (three seconds held, running or faulted, ten in a plain
+command loop). A stale IN request can ask for one abort; only the shared verified terminal
+rule releases its buffer. sc_usb_recover checks OUT delivery while IN is pending or isolated,
+unavailable/failed aborts, malformed cancellations, normal completions, stable buffer
+identity and bounded repeated waits. Idle command receives remain deliverable after repeated
+wait timeouts; abandoned data receives still discard late bytes. PSCI expectations are raw spec numbers written independently
 (TF-A include/lib/psci/psci.h, PSCI_RET_*), asserted against the constants inside the
 extracted block, so a wrong constant fails instead of passing on a shared value.
 The USB event/status/link enums and the event union are injected verbatim from
@@ -117,14 +116,14 @@ MUTATIONS = [
 	("m_enter_no_mask", "bridge_", "\t} else if (kernel_resources_held) {", "\t} else if (0) {"),
 	("m_tail_no_mask", "tail_held_masks", "\tif (kernel_resources_held || firmware_fault) {\n\t\t/* interrupts stay off while", "\tif (0) {\n\t\t/* interrupts stay off while"),
 	("m_watch_pet_swap", "watch_notstarted_no_services", "@WATCH_PET_SWAP@"),
-	("m_timeout_mark", "usb_rx_", "\t\t\tif (usb_out_owned) {\n\t\t\t\tusb_out_invalid = 1;\n\t\t\t}\n\t\t\tif (usb_in_owned) {\n\t\t\t\tusb_in_invalid = 1;\n\t\t\t}\n", ""),
+	("m_timeout_mark", "usb_rx_", "\t\t\tif (usb_out_owned && usb_command_bytes < 0) {\n\t\t\t\tusb_out_invalid = 1;\n\t\t\t}\n\t\t\tif (usb_in_owned) {\n\t\t\t\tusb_in_invalid = 1;\n\t\t\t}\n", ""),
 	("mut_poll_guard", "usb_poll_", "\tif (!usb_rx_queued && !usb_out_lost && !usb_out_owned && usb_connected", "\tif (!usb_rx_queued && usb_connected"),
 	("m_prequeue_owned_guard", "usb_poll_", " && !usb_out_owned && usb_connected &&", " && usb_connected &&"),
 	("mut_fb_pre", "fb_", "\tfor (; *code && n < sizeof(msg) - 1; code++) {\n\t\tmsg[n++] = (uint8_t)*code;\n\t}\n\tfor (; *text && n < sizeof(msg) - 1; text++) {\n\t\tmsg[n++] = (uint8_t)*text;\n\t}\n\tusb_tx((const uint8_t *)msg, n);", "\tfor (; *code; code++) {\n\t\tusb_tx_buf[n++] = (uint8_t)*code;\n\t}\n\tfor (; *text && n < 63; text++) {\n\t\tusb_tx_buf[n++] = (uint8_t)*text;\n\t}\n\tusb_tx(usb_tx_buf, n);"),
 	("mut_ev_active", "usb_notify_", '\tif (data->transfer.status == UsbDeviceTransferStatusActive ||\n\t    data->transfer.status > UsbDeviceTransferStatusCompleteError) {\n\t\treturn 0;   /* the controller may still work on the buffer: no read, no release, no resend */\n\t}', '\tif (data->transfer.status == UsbDeviceTransferStatusActive ||\n\t    data->transfer.status > UsbDeviceTransferStatusCompleteError) {\n\t\tif (out) { usb_out_owned = 0; usb_rx_queued = 0; } else { usb_in_owned = 0; }   /* rev4: every notification ended the request */\n\t\treturn 0;\n\t}'),
 	("mut_ev_lostguard", "usb_guard_", '\tif (out ? usb_out_lost : usb_in_lost) {\n\t\treturn 0;   /* isolated keeps its buffer and its flags: a late event changes nothing */\n\t}\n', ""),
 	("mut_ev_shortstop", "usb_guard_", '\tif (usb_out_owned || usb_rx_queued) {\n\t\tusb_stop_endpoint(1, "event too short to attribute");\n\t}\n\tif (usb_in_owned) {\n\t\tusb_stop_endpoint(0, "event too short to attribute");\n\t}', "	(void)0;"),
-	("mut_ev_record", "usb_guard_", '\tif (usb_rx_queued) {\n\t\t/* the pending request stays exactly as it was submitted: only a caller using the\n		 * recorded buffer and length may take it over */\n		if (buf != usb_out_buf || len != usb_out_len) {\n			return -1;      /* refused: the on-file request and its ownership are untouched */\n		}\n		usb_rx_queued = 0;      /* (every command is received the same way, into the same buffer) */\n	} else {\n		if (usb_out_owned) {\n			/* the record alone says the buffer is with the controller (a timeout or a\n			 * disconnect left it there): sending again would hand the same buffer twice */\n			return usb_wait(USB_EP_OUT, 1);   /* wait out the terminal that will release it */\n		}\n		if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {\n			return -1;\n		}\n		usb_out_owned = 1;      /* the submit record is written only for a send that succeeded */\n		usb_out_buf = buf;      /* the notification is only believed for this buffer and length */\n		usb_out_len = len;\n		usb_out_invalid = 0;    /* a new request starts with a fresh delivery state */\n	}\n', '\tif (usb_rx_queued) {\n		usb_rx_queued = 0;   /* rev5: any caller took it over and rewrote the metadata */\n	} else if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {\n		return -1;\n	}\n	usb_out_owned = 1;\n	usb_out_buf = buf;\n	usb_out_len = len;\n'),
+	("mut_ev_record", "usb_guard_", '\tif (usb_rx_queued) {\n\t\t/* the pending request stays exactly as it was submitted: only a caller using the\n		 * recorded buffer and length may take it over */\n		if (buf != usb_out_buf || len != usb_out_len) {\n			return -1;      /* refused: the on-file request and its ownership are untouched */\n		}\n		usb_rx_queued = 0;      /* (every command is received the same way, into the same buffer) */\n	} else {\n		if (usb_out_owned) {\n			/* the record alone says the buffer is with the controller (a timeout or a\n			 * disconnect left it there): sending again would hand the same buffer twice */\n			return usb_wait(USB_EP_OUT, 1);   /* wait out the terminal that will release it */\n		}\n		if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {\n			return -1;\n		}\n		usb_out_owned = 1;      /* the submit record is written only for a send that succeeded */\n		usb_out_buf = buf;      /* the notification is only believed for this buffer and length */\n		usb_out_len = len;\n		usb_command_bytes = command_wait ? 0 : -1;\n		usb_out_invalid = 0;    /* a new request starts with a fresh delivery state */\n	}\n', '\tif (usb_rx_queued) {\n		usb_rx_queued = 0;   /* rev5: any caller took it over and rewrote the metadata */\n	} else if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {\n		return -1;\n	}\n	usb_out_owned = 1;\n	usb_out_buf = buf;\n	usb_out_len = len;\n'),
 	("m_owned_veto", "dyn_", "\t\tif (usb_out_owned) {\n\t\t\t/* the record alone says the buffer is with the controller (a timeout or a\n\t\t\t * disconnect left it there): sending again would hand the same buffer twice */\n\t\t\treturn usb_wait(USB_EP_OUT, 1);   /* wait out the terminal that will release it */\n\t\t}\n", ""),
 	("m_disconnect_clears_records", "usb_disconnect", "\t\t\t\t\tif (usb_out_owned) {\n\t\t\t\t\t\tusb_out_invalid = 1;\n\t\t\t\t\t}\n\t\t\t\t\tif (usb_in_owned) {\n\t\t\t\t\t\tusb_in_invalid = 1;\n\t\t\t\t\t}\n", "\t\t\t\t\tusb_out_owned = 0; usb_rx_queued = 0;   /* mutation: the disconnect drops the records */\n\t\t\t\t\treturn -1;   /* a disconnect ends this wait; the records stay on file */"),
 	("m_disconnect_mark", "dyn_", "\t\t\t\t\tif (usb_out_owned) {\n\t\t\t\t\t\tusb_out_invalid = 1;\n\t\t\t\t\t}\n\t\t\t\t\tif (usb_in_owned) {\n\t\t\t\t\t\tusb_in_invalid = 1;\n\t\t\t\t\t}\n", ""),
@@ -138,7 +137,13 @@ MUTATIONS = [
 	("m_cancel_bound", "dyn_", "\t\tif (data->transfer.bytes_completed > sub_len) {\n\t\t\tusb_stop_endpoint(out, \"Cancelled over a length that was not submitted\");\n\t\t\treturn -1;   /* overlong like an over-OK: structurally unsound, nothing releases */\n\t\t}\n", ""),
 	("m_isolation_frees", "usb_guard_buf", '\t\t\tusb_out_lost = 1;\n\t\t}', '\t\t\tusb_out_lost = 1;\n\t\t\tusb_out_owned = 0;   /* mutation: the isolation forgets the buffer */\n\t\t}'),
 	("m_recover_no_age", "recover_young_kept", "\tif (!usb_in_invalid && usb_in_since != 0 && age < USB_IN_STALE_SECONDS) {\n\t\treturn -1;      /* young: its transfer may still be running, nothing to recover */\n\t}\n", ""),
-	("m_recover_no_abort", "recover_level1_only_abort", "\tif (USB->abort_xfer != NULL) {\n\t\t(void)USB->abort_xfer(USB_EP_IN);\n\t\tif (!usb_recover_drain(freq / 4)) {", "\tif (0) {\n\t\t(void)USB->abort_xfer(USB_EP_IN);\n\t\tif (!usb_recover_drain(freq / 4)) {"),
+	("m_poll_data_purpose", "interleave_poll_records_command_purpose", "\t\tusb_command_bytes = 0;\n\t\tusb_out_invalid = 0;", "\t\tusb_command_bytes = -1;\n\t\tusb_out_invalid = 0;"),
+	("m_early_command_drop", "interleave_out_completion_saved", "usb_command_bytes = (int64_t)bytes;", "usb_command_bytes = 0;"),
+	("m_command_idle_drop", "idle_command_wait_preserves_delivery", "if (usb_out_owned && usb_command_bytes < 0)", "if (usb_out_owned)"),
+	("m_data_late_deliver", "idle_data_timeout_stays_invalid", "if (usb_out_owned && usb_command_bytes < 0)", "if (0)"),
+	("m_recover_no_abort", "recover_abort_requested_once", "\t(void)USB->abort_xfer(USB_EP_IN);", "\t/* mutation: no abort request */"),
+	("m_recover_forgets_record", "recover_abort_requested_once", "\tusb_in_abort_requested = 1;", "\tusb_in_abort_requested = 1;\n\tusb_in_owned = 0;"),
+	("m_recover_repeat_abort", "recover_repoll_no_repeat_abort", "usb_in_lost || usb_in_abort_requested", "usb_in_lost"),
 	("mut_ev_deadline", "usb_notify_", "@DEADLINE_SWAP@"),
 	("m_aff_negative_pending", "ret_bad", '\t\t\tif (state == 0 || state == 2) {   /* on, or being started: the race may still settle */', '\t\t\tif (state != 1) {   /* mutation: an error is polled like a settling race */'),
 	("m_aff_reask_off", "ret_aff_settles", '\t\t\tif (off_seen[i]) {\n\t\t\t\tcontinue;   /* an off core is never asked again */\n\t\t\t}\n', ''),
@@ -305,15 +310,17 @@ def wiring_checks(src):
     blk_u = extract(src, "LC-USB")
     ck("? 3 * freq : USB_IDLE_WAIT_SECONDS * freq;" in blk_u and blk_u.count("began > limit") == 1,
        "usb_bound_line")
-    ck(blk_u.count('usb_recover_in("') == 2 and "static int\nusb_recover_in(const char *why)" in blk_u,
+    ck(blk_u.count('usb_abort_stale_in("') == 2 and "static int\nusb_abort_stale_in(const char *why)" in blk_u,
        "recover_defined_and_called_twice")
-    ck(0 < blk_u.find('usb_recover_in("a reply")') < blk_u.find("memcpy(usb_tx_buf"), "recover_before_reply")
-    ck(0 < blk_u.find('usb_recover_in("the next command")') < blk_u.find("if (usb_out_lost) {"),
+    ck(0 < blk_u.find('usb_abort_stale_in("a reply")') < blk_u.find("memcpy(usb_tx_buf"), "recover_before_reply")
+    ck(0 < blk_u.find('usb_abort_stale_in("the next command")') < blk_u.find("if (usb_out_lost) {"),
        "recover_before_command")
     ck("usb_in_since = READ_SYSREG(CNTVCT_EL0);" in blk_u and blk_u.count("usb_in_since") >= 3, "submit_stamp")
-    ck(0 < blk_u.find("USB->abort_xfer(USB_EP_IN)") < blk_u.find("set_endpoint_stall_state(USB_EP_IN, 1)")
-       < blk_u.find("usb_rebuild()"), "recover_level_order")
+    ck("USB->set_endpoint_stall_state(" not in blk_u and "USB->start_ex(" not in blk_u
+       and "USB->allocate_transfer_buffer(" not in blk_u, "recover_keeps_buffer_identity")
     ck("usb_in_recoveries >= USB_IN_RECOVER_LIMIT" in blk_u, "recover_bounded")
+    ck("n = usb_rx(usb_rx_buf, 511, 1);" in src and "int64_t r = usb_rx(usb_rx_buf, want, 0);" in src,
+       "command_and_data_receive_modes")
     ck("USB_CHUNK    (1024 * 1024)" in src and "#define USB_CHUNK (1024 * 1024)" in PRELUDE, "chunk_mirror")
     ck("queues a fresh receive" not in src, "no_recovery_overclaim")
     ck(0 < blk_u.find("if (usb_out_lost) {") < blk_u.find("USB->send(USB_EP_OUT, len, buf)"), "rx_guard_first")

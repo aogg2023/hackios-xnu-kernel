@@ -146,19 +146,19 @@ static void sc_usb_dyn(void)
 	CK(usb_wait(0xff, 0) == 0 && usb_connected == 1 && ev_calls == 1, "dyn_link_wait_ends_on_connected");
 	ev_change = 0; ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2; ev_after = 3;
 	strcpy((char *)rx_store, "go");
-	CK(usb_rx(rx_store, 511) == 2 && ev_sends == 1, "dyn_first_out_after_link_up");
+	CK(usb_rx(rx_store, 511, 0) == 2 && ev_sends == 1, "dyn_first_out_after_link_up");
 	/* held: a timed-out OUT keeps the record, marked undeliverable; neither the poll nor a
 	 * new usb_rx may send the controller-held buffer again; the old OK only releases */
 	usb_clean();
-	CK(usb_rx(rx_store, 511) == -1 && usb_out_owned == 1 && usb_out_invalid == 1 && usb_rx_queued == 0
+	CK(usb_rx(rx_store, 511, 0) == -1 && usb_out_owned == 1 && usb_out_invalid == 1 && usb_rx_queued == 0
 	   && ev_sends == 1, "dyn_timeout_marks_record");
 	ev_msg = UsbDeviceEventNoEvent; ev_sends = 0; poll_once();
 	CK(ev_sends == 0 && usb_out_owned == 1, "dyn_poll_no_resend_while_owned");
 	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 3; strcpy((char *)rx_store, "abc");
-	CK(usb_rx(rx_store, 511) == -1 && ev_sends == 0 && usb_out_owned == 0 && usb_out_invalid == 0,
+	CK(usb_rx(rx_store, 511, 0) == -1 && ev_sends == 0 && usb_out_owned == 0 && usb_out_invalid == 0,
 	   "dyn_timeout_old_ok_releases_no_delivery");
 	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2; strcpy((char *)rx_store, "go"); ev_sends = 0;
-	CK(usb_rx(rx_store, 511) == 2 && ev_sends == 1 && usb_out_owned == 0, "dyn_new_submit_after_release");
+	CK(usb_rx(rx_store, 511, 0) == 2 && ev_sends == 1 && usb_out_owned == 0, "dyn_new_submit_after_release");
 	/* idle poll pre-queues, the cable drops and comes back: the queued request is not resent,
 	 * its old OK releases without a delivery, and only then a fresh receive goes out */
 	usb_clean(); kernel_resources_held = 0; poll_once();
@@ -169,10 +169,10 @@ static void sc_usb_dyn(void)
 	CK(usb_wait(0xff, 0) == 0 && usb_connected == 1, "dyn_reconnect_returns_to_loop");
 	ev_change = 0; ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2;
 	strcpy((char *)rx_store, "late"); fb_calls = 0; ev_sends = 0;
-	CK(usb_rx(rx_store, 511) == -1 && fb_calls == 0 && ev_sends == 0 && usb_out_owned == 0 && usb_rx_queued == 0,
+	CK(usb_rx(rx_store, 511, 0) == -1 && fb_calls == 0 && ev_sends == 0 && usb_out_owned == 0 && usb_rx_queued == 0,
 	   "dyn_reconnect_old_ok_releases_no_resend");
 	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 1; strcpy((char *)rx_store, "q"); ev_sends = 0;
-	CK(usb_rx(rx_store, 511) == 1 && ev_sends == 1 && usb_out_owned == 0, "dyn_new_command_after_reconnect");
+	CK(usb_rx(rx_store, 511, 0) == 1 && ev_sends == 1 && usb_out_owned == 0, "dyn_new_command_after_reconnect");
 	/* the poll's own sequence: disconnect marks, a reconnect keeps the record and sends no
 	 * second OUT, and the old OK dispatches no command; the next poll pre-queues freshly */
 	usb_clean(); poll_once();
@@ -193,7 +193,7 @@ static void sc_usb_dyn(void)
 	r = usb_wait(USB_EP_OUT, 1);
 	CK(r == -1 && usb_out_owned == 1 && usb_out_invalid == 1, "dyn_wait_disconnect_marks_record");
 	ev_change = 0; ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 2;
-	CK(usb_rx(usb_rx_buf, 511) == -1 && usb_out_owned == 0 && usb_out_invalid == 0 && usb_rx_queued == 0,
+	CK(usb_rx(usb_rx_buf, 511, 0) == -1 && usb_out_owned == 0 && usb_out_invalid == 0 && usb_rx_queued == 0,
 	   "dyn_wait_disconnect_old_ok_not_delivered");
 	/* a Cancelled that reports more bytes than the 511 submitted is structurally unsound:
 	 * it isolates instead of releasing; the same record one byte lower releases normally */
@@ -205,5 +205,53 @@ static void sc_usb_dyn(void)
 	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_status = UsbDeviceTransferStatusCancelled; ev_bytes = 511;
 	poll_once();
 	CK(usb_out_lost == 0 && usb_out_owned == 0 && usb_rx_queued == 0, "dyn_exact_cancel_releases");
+}
+
+static void sc_usb_command_interleaved(void)
+{
+	/* A queued command remains deliverable after an IN wait exhausts its budget. */
+	usb_clean(); poll_once();
+	CK(usb_out_owned && usb_command_bytes == 0, "interleave_poll_records_command_purpose");
+	CK(usb_tx((const uint8_t *)"OKAY", 4) == -1 && usb_out_owned && !usb_out_invalid,
+	   "interleave_in_timeout_preserves_queued_command");
+	memcpy(rx_store, "reboot", 6);
+	ev_msg = UsbDeviceEventTransferNotification; ev_ep = USB_EP_OUT; ev_bytes = 6;
+	CK(usb_rx(rx_store, 511, 1) == 6 && !memcmp(rx_store, "reboot", 6),
+	   "interleave_first_reboot_after_in_timeout");
+
+	/* OUT can complete before either the IN terminal or its timeout. Both consumers must
+	 * deliver the saved command once, before the receive buffer can be submitted again. */
+	for (int consumer = 0; consumer < 2; consumer++) {
+		for (int timeout = 0; timeout < 2; timeout++) {
+			usb_clean(); poll_once();
+			memcpy(rx_store, "reboot", 6);
+			ev_prefix_pending = 1;
+			ev_prefix.transfer.endpoint_index = USB_EP_OUT;
+			ev_prefix.transfer.status = UsbDeviceTransferStatusCompleteOK;
+			ev_prefix.transfer.data_buffer = rx_store;
+			ev_prefix.transfer.bytes_completed = 6;
+			ev_msg = timeout ? UsbDeviceEventNoEvent : UsbDeviceEventTransferNotification;
+			ev_ep = USB_EP_IN; ev_bytes = 4;
+			CK(usb_tx((const uint8_t *)"OKAY", 4) == (timeout ? -1 : 4)
+			    && usb_command_bytes == 6 && !usb_out_owned, "interleave_out_completion_saved");
+			int sends = ev_sends, events = ev_calls;
+			CK(usb_rx(rx_store, 511, 0) == -1 && usb_command_bytes == 6,
+			   "interleave_data_cannot_reuse_ready_command_buffer");
+			fb_calls = 0;
+			if (consumer) {
+				poll_once();
+				CK(fb_calls == 1 && !strcmp(fb_got, "reboot"), "interleave_poll_delivers_saved_command");
+			} else {
+				CK(usb_rx(rx_store, 511, 1) == 6 && !memcmp(rx_store, "reboot", 6),
+				   "interleave_rx_delivers_saved_command");
+			}
+			CK(usb_command_bytes == 0 && ev_sends == sends && ev_calls == events,
+			   "interleave_saved_command_consumed_without_resubmit");
+			ev_msg = UsbDeviceEventNoEvent;
+			poll_once();
+			CK(fb_calls == consumer && ev_sends == sends + 1,
+			   "interleave_saved_command_not_dispatched_twice");
+		}
+	}
 }
 """

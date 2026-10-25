@@ -17,7 +17,6 @@ static usb_device_protocol *USB;
 static int download_to_ramdisk;     /* set by "oem ramdisk" for the one download that follows */
 static uint8_t *usb_rx_buf, *usb_tx_buf;
 static int usb_connected;
-static usb_device_descriptor_set usb_desc_set;   /* what usb_start() filled: usb_rebuild() reuses it */
 
 static const uint8_t usb_dev_desc[18] = { 18, 1, 0x10, 0x02, 0, 0, 0, 64, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
 static const uint8_t usb_ss_dev_desc[18] = { 18, 1, 0x00, 0x03, 0, 0, 0, 9, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
@@ -46,10 +45,6 @@ static const uint8_t usb_str_prod[20] = { 20, 3, 'x', 0, 'n', 0, 'u', 0, 'l', 0,
 static const uint8_t usb_str_serial[20] = { 20, 3, 'x', 0, 'n', 0, 'u', 0, 'l', 0, 'o', 0, 'a', 0, 'd', 0, 'e', 0, 'r', 0 };
 static const uint8_t usb_str_iface[18] = { 18, 3, 'f', 0, 'a', 0, 's', 0, 't', 0, 'b', 0, 'o', 0, 'o', 0, 't', 0 };
 
-/* the descriptor set holds pointers to these; taking the address of an array would hand the
- * firmware a different type, so each one goes through a const void * like it always did */
-static const void *usb_cfg_list = usb_cfg_desc, *usb_ss_cfg_list = usb_ss_cfg_desc;
-
 static void EFIAPI
 usb_dummy_notify(void *event, void *ctx)
 {
@@ -60,7 +55,9 @@ usb_start(void)
 {
 	static const efi_guid usb_guid = QCOM_USB_DEVICE_GUID;
 	static const efi_guid init_guid = QCOM_USB_INIT_EVENT_GUID;
+	static const void *cfg = usb_cfg_desc, *ss_cfg = usb_ss_cfg_desc;
 	static const void *strings[5] = { usb_str0, usb_str_mfr, usb_str_prod, usb_str_serial, usb_str_iface };
+	static usb_device_descriptor_set set;
 	void *event;
 
 	/* Ask the platform to bring the controller up in peripheral mode (as the stock fastboot does). */
@@ -73,15 +70,15 @@ usb_start(void)
 		print("usb: device protocol not found\n");
 		return 0;
 	}
-	usb_desc_set.device_descriptor = usb_dev_desc;
-	usb_desc_set.descriptors = &usb_cfg_list;
-	usb_desc_set.ss_device_descriptor = usb_ss_dev_desc;
-	usb_desc_set.ss_descriptors = &usb_ss_cfg_list;
-	usb_desc_set.device_qualifier = usb_qualifier;
-	usb_desc_set.bos = usb_bos;
-	usb_desc_set.string_count = 5;
-	usb_desc_set.strings = strings;
-	efi_status s = USB->start_ex(&usb_desc_set);
+	set.device_descriptor = usb_dev_desc;
+	set.descriptors = &cfg;
+	set.ss_device_descriptor = usb_ss_dev_desc;
+	set.ss_descriptors = &ss_cfg;
+	set.device_qualifier = usb_qualifier;
+	set.bos = usb_bos;
+	set.string_count = 5;
+	set.strings = strings;
+	efi_status s = USB->start_ex(&set);
 	if (EFI_ERROR(s)) {
 		print("usb: start failed %x\n", s);
 		return 0;
@@ -100,51 +97,19 @@ usb_start(void)
  * Returns the byte count, or -1 if the transfer was cancelled or the cable
  * state changed. Keeps the watchdog fed while idle.
  */
-/* LC-USB-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: the wait for one
- * USB event and both transfers under the ownership rules of the USB/return review.
- * The wait bound is a lifecycle rule, not a log-pointer detail: every wait ends inside it,
- * three seconds in a held state, with a kernel to watch, or in a firmware fault, ten in a
- * plain command loop, so a host that went away cannot stop the loader from answering the
- * commands that end the state (the reboot starts over). The plain loop had no bound at all
- * until a killed upload left it waiting with no way back to those commands.
- * Ownership: a transfer belongs to the controller until a verified notification ends it,
- * and only a verified one: the handle_event call must have returned success, the event must
- * cover the transfer fields, its data_buffer must be the buffer this endpoint's recorded
- * request submitted, and bytes_completed must stay within the submitted length. Each
- * endpoint records one request (owned flag, buffer, length); the submit record is written
- * only where a send succeeded, and taking over a queued request requires the recorded
- * buffer and length. Statuses split three ways: CompleteOK releases the record and is the
- * only status whose bytes may be read; Cancelled ends the request as a failure and clears
- * the record so a later submit may go; Active and values outside the four documented
- * statuses keep everything. Structural failures (a notification for a buffer the loader did
- * not submit, more bytes than submitted, an event too short to attribute, a request on file
- * without its buffer, CompleteError, whose buffer return efi.h leaves unproven) isolate the
- * endpoint: its buffer and flags stay until the machine is reset, and external reset is the
- * recovery boundary the loader can point at. A timeout or a disconnect ends the current wait
- * and marks the owned records undeliverable: the buffer is not rewritten, nothing resends
- * itself (the owned record vetoes a submit until its terminal arrives), and a later matching
- * terminal only releases the record: a CompleteOK so marked is recycled, the record clears
- * and the bytes go unread. An IN record a host walked away from would then stay owned until
- * a machine reset, so its submit time is kept (usb_in_since) and usb_recover_in() uses the
- * age at the two boundaries where nothing is in flight, before a reply is submitted and
- * before the next command is received: abort_xfer and the Cancelled terminal it asks for,
- * then a halt cycle on the endpoint, then a rebuild of the device stack, each level only
- * after the one before it failed and the whole ladder at most USB_IN_RECOVER_LIMIT times a
- * session. A link wait (endpoint 0xff, no transfer of its own) ends on a
- * Connected event so the waiting loop can submit, without touching any record. DeviceStateChange carries no transfer information: the
- * link flag follows a readable state, a disconnect ends the current wait, a reconnect --
- * which firmware may post again on each CONFIGURED entry -- keeps every record, and an
- * unreadable state payload changes nothing. The interface carries no generation or request
- * id, so matching a notification to a request assumes one unfinished request per endpoint
- * and one terminal event per request; a notification that finds no recorded request is
- * ignored and a duplicated terminal lands in that same no-op. That assumption is a
- * deployment condition of these builds: it is matched to the documented interface, verified
- * against no firmware trace here. efi.h offers abort_xfer but records no completion
- * semantics behind its return, so that return never ends a request: the ladder above uses
- * the call only to provoke a terminal, and its later levels stand on a call pair the header
- * does document (the halt cycle) or on a start that rebuilds every record. No field of the event union is read before the event type's
- * own payload size was checked. A completion in hand is verified before the time budget, so
- * a terminal event at the deadline is kept, and a wait without one still ends within it. */
+/* LC-USB-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py.
+ * Each endpoint has one owned request. Only a successful, full-sized transfer event with
+ * the recorded buffer and a byte count within its submitted length may end that request.
+ * Active/unknown statuses keep ownership; malformed records and CompleteError isolate the
+ * endpoint until reset. Cancelled releases without delivery; CompleteOK may deliver bytes.
+ * Disconnects invalidate owned requests. Timeouts invalidate IN replies and OUT data, while
+ * OUT command receives remain valid across idle polls. A command completed during an IN
+ * wait retains its buffer until usb_rx or usb_poll_command delivers it exactly once.
+ * All waits have a three-second bound in running/held/fault states and ten seconds otherwise.
+ * A stale IN request may request one abort; its return never releases the buffer. The
+ * shared event verifier handles subsequent terminals while OUT commands remain usable.
+ * efi.h has no request id: attribution assumes one unfinished request per endpoint and one
+ * terminal per request. Firmware behavior still requires device validation. */
 static int usb_rx_queued;       /* usb_poll_command() has left the receive for the next command with the controller */
 static int usb_out_owned;       /* the OUT buffer is with the controller, its end unconfirmed */
 static int usb_in_owned;        /* the IN buffer is with the controller, its end unconfirmed */
@@ -152,14 +117,15 @@ static int usb_out_lost;        /* structurally isolated: an external reset is t
 static int usb_in_lost;
 static void *usb_out_buf;       /* what the owned request submitted, kept to verify the notification */
 static uint64_t usb_out_len;
+static int64_t usb_command_bytes = -1;   /* OUT purpose/result: -1 data, 0 waiting command, >0 completed command */
 static void *usb_in_buf;
 static uint64_t usb_in_len;
 static int usb_out_invalid;     /* the owned request was left by a timeout or a disconnect: its terminal may
                                  * still come, but its bytes may no longer be handed to a caller */
 static int usb_in_invalid;
-static uint64_t usb_in_since;   /* CNTVCT at the submit that owns usb_tx_buf: a timeout only marks a
-                                 * record, so its age is the one signal that nobody will finish it */
-static int usb_in_recoveries;   /* the ladder below runs at most USB_IN_RECOVER_LIMIT times a session */
+static uint64_t usb_in_since;   /* submit time: elapsed time permits an abort request, never buffer reuse */
+static int usb_in_abort_requested;   /* at most one abort for the recorded request */
+static int usb_in_recoveries;   /* bounds firmware abort calls across this loader session */
 
 static void
 usb_stop_endpoint(int out, const char *why)
@@ -261,73 +227,14 @@ usb_notification(int out, const usb_device_event_data *data, uint64_t *bytes)
 	return 1;
 }
 
-/*
- * Getting an IN record back without a machine reset.
- *
- * A host that stops reading in the middle of a reply leaves the record owned: a timeout only
- * marks it, and the loader never aborts a request it cannot account for. The record's age
- * from its submit is the one signal that says no terminal is coming (a timeout sets
- * usb_in_invalid, the unbounded wait did not get that far), and this ladder is the bounded
- * way back. It runs only at the two boundaries where nothing of ours is in flight, before a
- * reply is submitted and before the next command is received, so it never interrupts a live
- * transfer and never reads bytes that belong to a caller.
- */
-#define USB_IN_STALE_SECONDS    5   /* younger than this: the transfer may still be running */
-#define USB_IN_RECOVER_LIMIT    3   /* a session's worth; each rebuild costs a pair of buffers */
+/* A stale reply may be aborted, but only a verified terminal can release its buffer.
+ * Event handling stays in usb_wait/usb_poll_command so an OUT completion cannot be lost
+ * while the IN abort is pending. A request with no terminal remains owned until reset. */
+#define USB_IN_STALE_SECONDS    5
+#define USB_IN_RECOVER_LIMIT    3
 
-/* pump events until the record is free or the window ends; only our own abort's terminal is
- * taken, by status, because this path hands no bytes to anyone */
 static int
-usb_recover_drain(uint64_t ticks)
-{
-	uint64_t began = READ_SYSREG(CNTVCT_EL0);
-
-	while (usb_in_owned && READ_SYSREG(CNTVCT_EL0) - began < ticks) {
-		uint32_t msg = UsbDeviceEventNoEvent;
-		uint64_t size = 0;
-		usb_device_event_data data;
-
-		if (!EFI_ERROR(USB->handle_event(&msg, &size, &data)) &&
-		    msg == UsbDeviceEventTransferNotification && size >= sizeof(data.transfer) &&
-		    data.transfer.endpoint_index == USB_EP_IN &&
-		    data.transfer.status == UsbDeviceTransferStatusCancelled) {
-			usb_in_owned = 0;
-			usb_in_invalid = 0;
-		}
-		wdt_pet();
-	}
-	return usb_in_owned;
-}
-
-/* stop the device stack and start it again from the descriptor set usb_start() filled; a
- * failure leaves the channel exactly as it was, which is where the ladder started */
-static int
-usb_rebuild(void)
-{
-	if (USB->stop == NULL || USB->start_ex == NULL || USB->allocate_transfer_buffer == NULL) {
-		return 0;
-	}
-	if (EFI_ERROR(USB->stop()) || EFI_ERROR(USB->start_ex(&usb_desc_set))) {
-		return 0;
-	}
-	if (EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_rx_buf)) ||
-	    EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_tx_buf))) {
-		return 0;
-	}
-	print("usb: the device stack is rebuilt; the previous buffer pair stays allocated\n");
-	return 1;
-}
-
-/*
- * 0: nothing to do, or the record is free again. -1: the record is still owned, which is what
- * usb_tx() answered before this ladder existed. The levels run in order, each only after the
- * one before it failed:
- *   1  abort_xfer, then its own Cancelled terminal within a quarter of a second;
- *   2  a halt cycle on the endpoint, taken as the end of the request when both calls succeed;
- *   3  stop and start the device stack again, which drops every record of this session.
- */
-static int
-usb_recover_in(const char *why)
+usb_abort_stale_in(const char *why)
 {
 	uint64_t freq = READ_SYSREG(CNTFRQ_EL0);
 	uint64_t age;
@@ -335,44 +242,21 @@ usb_recover_in(const char *why)
 	if (USB == NULL || !usb_in_owned) {
 		return 0;
 	}
-	if (usb_in_lost) {
-		return -1;      /* isolated: this ladder does not undo a structural decision */
+	if (usb_in_lost || usb_in_abort_requested) {
+		return -1;
 	}
 	age = usb_in_since ? (READ_SYSREG(CNTVCT_EL0) - usb_in_since) / (freq ? freq : 1) : 0;
 	if (!usb_in_invalid && usb_in_since != 0 && age < USB_IN_STALE_SECONDS) {
 		return -1;      /* young: its transfer may still be running, nothing to recover */
 	}
-	if (usb_in_recoveries >= USB_IN_RECOVER_LIMIT) {
-		return -1;      /* bounded on purpose: a machine reset stays the last boundary */
+	if (usb_in_recoveries >= USB_IN_RECOVER_LIMIT || USB->abort_xfer == NULL) {
+		return -1;
 	}
 	usb_in_recoveries++;
-	print("usb: the IN record went unreleased for %d s; recovering before %s (attempt %d)\n",
-	    age, why, (uint64_t)usb_in_recoveries);
-	if (USB->abort_xfer != NULL) {
-		(void)USB->abort_xfer(USB_EP_IN);
-		if (!usb_recover_drain(freq / 4)) {
-			print("usb: IN recovered at level 1: the abort's own terminal arrived\n");
-			return 0;
-		}
-	}
-	if (USB->set_endpoint_stall_state != NULL &&
-	    !EFI_ERROR(USB->set_endpoint_stall_state(USB_EP_IN, 1)) &&
-	    !EFI_ERROR(USB->set_endpoint_stall_state(USB_EP_IN, 0))) {
-		usb_in_owned = 0;
-		usb_in_invalid = 0;
-		print("usb: IN recovered at level 2: the endpoint halt was cleared\n");
-		return 0;
-	}
-	if (usb_rebuild()) {
-		usb_rx_queued = usb_out_owned = usb_in_owned = 0;
-		usb_out_lost = usb_in_lost = 0;
-		usb_out_invalid = usb_in_invalid = 0;
-		usb_out_buf = usb_in_buf = NULL;
-		usb_out_len = usb_in_len = 0;
-		print("usb: IN recovered at level 3: every record of this session is dropped\n");
-		return 0;
-	}
-	print("usb: IN recovery failed; the record stays owned and a machine reset ends it\n");
+	usb_in_abort_requested = 1;
+	(void)USB->abort_xfer(USB_EP_IN);
+	print("usb: IN abort requested before %s after %d s (attempt %d); awaiting verified terminal\n",
+	    why, age, (uint64_t)usb_in_recoveries);
 	return -1;
 }
 
@@ -401,6 +285,9 @@ usb_wait(uint8_t endpoint, int deliver)
 				int was_connected = usb_connected;
 				usb_connected = (data.device_state == UsbDeviceStateConnected);
 				if (data.device_state != UsbDeviceStateConnected) {
+					if (usb_command_bytes > 0) {
+						usb_command_bytes = 0;
+					}
 					/* a disconnect ends this wait; the records stay on file, marked so a
 					 * terminal that still arrives only releases them, delivers nothing */
 					if (usb_out_owned) {
@@ -428,7 +315,10 @@ usb_wait(uint8_t endpoint, int deliver)
 				/* the other endpoint's terminal is booked here so its record finishes
 				 * even while this side waits */
 				int kept = usb_notification(data.transfer.endpoint_index == USB_EP_OUT, &data, &bytes);
-
+				if (data.transfer.endpoint_index == USB_EP_OUT && endpoint != USB_EP_OUT &&
+				    kept == 1 && usb_command_bytes == 0) {
+					usb_command_bytes = (int64_t)bytes;
+				}
 				if (data.transfer.endpoint_index == endpoint) {
 					if (kept == 1 && deliver) {
 						return (int64_t)bytes;
@@ -448,9 +338,9 @@ usb_wait(uint8_t endpoint, int deliver)
 		uint64_t limit = (running_live != NULL || kernel_resources_held || firmware_fault)
 		    ? 3 * freq : USB_IDLE_WAIT_SECONDS * freq;
 		if (READ_SYSREG(CNTVCT_EL0) - began > limit) {
-			/* the wait ends without a delivery: the records stay owned and are marked, so a
-			 * terminal that still arrives releases them without handing its bytes over */
-			if (usb_out_owned) {
+			/* A command receive stays valid across idle polls; the command loop resumes the
+			 * same request. Abandoned data receives and IN replies only release late bytes. */
+			if (usb_out_owned && usb_command_bytes < 0) {
 				usb_out_invalid = 1;
 			}
 			if (usb_in_owned) {
@@ -466,11 +356,19 @@ usb_wait(uint8_t endpoint, int deliver)
 }
 
 static int64_t
-usb_rx(uint8_t *buf, uint64_t len)
+usb_rx(uint8_t *buf, uint64_t len, int command_wait)
 {
-	/* every command starts here, and nothing of ours is in flight at this boundary: a reply
-	 * the host walked away from is recovered here rather than at the next reply that needs it */
-	(void)usb_recover_in("the next command");
+	/* Request an IN abort before waiting for the next OUT command. Its terminal is handled
+	 * by the same wait as other transfer events; no buffer changes at this boundary. */
+	(void)usb_abort_stale_in("the next command");
+	if (usb_command_bytes > 0) {
+		if (!command_wait || buf != usb_out_buf || len != usb_out_len) {
+			return -1;
+		}
+		int64_t n = usb_command_bytes;
+		usb_command_bytes = 0;
+		return n;
+	}
 	if (usb_out_lost) {
 		usb_wait(0xff, 0);    /* bounded and watchdog-feeding, so the caller's loop cannot spin */
 		return -1;            /* the isolated channel keeps its buffer: no new send, no overwrite */
@@ -494,6 +392,7 @@ usb_rx(uint8_t *buf, uint64_t len)
 		usb_out_owned = 1;      /* the submit record is written only for a send that succeeded */
 		usb_out_buf = buf;      /* the notification is only believed for this buffer and length */
 		usb_out_len = len;
+		usb_command_bytes = command_wait ? 0 : -1;
 		usb_out_invalid = 0;    /* a new request starts with a fresh delivery state */
 	}
 	return usb_wait(USB_EP_OUT, 1);
@@ -505,7 +404,7 @@ usb_tx(const uint8_t *data, uint64_t len)
 	if (usb_in_lost) {
 		return -1;          /* isolated: no memcpy over the buffer the controller kept, no send */
 	}
-	if (usb_in_owned && usb_recover_in("a reply") < 0) {
+	if (usb_in_owned && usb_abort_stale_in("a reply") < 0) {
 		return -1;          /* the old send still holds the buffer: no memcpy over it, no send */
 	}
 	if (data != usb_tx_buf) {
@@ -515,7 +414,8 @@ usb_tx(const uint8_t *data, uint64_t len)
 		return -1;
 	}
 	usb_in_owned = 1;
-	usb_in_since = READ_SYSREG(CNTVCT_EL0);   /* the age the recovery ladder reads */
+	usb_in_since = READ_SYSREG(CNTVCT_EL0);
+	usb_in_abort_requested = 0;
 	usb_in_buf = usb_tx_buf;    /* the notification is only believed for this buffer and length */
 	usb_in_len = len;
 	usb_in_invalid = 0;         /* a new request starts with a fresh delivery state */
@@ -685,7 +585,7 @@ fb_command(char *cmd)
 			fb_reply_data(total);
 			while (got < total) {
 				uint64_t want = total - got > USB_CHUNK ? USB_CHUNK : total - got;
-				int64_t r = usb_rx(usb_rx_buf, want);
+				int64_t r = usb_rx(usb_rx_buf, want, 0);
 				if (r <= 0) {
 					break;
 				}
@@ -843,12 +743,18 @@ usb_poll_command(void)
 	/* LC-POLL-BEGIN -- extracted verbatim by tools/test-loader-lifecycle.py: the queue rules
 	 * around the ownership flags of the LC-USB block; a queued request ends only through the
 	 * shared verified rule, so the wait and the poll cannot grow two sets of conditions. */
+	if (usb_command_bytes > 0) {
+		n = (uint64_t)usb_command_bytes;
+		usb_command_bytes = 0;
+		goto command_ready;
+	}
 	if (!usb_rx_queued && !usb_out_lost && !usb_out_owned && usb_connected &&
 	    !EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
 		usb_rx_queued = 1;
 		usb_out_owned = 1;
 		usb_out_buf = usb_rx_buf;   /* what this queued request submitted, kept for the check */
 		usb_out_len = 511;
+		usb_command_bytes = 0;
 		usb_out_invalid = 0;        /* a new request starts with a fresh delivery state */
 	}
 	if (EFI_ERROR(USB->handle_event(&msg, &size, &data))) {
@@ -858,6 +764,9 @@ usb_poll_command(void)
 		if (size >= sizeof(data.device_state)) {
 			usb_connected = (data.device_state == UsbDeviceStateConnected);
 			if (!usb_connected) {
+				if (usb_command_bytes > 0) {
+					usb_command_bytes = 0;
+				}
 				/* a disconnect marks the owned records undeliverable: a terminal that
 				 * still arrives only releases them, its bytes reach no command */
 				if (usb_out_owned) {
@@ -891,6 +800,7 @@ usb_poll_command(void)
 	if (usb_notification(1, &data, &n) != 1 || !usb_connected || n == 0) {
 		return;         /* kept, failed, isolated, link down or ended empty: the buffer is not read */
 	}
+command_ready:
 	if (n > sizeof(cmd) - 1) {
 		n = sizeof(cmd) - 1;
 	}
@@ -914,7 +824,7 @@ usb_command_loop(void)
 			usb_wait(0xff, 0);
 			continue;
 		}
-		n = usb_rx(usb_rx_buf, 511);
+		n = usb_rx(usb_rx_buf, 511, 1);
 		if (n <= 0) {
 			continue;
 		}

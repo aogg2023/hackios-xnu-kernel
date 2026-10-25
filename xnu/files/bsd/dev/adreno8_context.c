@@ -20,6 +20,7 @@
 #define CONTEXT_FLAGS 0x00101072u
 #define CONTEXT_NOTIFY (1u << 5)
 #define CONTEXT_WAIT_NS 200000000ULL
+#define CONTEXT_CONSUME_NS 20000000ULL
 
 enum context_state { CONTEXT_COLD, CONTEXT_PREPARED, CONTEXT_REGISTERED, CONTEXT_FAILED };
 static enum context_state context_state;
@@ -149,6 +150,26 @@ context_wait(uint32_t timestamp)
 	return true;
 }
 
+/* The GMU may advance the queue read index after EOP and GPU idle are already
+ * visible (seen on device at test pass 2), so the read index gets a short wait. */
+static bool
+context_consumed(void)
+{
+	uint64_t start = mach_absolute_time(), elapsed;
+	uint32_t read, write;
+
+	for (;;) {
+		if (!context_queue_indices(&read, &write)) return false;
+		if (read == write) return true;
+		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);
+		if (elapsed >= CONTEXT_CONSUME_NS) {
+			printf("adreno8: context queue read %u, write %u after %llu us\n", read, write, elapsed / 1000);
+			return false;
+		}
+		adreno8_sleep_us(100);
+	}
+}
+
 bool
 adreno8_context_wait_idle(const char *what)
 {
@@ -274,8 +295,7 @@ adreno8_context_test(void)
 		for (unsigned i = 1; i < CONTEXT_BYTES / 4; i++)
 			if (result[i] != 0) return context_fail("test result bounds");
 		if (!context_health() || !adreno8_hfi_poll()) return context_fail("test fault check");
-		uint32_t read, write;
-		if (!context_queue_indices(&read, &write) || read != write)
+		if (!context_consumed())
 			return context_fail("test queue consumption");
 		printf("adreno8: context %u pass %u: SOP/EOP %u result %#x; idle and fault checks passed\n",
 		    CONTEXT_ID, pass, timestamp, result[0]);

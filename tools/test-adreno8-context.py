@@ -40,10 +40,10 @@ static bool adreno8_reset_required;
 static bool gpu_ready, hardware_fault, closed, idle_ok = true;
 static unsigned failures, snapshots, idle_calls, command_count, dispatches, sleeps, mode;
 static uint64_t clock_ns;
-static uint32_t ack_status, last_packet[255], last_packet_words, pending_timestamp;
+static uint32_t ack_status, last_packet[255], last_packet_words, pending_timestamp, pending_read;
 enum { NORMAL, DELAY_EOP, RETIRE_ONLY, NACK_REGISTER, NACK_POINTERS, NACK_CLOSE,
        BAD_ACK, CONTEXT_BAD, ERROR_MESSAGE, CORRUPT_HFI, CORRUPT_RESULT, BAD_SOP,
-       GMU_FAULT, SMMU_FAULT, ALIAS_FAILURE, CORRUPT_CONTEXT, EOP_AHEAD };
+       GMU_FAULT, SMMU_FAULT, ALIAS_FAILURE, CORRUPT_CONTEXT, EOP_AHEAD, DELAY_READ, STUCK_READ };
 #define GMU_HOST2GMU_SET 0
 #define GMU_GMU2HOST_INFO 4
 #define GMU_GMU2HOST_CLR 8
@@ -163,7 +163,9 @@ static void consume_context(void) {
         uint32_t *result = device_gpu(ib[1], 4, ADRENO8_MEM_WRITE);
         *result = mode == CORRUPT_RESULT ? ib[3] ^ 1 : ib[3];
     }
-    q[5] = (read + padded) % 1012;
+    /* pending_read holds the index plus one, so index 0 stays distinguishable. */
+    if (mode == DELAY_READ) pending_read = (read + padded) % 1012 + 1;
+    else if (mode != STUCK_READ) q[5] = (read + padded) % 1012;
     uint32_t retire[15] = {header(133, 15, 0, 7), 1, timestamp, 0};
     append(1, retire, 15);
     if (mode == DELAY_EOP) pending_timestamp = timestamp;
@@ -222,6 +224,10 @@ static void adreno8_sleep_us(uint32_t us) {
         ((uint32_t *)allocations[1].device)[2] = pending_timestamp;
         pending_timestamp = 0;
     }
+    if (pending_read && sleeps % 3 == 0) {
+        ((uint32_t *)allocations[0].device)[5] = pending_read - 1;
+        pending_read = 0;
+    }
 }
 ''' + transport + r'''
 #include "adreno8_context.c"
@@ -241,7 +247,7 @@ static void reset(unsigned next_mode) {
     gpu_ready = idle_ok = true;
     hardware_fault = closed = adreno8_reset_required = false;
     failures = snapshots = idle_calls = command_count = dispatches = sleeps = 0;
-    clock_ns = ack_status = pending_timestamp = last_packet_words = 0;
+    clock_ns = ack_status = pending_timestamp = pending_read = last_packet_words = 0;
     adreno8_gpu_space.context = 0; adreno8_gpu_space.is_on = true;
     adreno8_gpu_space.table_count = 1; adreno8_gpu_space.tables[0].phys = 0x300123000ULL;
     context_state = CONTEXT_COLD;
@@ -280,6 +286,10 @@ int main(void) {
     assert(command_count == 6 && context_state == CONTEXT_PREPARED);
 
     reset(DELAY_EOP); assert(adreno8_context_test() && sleeps == 10);
+    /* EOP and idle can be visible before the GMU advances the queue read index. */
+    reset(DELAY_READ); assert(adreno8_context_test() && dispatches == 2 && sleeps == 6);
+    reset(STUCK_READ); assert(!adreno8_context_test() && dispatches == 1 && context_state == CONTEXT_FAILED);
+    assert(clock_ns >= 20000000ULL && closed);
     reset(NORMAL); prepare_ib();
     uint32_t *q = (uint32_t *)context_queue_view;
     q[5] = q[6] = 1008; context_sequence = 4095;

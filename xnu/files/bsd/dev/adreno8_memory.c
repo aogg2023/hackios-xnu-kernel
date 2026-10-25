@@ -9,6 +9,11 @@
 #define MEMORY_BLOCK_LIMIT (64u * 1024u * 1024u)
 #define MEMORY_TOTAL_LIMIT (128u * 1024u * 1024u)
 #define GPU_MATCH 0u
+/* gfx3d_lpac SID 1, selected by CP_SMMU_STREAM_ID_LPAC=0x101. The BR SQE waits on
+ * THREAD_SYNC for the LPAC engine, which fetches its microcode with this stream.
+ * Linux msm puts SID 0 and 1 in one domain; this route shares GPU context 0. */
+#define LPAC_STREAM 1u
+#define LPAC_MATCH 3u
 
 struct adreno8_memory_entry {
 	struct adreno8_memory buffer;
@@ -279,7 +284,8 @@ adreno8_gpu_memory_verify(void)
 		adreno8_memory_failed = true;
 		return false;
 	}
-	if (!adreno8_space_check(&adreno8_gpu_space, 0, GPU_MATCH) || adreno8_gpu_faulted()) {
+	if (!adreno8_space_check(&adreno8_gpu_space, 0, GPU_MATCH) ||
+	    !adreno8_space_route_check(&adreno8_gpu_space, LPAC_STREAM, LPAC_MATCH) || adreno8_gpu_faulted()) {
 		adreno8_memory_failed = true;
 		adreno8_hwsched_memory_failed();
 		printf("adreno8: GPU memory verification failed; retain all memory and mappings until cold reset\n");
@@ -297,7 +303,8 @@ adreno8_gpu_memory_enable(void)
 	if (adreno8_gpu_space.is_on) {
 		return adreno8_gpu_memory_verify();
 	}
-	if (!adreno8_space_on(&adreno8_gpu_space, 0, GPU_MATCH) || !adreno8_scm_gpu_aperture()) {
+	if (!adreno8_space_on(&adreno8_gpu_space, 0, GPU_MATCH) ||
+	    !adreno8_space_route(&adreno8_gpu_space, LPAC_STREAM, LPAC_MATCH) || !adreno8_scm_gpu_aperture()) {
 		adreno8_memory_failed = true;
 		return false;
 	}

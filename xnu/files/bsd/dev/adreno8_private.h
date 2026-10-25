@@ -391,6 +391,10 @@ bool
 adreno8_space_map_block(struct adreno8_gpu_space *space, const struct adreno8_gpu_block *b);
 bool
 adreno8_space_on(struct adreno8_gpu_space *space, uint32_t stream, uint32_t match);
+bool
+adreno8_space_route(struct adreno8_gpu_space *space, uint32_t stream, uint32_t match);
+bool
+adreno8_space_route_check(struct adreno8_gpu_space *space, uint32_t stream, uint32_t match);
 void
 adreno8_space_off(struct adreno8_gpu_space *space, uint32_t match);
 bool

@@ -894,6 +894,52 @@ fail:
 	return false;
 }
 
+bool
+adreno8_space_route_check(struct adreno8_gpu_space *space, uint32_t stream, uint32_t match)
+{
+	return space->is_on && match < adreno8_smmu_matches &&
+	    adreno8_get(&adreno8_smmu, "route smr check", SMMU_SMR(match)) == (SMR_VALID | SMR_MASK << 16 | stream) &&
+	    (adreno8_get(&adreno8_smmu, "route s2cr check", SMMU_S2CR(match)) & 0x30303ff) ==
+	    (SMMU_S2CR_SHCFG_NSH | space->context);
+}
+
+/*
+ * Route one more stream into an enabled context. The match slot must be unused and
+ * no valid entry may cover the stream; a failed step leaves the slot faulting.
+ */
+bool
+adreno8_space_route(struct adreno8_gpu_space *space, uint32_t stream, uint32_t match)
+{
+	uint32_t smr = SMR_VALID | SMR_MASK << 16 | stream;
+
+	if (!space->is_on || match >= adreno8_smmu_matches || stream > 0x7fff)
+		return false;
+	for (uint32_t i = 0; i < adreno8_smmu_matches; i++) {
+		uint32_t other = adreno8_get(&adreno8_smmu, "route smr ownership", SMMU_SMR(i));
+		uint32_t mask = (other >> 16 & 0x7fff) | SMR_MASK;
+
+		if ((other & SMR_VALID) && (i == match || ((other ^ stream) & 0x7fff & ~mask) == 0)) {
+			printf("adreno8: %u: stream %u route conflicts with match %u (%#x)\n", adreno8_step, stream, i, other);
+			return false;
+		}
+	}
+	adreno8_put(&adreno8_smmu, "route s2cr fault", SMMU_S2CR(match), SMMU_S2CR_FAULT | SMMU_S2CR_SHCFG_NSH);
+	adreno8_put(&adreno8_smmu, "route smr", SMMU_SMR(match), smr);
+	adreno8_settle();
+	if ((adreno8_get(&adreno8_smmu, "route s2cr fault", SMMU_S2CR(match)) & 0x30000) != SMMU_S2CR_FAULT ||
+	    adreno8_get(&adreno8_smmu, "route smr", SMMU_SMR(match)) != smr)
+		return false;
+	adreno8_put(&adreno8_smmu, "route s2cr translate", SMMU_S2CR(match), SMMU_S2CR_SHCFG_NSH | space->context);
+	adreno8_settle();
+	if (!adreno8_space_route_check(space, stream, match) || adreno8_space_faulted(space)) {
+		adreno8_put(&adreno8_smmu, "route s2cr fault", SMMU_S2CR(match), SMMU_S2CR_FAULT | SMMU_S2CR_SHCFG_NSH);
+		return false;
+	}
+	printf("adreno8: %u: %s translation route added: stream %u, match %u, context %u\n", adreno8_step,
+	    space->name, stream, match, space->context);
+	return true;
+}
+
 void
 adreno8_space_off(struct adreno8_gpu_space *space, uint32_t match)
 {

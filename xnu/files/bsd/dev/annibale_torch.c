@@ -103,7 +103,6 @@ static uint8_t timer_original;                  /* channel 0's safety timer as f
 #define CMD_REG(reg)            (((uint32_t)(reg) & 0xff) << 4)
 #define OPC_EXT_WRITEL          0
 #define OPC_EXT_READL           1
-#define OPC_EXT_WRITE           2
 #define OPC_EXT_READ            13
 #define TRANSACT_TIMEOUT_US     2000
 
@@ -242,7 +241,8 @@ spmi_write16(uint16_t addr, uint8_t value)
 	channel = flash.channel;
 	annibale_spmi_lock();
 	wr(channel + CH_WDATA0, value);
-	wr(channel + CH_CMD, CMD_OPC(OPC_EXT_WRITE) | CMD_REG(addr) | (1 - 1));
+	/* the 16-bit register address's write, as Linux's regmap-spmi-ext and redwood_torch.c send it */
+	wr(channel + CH_CMD, CMD_OPC(OPC_EXT_WRITEL) | CMD_REG(addr) | (1 - 1));
 	do {
 		status = rd(channel + CH_STATUS);
 		now = mach_absolute_time();
@@ -286,7 +286,12 @@ flash_put(uint16_t reg, uint8_t value)
 		return false;
 	}
 	if (back != value) {
-		say("torch: %#04x = %#04x read back %#04x\n", reg, value, back);
+		uint8_t later = back;
+
+		/* read once more after 1 ms to tell a slow register from one that refused */
+		wait_ms(1);
+		(void)spmi_read16(reg, &later, 1);
+		say("torch: %#04x = %#04x read back %#04x, %#04x 1 ms later\n", reg, value, back, later);
 		broken = true;
 		return false;
 	}

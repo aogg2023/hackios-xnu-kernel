@@ -678,6 +678,53 @@ adreno8_secure_preflight(void)
 	return true;
 }
 
+static bool
+adreno8_space_registers(struct adreno8_gpu_space *space)
+{
+	uint64_t root = space->tables[0].phys | (uint64_t)space->context << 48;
+	uint32_t cb = (adreno8_smmu_pages + space->context) * adreno8_smmu_page;
+	bool ok;
+
+	/* TBI0/1 can read as one on MMU-500; all IOVAs here are untagged 32-bit values. */
+	ok = adreno8_get(&adreno8_smmu, "cb sctlr", cb + SMMU_CB_SCTLR) == adreno8_smmu_sctlr(space->context);
+	ok &= adreno8_get(&adreno8_smmu, "cb a2r", adreno8_smmu_page + SMMU_CBA2R(space->context)) == 1;
+	ok &= adreno8_get(&adreno8_smmu, "cb bar", adreno8_smmu_page + SMMU_CBAR(space->context)) == STAGE_1;
+	ok &= (adreno8_get(&adreno8_smmu, "cb tcr2", cb + SMMU_CB_TCR2) & ~SMMU_TCR2_TBI) == TCR2_39_BITS;
+	ok &= adreno8_get(&adreno8_smmu, "cb tcr", cb + SMMU_CB_TCR) == TCR_39_BITS;
+	ok &= adreno8_get(&adreno8_smmu, "cb ttbr0, low", cb + SMMU_CB_TTBR0) == (uint32_t)root;
+	ok &= adreno8_get(&adreno8_smmu, "cb ttbr0, high", cb + SMMU_CB_TTBR0 + 4) == (uint32_t)(root >> 32);
+	ok &= adreno8_get(&adreno8_smmu, "cb ttbr1, low", cb + SMMU_CB_TTBR1) == 0;
+	ok &= adreno8_get(&adreno8_smmu, "cb ttbr1, high", cb + SMMU_CB_TTBR1 + 4) == 0;
+	ok &= adreno8_get(&adreno8_smmu, "cb mair0", cb + SMMU_CB_MAIR0) == MAIR0_NORMAL;
+	ok &= adreno8_get(&adreno8_smmu, "cb mair1", cb + SMMU_CB_MAIR1) == 0;
+	if (!ok) {
+		printf("adreno8: %u: context %u register verification failed\n", adreno8_step, space->context);
+	}
+	return ok;
+}
+
+bool
+adreno8_space_check(struct adreno8_gpu_space *space, uint32_t stream, uint32_t match)
+{
+	if (space == NULL || space == &adreno8_secure_space || !space->is_on ||
+	    space->table_count == 0 || space->table_count > sizeof(space->tables) / sizeof(space->tables[0]) ||
+	    space->tables[0].level != 0 || space->secure_tables != 0 || adreno8_smmu_page == 0 ||
+	    space->context >= adreno8_smmu_contexts || match >= adreno8_smmu_matches || stream > 0x7fff ||
+	    (adreno8_smmu_pages + space->context + 1) * adreno8_smmu_page > adreno8_smmu.size) {
+		return false;
+	}
+	bool ok = adreno8_space_registers(space);
+	ok &= adreno8_get(&adreno8_smmu, "smr check", SMMU_SMR(match)) == (SMR_VALID | SMR_MASK << 16 | stream);
+	ok &= (adreno8_get(&adreno8_smmu, "s2cr check", SMMU_S2CR(match)) & 0x30303ff) ==
+	    (SMMU_S2CR_SHCFG_NSH | space->context);
+	ok &= adreno8_space_verify(space, false);
+	ok &= !adreno8_space_faulted(space);
+	if (!ok) {
+		printf("adreno8: %u: %s active translation verification failed; configuration retained\n", adreno8_step, space->name);
+	}
+	return ok;
+}
+
 bool
 adreno8_space_on(struct adreno8_gpu_space *space, uint32_t stream, uint32_t match)
 {
@@ -685,7 +732,7 @@ adreno8_space_on(struct adreno8_gpu_space *space, uint32_t stream, uint32_t matc
 	uint32_t cb, idr0, idr1, idr2, smr = SMR_VALID | SMR_MASK << 16 | stream;
 	uint32_t s2cr = SMMU_S2CR_SHCFG_NSH | space->context;
 	uint32_t sctlr = adreno8_smmu_sctlr(space->context);
-	bool atos, registers_ok;
+	bool atos;
 
 	adreno8_announce("configure %s SMMU context %u and verify its page mappings", space->name, space->context);
 	if (space->is_on || space->table_count == 0 || space->tables[0].level != 0 || !adreno8_smmu_layout() ||
@@ -742,20 +789,7 @@ adreno8_space_on(struct adreno8_gpu_space *space, uint32_t stream, uint32_t matc
 	}
 	adreno8_put(&adreno8_smmu, "cb sctlr", cb + SMMU_CB_SCTLR, sctlr);
 	adreno8_settle();
-	/* TBI0/1 can read as one on MMU-500; all IOVAs here are untagged 32-bit values. */
-	registers_ok = adreno8_get(&adreno8_smmu, "cb sctlr", cb + SMMU_CB_SCTLR) == sctlr;
-	registers_ok &= adreno8_get(&adreno8_smmu, "cb a2r", adreno8_smmu_page + SMMU_CBA2R(space->context)) == 1;
-	registers_ok &= adreno8_get(&adreno8_smmu, "cb bar", adreno8_smmu_page + SMMU_CBAR(space->context)) == STAGE_1;
-	registers_ok &= (adreno8_get(&adreno8_smmu, "cb tcr2", cb + SMMU_CB_TCR2) & ~SMMU_TCR2_TBI) == TCR2_39_BITS;
-	registers_ok &= adreno8_get(&adreno8_smmu, "cb tcr", cb + SMMU_CB_TCR) == TCR_39_BITS;
-	registers_ok &= adreno8_get(&adreno8_smmu, "cb ttbr0, low", cb + SMMU_CB_TTBR0) == (uint32_t)root;
-	registers_ok &= adreno8_get(&adreno8_smmu, "cb ttbr0, high", cb + SMMU_CB_TTBR0 + 4) == (uint32_t)(root >> 32);
-	registers_ok &= adreno8_get(&adreno8_smmu, "cb ttbr1, low", cb + SMMU_CB_TTBR1) == 0;
-	registers_ok &= adreno8_get(&adreno8_smmu, "cb ttbr1, high", cb + SMMU_CB_TTBR1 + 4) == 0;
-	registers_ok &= adreno8_get(&adreno8_smmu, "cb mair0", cb + SMMU_CB_MAIR0) == MAIR0_NORMAL;
-	registers_ok &= adreno8_get(&adreno8_smmu, "cb mair1", cb + SMMU_CB_MAIR1) == 0;
-	if (!registers_ok) {
-		printf("adreno8: %u: context %u register verification failed\n", adreno8_step, space->context);
+	if (!adreno8_space_registers(space)) {
 		goto fail;
 	}
 	if (atos && !adreno8_space_verify(space, true)) {

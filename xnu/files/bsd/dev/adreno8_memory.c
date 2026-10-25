@@ -272,19 +272,38 @@ adreno8_gpu_memory_ready(void)
 }
 
 bool
+adreno8_gpu_memory_verify(void)
+{
+	if (adreno8_memory_failed) {
+		return false;
+	}
+	if (!adreno8_cx_ready()) {
+		adreno8_memory_failed = true;
+		return false;
+	}
+	if (!adreno8_space_check(&adreno8_gpu_space, 0, GPU_MATCH) || adreno8_gpu_faulted()) {
+		adreno8_memory_failed = true;
+		adreno8_hwsched_memory_failed();
+		printf("adreno8: GPU memory verification failed; retain all memory and mappings until cold reset\n");
+		return false;
+	}
+	return true;
+}
+
+bool
 adreno8_gpu_memory_enable(void)
 {
 	if (adreno8_memory_failed || !adreno8_cx_ready()) {
 		return false;
 	}
 	if (adreno8_gpu_space.is_on) {
-		return true;
+		return adreno8_gpu_memory_verify();
 	}
 	if (!adreno8_space_on(&adreno8_gpu_space, 0, GPU_MATCH) || !adreno8_scm_gpu_aperture()) {
 		adreno8_memory_failed = true;
 		return false;
 	}
-	return true;
+	return adreno8_gpu_memory_verify();
 }
 
 bool

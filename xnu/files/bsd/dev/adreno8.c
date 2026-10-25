@@ -17,9 +17,9 @@
  *  11  SCM CX register initialization and GMU start, using inherited host DDR votes
  *  12  HFI queue start and version validation
  *  13  Performance and bandwidth tables
- *  14  Prepare GPU buffers and start HWSCHED, servicing GMU memory requests
- *  15  125 MHz/BW2 DCVS request and GMUCX status; requires keep and a host cold reset
- *  16  GPU SMMU context 0
+ *  14  Prepare GPU buffers, enable CB0 and start HWSCHED, servicing GMU memory requests
+ *  15  160 MHz/BW2 DCVS request and GMUCX status; requires keep and a host cold reset
+ *  16  Read back GPU SMMU context 0, routing, page tables and fault status
  *  17  OOB, GPU registers, SQE/AQE and CP initialization
  *  18  PAS 13 zap authentication
  *  19  Leave secure mode
@@ -32,7 +32,8 @@
  * adreno8_skip=MASK   skip selected steps (bit 0 selects step 1)
  * adreno8_pause=MS    pause before access groups in the newest step (default 2200 ms)
  * adreno8_fine=1      also pause before individual accesses in that step
- * adreno8_raw_nop=N   stop after RAW NOPs before CP_INIT: 1=two words, 2=ten words
+ * adreno8_raw_nop=N   stop before CP_INIT: 1=two RAW NOP words, 2=ten RAW NOP words,
+ *                  3=setup-only health checks without RAW publication
  * adreno8_watch=S     inspect GMU status for S seconds after step 11 or later (default 20)
  * adreno8_keep=1      retain resources; stage 15 requires a cold reset before memory reuse
  * adreno8_secure_preflight=N  stage-14 secure memory mode. Mode 0 and unknown values
@@ -312,7 +313,7 @@ adreno8_step_hwsched(void)
 		printf("adreno8: HWSCHED probes require keep=1, return=0 and host cold reset\n");
 		return false;
 	}
-	return adreno8_gpu_prepare() && adreno8_hwsched_start();
+	return adreno8_gpu_prepare() && adreno8_gpu_memory_enable() && adreno8_hwsched_start();
 }
 
 static bool
@@ -335,7 +336,7 @@ adreno8_init(void)
 		adreno8_step_outside, adreno8_step_gpucc, adreno8_step_cx_power, adreno8_step_cx_awake, adreno8_step_clocks,
 		adreno8_step_first_words, adreno8_step_gmu_memory, adreno8_step_smmu_read, adreno8_step_gmu_space, adreno8_step_firmware,
 		adreno8_step_gmu_start, adreno8_step_queues, adreno8_step_tables, adreno8_step_hwsched,
-		adreno8_step_gx_power, adreno8_gpu_memory_enable, adreno8_gpu_cp_init, adreno8_step_zap,
+		adreno8_step_gx_power, adreno8_gpu_memory_verify, adreno8_gpu_cp_init, adreno8_step_zap,
 		adreno8_step_secure_exit, adreno8_gpu_scratch_test, adreno8_step_last_look, adreno8_context_test
 	};
 	const unsigned count = sizeof(each) / sizeof(each[0]);

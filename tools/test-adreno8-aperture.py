@@ -85,6 +85,7 @@ int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t a0,
     return transport_status;
 }
 static bool adreno8_memory_failed;
+void adreno8_hwsched_memory_failed(void) { adreno8_memory_failed = true; }
 static unsigned adreno8_memory_count;
 static bool adreno8_secure_lost(void) { return false; }
 '''
@@ -172,7 +173,8 @@ def main():
     cx, memory = (DEV / "adreno8_cx.c").read_text(), (DEV / "adreno8_memory.c").read_text()
     helper = function(cx, "adreno8_scm_gpu_aperture")
     functions = macro(memory, "GPU_MATCH") + "\n".join(function(memory, name) for name in
-                          ("adreno8_memory_retained", "adreno8_gpu_memory_ready", "adreno8_gpu_memory_enable"))
+                          ("adreno8_memory_retained", "adreno8_gpu_memory_ready", "adreno8_gpu_memory_verify",
+                           "adreno8_gpu_memory_enable", "adreno8_gpu_faulted"))
     setup = fixture["tests"].split("int main(void) {")[0]
     source = ('#include "adreno8_smmu.c"\n' + setup + vendor_reference(vendor) + SPY + helper
               + functions + "\n#undef printf\n" + CASES)
@@ -195,7 +197,8 @@ def main():
                 "skip_aperture": (" || !adreno8_scm_gpu_aperture()", ""),
                 "before_ttbr0": ("!adreno8_space_on(&adreno8_gpu_space, 0, GPU_MATCH) || !adreno8_scm_gpu_aperture()",
                                  "!adreno8_scm_gpu_aperture() || !adreno8_space_on(&adreno8_gpu_space, 0, GPU_MATCH)"),
-                "retry_after_failure": ("adreno8_memory_failed = true;", "adreno8_memory_failed = false;"),
+                "retry_after_failure": ("adreno8_memory_failed = true;\n\t\treturn false;\n\t}\n\treturn adreno8_gpu_memory_verify();",
+                                        "adreno8_memory_failed = false;\n\t\treturn false;\n\t}\n\treturn adreno8_gpu_memory_verify();"),
             }
             for name, (old, new) in changes.items():
                 # Restrict mutations to the production helper/functions, leaving the vendor reference intact.

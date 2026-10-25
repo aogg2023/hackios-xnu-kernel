@@ -737,6 +737,44 @@ int main(void) {
     unsigned reads_after = 0;
     for (unsigned i = 0; i < sizeof(reads) / sizeof(reads[0]); i++) reads_after += reads[i];
     assert(reads_after == reads_before);
+    /* One more stream into an enabled context (LPAC SID 1 into the GPU context). */
+    reset(&space, false);
+    assert(adreno8_step_smmu_read());
+    space.name = "route";
+    assert(!adreno8_space_route(&space, 1, 3) && writes == 0);
+    space.is_on = true;
+    assert(!adreno8_space_route(&space, 1, 24) && writes == 0);
+    assert(!adreno8_space_route(&space, 0x8000, 3) && writes == 0);
+    regs[SMMU_SMR(3) / 4] = 0x80000007;     /* the slot itself is taken */
+    assert(!adreno8_space_route(&space, 1, 3) && writes == 0);
+    regs[SMMU_SMR(3) / 4] = 0;
+    regs[SMMU_SMR(0) / 4] = 0x80010000;     /* stream 0 with mask 1 already covers stream 1 */
+    assert(!adreno8_space_route(&space, 1, 3) && writes == 0);
+    regs[SMMU_SMR(0) / 4] = 0x80000000;     /* stream 0 alone */
+    assert(adreno8_space_route(&space, 1, 3) && write_log_count == 3);
+    assert(write_log[0].offset == SMMU_S2CR(3) && write_log[0].value == (SMMU_S2CR_FAULT | SMMU_S2CR_SHCFG_NSH));
+    assert(write_log[1].offset == SMMU_SMR(3) && write_log[1].value == 0x80000001);
+    assert(write_log[2].offset == SMMU_S2CR(3) && write_log[2].value == (SMMU_S2CR_SHCFG_NSH | space.context));
+    assert(adreno8_space_route_check(&space, 1, 3) && !adreno8_space_route_check(&space, 2, 3));
+    space.is_on = false;
+    assert(!adreno8_space_route_check(&space, 1, 3));
+    /* A context fault seen after the switch to translate puts the slot back to fault. */
+    reset(&space, false);
+    assert(adreno8_step_smmu_read());
+    space.name = "route";
+    space.is_on = true;
+    regs[(0x20000 + space.context * 0x1000 + SMMU_CB_FSR) / 4] = 2;
+    assert(!adreno8_space_route(&space, 1, 3));
+    assert((regs[SMMU_S2CR(3) / 4] & 0x30000) == SMMU_S2CR_FAULT && regs[SMMU_SMR(3) / 4] == 0x80000001);
+    /* An SMR that does not read back stops before the translate write. */
+    reset(&space, false);
+    assert(adreno8_step_smmu_read());
+    space.name = "route";
+    space.is_on = true;
+    reject_offset = SMMU_SMR(3);
+    reject_value = 0x80000001;
+    assert(!adreno8_space_route(&space, 1, 3) && write_log_count == 2);
+    assert((regs[SMMU_S2CR(3) / 4] & 0x30000) == SMMU_S2CR_FAULT);
     release_all();
     puts("SMMU mapping, register writes, ATOS capability and failure cleanup: PASS");
 }

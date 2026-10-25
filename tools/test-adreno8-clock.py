@@ -26,10 +26,12 @@ static uint32_t adreno8_gmu_from_pll, adreno8_step, adreno8_newest_step;
 static bool adreno8_reset_required, resources, pending_latch;
 static unsigned reads, writes, resource_calls, running, elapsed_us;
 static unsigned mode, drop_write, poison_read, pll_writes, rcg_updates;
+static uint32_t write_only_high, cold_write_only_high;
 static struct { bool is_gpu; uint32_t offset, value; } history[128];
 enum { NORMAL, RESOURCE_FAIL, GPLL_UNLOCKED, GPLL_BAD_RATE, GPLL_GATE_FAIL,
        GPU_FSM, CONFIG_FAIL, GPU_UNLOCKED, GMU_FORCE_FAIL, GMU_UPDATE_FAIL,
-       HUB_FORCE_FAIL, HUB_UPDATE_FAIL, LATCH_FAIL, POST_RATE_UNLOCKED };
+       HUB_FORCE_FAIL, HUB_UPDATE_FAIL, LATCH_FAIL, POST_RATE_UNLOCKED,
+       L_HIGH_IGNORED, L_HIGH_WRITE_ONLY };
 #define GPUCC_GMU_RCGR 0x9318u
 #define GPUCC_HUB_RCGR 0x93ecu
 #define GPUCC_HUB_DIV 0x942cu
@@ -77,6 +79,12 @@ static void adreno8_put(struct adreno8_block *b, const char *n, uint32_t off, ui
             if(mode==POST_RATE_UNLOCKED) r[0] &= ~(1u<<31);
         } else r[0] &= ~(1u<<13);
         if ((value & 1) && !(old & 1)) assert(old & (1u<<31));
+    } else if (off == 0x10 && mode == L_HIGH_IGNORED) {
+        r[4]=(old&0xff000000u)|(value&0x00ffffffu);
+    } else if (off == 0x10 && mode == L_HIGH_WRITE_ONLY) {
+        write_only_high=value>>24;
+        if (!(old&0xffff)) cold_write_only_high=write_only_high;
+        r[4]=value&0x00ffffffu;
     } else if (off == 4) {
         assert(value == 0 || value == 1); r[1]=value;
         if (value == 1) {
@@ -102,6 +110,7 @@ static void reset(unsigned next) {
     resources=adreno8_reset_required=pending_latch=false; adreno8_gmu_from_pll=true;
     adreno8_step=adreno8_newest_step=5;
     reads=writes=resource_calls=running=elapsed_us=drop_write=poison_read=pll_writes=rcg_updates=0;
+    write_only_high=cold_write_only_high=0;
     mode=next; clock_state=CLOCK_COLD;
     gpu[0]=0x100; gpu[4]=0x440000; gpu[6]=1; gpu[7]=2;
     gpu[GPUCC_GMU_RCGR/4]=gpu[GPUCC_HUB_RCGR/4]=0x80040000;
@@ -125,6 +134,15 @@ static unsigned find(unsigned start, bool is_gpu, uint32_t off, uint32_t mask, u
     assert(!"required ordered register write absent"); return 0;
 }
 int main(void) {
+    /* Model the observed L write 0x44440034 / read 0x00440034 mismatch. */
+    reset(L_HIGH_IGNORED);
+    assert(adreno8_clock_boot() && gpu[4]==0x00440043 && running==2);
+    assert(adreno8_clock_started() && gpu[4]==0x00440034);
+    reset(L_HIGH_IGNORED); gpu[4]=0x88440000;
+    assert(adreno8_clock_boot() && gpu[4]==0x88440043 && running==2);
+    reset(L_HIGH_WRITE_ONLY);
+    assert(adreno8_clock_boot() && gpu[4]==0x00440043 && running==2 && cold_write_only_high==0x44);
+    assert(adreno8_clock_started() && gpu[4]==0x00440034);
     reset(NORMAL); adreno8_gmu_from_pll=false;
     assert(adreno8_clock_boot() && adreno8_clock_started());
     assert(!reads && !writes && !resource_calls && !adreno8_reset_required);
@@ -220,7 +238,9 @@ int main(void) {
     reset(NORMAL); gpu[4]=0x44440043; gpu[5]=0xb555; gpu[6]=0x80407;
     assert(adreno8_clock_boot() && gpu[4]==0x44440043 && gpu[6]==0x80407);
     for(unsigned i=0;i<writes;i++) assert(history[i].offset!=0x20 || !history[i].is_gpu);
-    const uint32_t unknown_cal[] = {0x88880000,0x44450000,0x45440000};
+    reset(NORMAL); gpu[4]=0x88440043; gpu[5]=0xb555;
+    assert(adreno8_clock_boot() && running==2 && gpu[4]==0x88440043);
+    const uint32_t unknown_cal[] = {0x88880000,0x44450000,0x45460000};
     for(unsigned i=0;i<sizeof(unknown_cal)/sizeof(*unknown_cal);i++) {
         reset(NORMAL); gpu[4]=unknown_cal[i]|0x43; gpu[5]=0xb555;
         assert(!adreno8_clock_boot() && !running && !rcg_updates);
@@ -409,13 +429,17 @@ def main():
              '(void)clock_poll(&adreno8_gpucc, command, RCG_UPDATE, 0, 500);'),
             ("retry-after-failure", 'clock_state = CLOCK_FAILED;', 'clock_state = CLOCK_COLD;'),
             ("no-inherited-even-check", 'if (gmu_parent == 2 && (user & 0x3c00) != 0x400)', 'if (false)'),
-            ("no-inherited-calibration-check", 'if ((l & 0xffff0000u) != 0x44440000u)', '(void)l; if (false)'),
+            ("no-inherited-calibration-check", 'if ((l & 0x00ff0000u) != 0x00440000u)', '(void)l; if (false)'),
             ("no-inherited-GMU-parent-check", 'if (gmu_parent != 0 && gmu_parent != 2 && gmu_parent != 5 && gmu_parent != 6)', 'if (false)'),
             ("no-inherited-HUB-range-check", 'if (hub_parent != 0 && (hub_source & 0x371f) != 0x505)',
              '(void)hub_parent; if (false)'),
             ("diagnostic-wrong-stage", 'if (adreno8_gmu_from_pll == 2 && (adreno8_step != 5 || adreno8_newest_step != 5))', 'if (false)'),
             ("diagnostic-enters-START", 'if (adreno8_gmu_from_pll != 1) return clock_fail("stage-5-only clock diagnostic cannot enter START");', ''),
             ("parent-gate-before-source-check", '!pll_configure() || !hub_parent()', '!hub_parent() || !pll_configure()'),
+            ("full-L-readback", '0x00ffffffu, 0x00440034u', '0xffffffffu, 0x44440034u'),
+            ("omitted-process-calibration-write", '{PLL_L, 0x44440034}', '{PLL_L, 0x00440034}'),
+            ("wide-calibration-guard", 'if ((l & 0x00ff0000u) != 0x00440000u)',
+             'if ((l & 0xffff0000u) != 0x44440000u)'),
         ]
         for label, before, after in mutations:
             assert before in production, label

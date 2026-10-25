@@ -112,9 +112,17 @@ pll_configure(void)
 		{0x20, 0x19660387}, {0x24, 0x098060a0}, {0x28, 0xb416cb20},
 		{PLL_USER, 0x407}, {0x1c, 2}, {0x2c, 0}, {0x30, 0},
 	};
-	for (unsigned i = 0; i < sizeof(config) / sizeof(config[0]); i++)
-		if (!clock_write(&adreno8_gpucc, "PLL0 configure", config[i].offset,
+	for (unsigned i = 0; i < sizeof(config) / sizeof(config[0]); i++) {
+		if (config[i].offset == PLL_L) {
+			/* Annibale reads L[31:24] as zero after this vendor write. Keep the
+			 * full write; rate and calibration calculations use the low 24 bits. */
+			adreno8_put(&adreno8_gpucc, "PLL0 configure L", PLL_L, config[i].value);
+			adreno8_settle();
+			if (!clock_matches(&adreno8_gpucc, "PLL0 configure L", PLL_L,
+			    0x00ffffffu, 0x00440034u)) return false;
+		} else if (!clock_write(&adreno8_gpucc, "PLL0 configure", config[i].offset,
 		    0xffffffffu, config[i].value)) return false;
+	}
 	return clock_write(&adreno8_gpucc, "PLL0 output off", PLL_MODE, PLL_OUT, 0);
 }
 
@@ -221,10 +229,10 @@ adreno8_clock_boot(void)
 	uint32_t calibration = adreno8_get(&adreno8_gpucc, "PLL0 calibration mode", PLL_MODE);
 	if (calibration == 0xffffffffu) return clock_fail("calibration read");
 	if (calibration & PLL_PCAL_NOT_DONE) {
-		/* The retained resource vote covers the fixed Sun calibration fields.
+		/* The retained resource vote covers the fixed Sun calibration value.
 		 * The vendor prepare path derives a separate voltage for other values. */
 		uint32_t l = adreno8_get(&adreno8_gpucc, "PLL0 calibration L", PLL_L);
-		if ((l & 0xffff0000u) != 0x44440000u) return clock_fail("inherited calibration fields");
+		if ((l & 0x00ff0000u) != 0x00440000u) return clock_fail("inherited calibration fields");
 		if (!pll_enable() ||
 		    !clock_write(&adreno8_gpucc, "PLL0 calibration output off", PLL_MODE, PLL_OUT, 0) ||
 		    !clock_write(&adreno8_gpucc, "PLL0 calibration standby", PLL_OPMODE, 0xffffffffu, 0) ||

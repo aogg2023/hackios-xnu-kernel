@@ -58,6 +58,8 @@ struct a8_protect_span { uint32_t reg, start, end, noaccess; };
 #define GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_0 0x1fc40
 #define GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_1 0x1fc41
 #define GEN8_GBIF_CX_CONFIG 0x3c00
+#define GEN8_GBIF_HALT 0x3c45
+#define GEN8_GBIF_HALT_ACK 0x3c46
 #define GEN8_GRAS_DBG_ECO_CNTL 0x8702
 #define GEN8_GRAS_NC_MODE_CNTL 0x8700
 #define GEN8_GRAS_TSEFE_DBG_ECO_CNTL 0x8600
@@ -75,6 +77,8 @@ struct a8_protect_span { uint32_t reg, start, end, noaccess; };
 #define GEN8_RBBM_CGC_P2S_TRIG_CMD 0x09c
 #define GEN8_RBBM_CLOCK_CNTL_GLOBAL 0x09a
 #define GEN8_RBBM_GBIF_CLIENT_QOS_CNTL 0x008
+#define GEN8_RBBM_GBIF_HALT 0x00a
+#define GEN8_RBBM_GBIF_HALT_ACK 0x00b
 #define GEN8_RBBM_INTERFACE_HANG_INT_CNTL 0x02f
 #define GEN8_RBBM_INT_0_MASK 0x062
 #define GEN8_RBBM_INT_0_STATUS 0x06a

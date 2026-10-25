@@ -434,10 +434,10 @@ gpu_ring_wptr(uint32_t value)
 }
 
 /* Linux a8xx_hw_init/a8xx_cp_init at efbda69d92e6 use a zeroed powerup page,
- * BR/BV RPTR shadows and a 32 KiB ring before enabling SQE. This probe ends
- * after the first CP_INIT; allocations and OOB remain held until cold reset. */
+ * BR/BV RPTR shadows and a 32 KiB ring before enabling SQE. Setup-only stops
+ * before SQE; the ring probe stops after CP_INIT. Both retain allocations and OOB until cold reset. */
 static bool
-gpu_direct_ring_init(void)
+gpu_direct_ring_init(bool setup_only)
 {
 	if (!ring || ring->size != 32768 || scratch->size < 16 || powerup->size != 4096)
 		return gpu_fail("direct ring buffer bounds");
@@ -461,6 +461,25 @@ gpu_direct_ring_init(void)
 		adreno8_settle();
 		if (gpu_read(setup[i].reg) != setup[i].value)
 			return gpu_fail("direct ring register readback");
+	}
+	if (setup_only) {
+		/* Mainline reads HALT after writes and polls ACK during shutdown. */
+		const uint32_t halt[] = { GEN8_GBIF_HALT, GEN8_GBIF_HALT_ACK,
+			GEN8_RBBM_GBIF_HALT, GEN8_RBBM_GBIF_HALT_ACK };
+		for (unsigned i = 0; i < A8_COUNT(halt); i++) {
+			uint32_t value = gpu_read(halt[i]);
+			printf("adreno8: ordinary setup-only halt sample %#x = %#x\n", adreno8_gpu.phys + 4u * halt[i], value);
+			if (value == 0xffffffffu)
+				return gpu_fail("ordinary setup-only halt read");
+		}
+		printf("adreno8: ordinary setup-only: ring registers verified; SQE enable and CP_INIT remain unissued\n");
+		for (unsigned i = 0; i < 100; i++) {
+			adreno8_sleep_us(100000);
+			if (!adreno8_hfi_poll() || !gpu_status_ok())
+				return gpu_fail("ordinary setup-only HFI or GPU fault");
+		}
+		printf("adreno8: ordinary setup-only remained healthy for 10 seconds through the final check; SQE was not started by this probe\n");
+		return gpu_fail("ordinary setup-only diagnostic stop");
 	}
 	gpu_write(GEN8_CP_SQE_CNTL, 1);
 	adreno8_settle();
@@ -512,14 +531,15 @@ adreno8_gpu_cp_init(void)
 	    !adreno8_gpu8_keep || adreno8_gpu8_return || adreno8_skip_steps != 0 || raw_nop != 0))
 		return gpu_fail("empty powerup diagnostic prerequisites");
 	if (adreno8_direct_ring && (adreno8_step != 17 || adreno8_newest_step != 17 ||
-	    !adreno8_gpu8_keep || adreno8_gpu8_return || adreno8_skip_steps != 0 || raw_nop || empty_powerup))
+	    !adreno8_gpu8_keep || adreno8_gpu8_return || adreno8_skip_steps != 0 ||
+	    (raw_nop != 0 && raw_nop != 3) || empty_powerup))
 		return gpu_fail("direct ring diagnostic prerequisites");
 	if (!gpu_oob_get() || !gpu_register_config() ||
 	    !gpu_ucode_base(GEN8_CP_SQE_INSTR_BASE_LO, sqe) ||
 	    !gpu_ucode_base(GEN8_CP_AQE_INSTR_BASE_LO_0, aqe))
 		return false;
 	if (adreno8_direct_ring)
-		return gpu_direct_ring_init();
+		return gpu_direct_ring_init(raw_nop == 3);
 	/* Separate delayed failure after setup from failure after publishing RAW. */
 	if (raw_nop == 3) {
 		for (unsigned i = 0; i < 100; i++) {

@@ -443,7 +443,7 @@ int main(void) {
     for(unsigned mode=0;mode<2;mode++) check(mode,17,0,0,0);
     for(unsigned mode=3;mode<5;mode++) check(mode,17,0,0,0);
     for(unsigned value=1;value<=5;value++) {
-        raw_nop_arg=value; check(2,17,0,0,0); raw_nop_arg=0;
+        raw_nop_arg=value; check(2,17,0,0,value == 3 ? 0x1ffff : 0); raw_nop_arg=0;
         empty_powerup_arg=value; check(2,17,0,0,0); empty_powerup_arg=0;
         secure_mode_arg=value; check(2,17,0,0,0); secure_mode_arg=0;
     }
@@ -583,7 +583,7 @@ def main():
             ("skip", "adreno8_skip_steps != 0 || ", ""),
             ("keep", "!adreno8_gpu8_keep || ", ""),
             ("return", "adreno8_gpu8_return || ", ""),
-            ("raw", "raw_nop != 0 ||", ""),
+            ("raw", "(raw_nop != 0 && raw_nop != 3) ||", ""),
             ("empty", "empty_powerup != 0 ||", ""),
             ("secure", "secure_mode_arg != 0 ||", ""),
             ("clock", "adreno8_gmu_from_pll != 2", "false"),

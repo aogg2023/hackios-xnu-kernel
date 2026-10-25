@@ -209,6 +209,7 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	}
 	lck_mtx_unlock(&touch_lock);
 	wakeup(&touch_queue);
+	annibale_cpufreq_touch();
 }
 
 void

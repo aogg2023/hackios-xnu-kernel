@@ -2,6 +2,7 @@
 #include "adreno8_private.h"
 #include "adreno8_hwsched_private.h"
 #include "adreno8_memory_private.h"
+#include "adreno8_clock_private.h"
 
 #define printf adreno8_say
 
@@ -156,6 +157,10 @@ adreno8_hwsched_start(void)
 	    !adreno8_hfi_send(11, preemption, 3, "disable HWSCHED preemption") ||
 	    !adreno8_hfi_send(11, aqe, 3, "enable AQE") ||
 	    !adreno8_hfi_send(10, NULL, 0, "HWSCHED START")) {
+		return false;
+	}
+	if (!adreno8_clock_started()) {
+		adreno8_hwsched_memory_failed();
 		return false;
 	}
 	adreno8_hwsched_started = true;

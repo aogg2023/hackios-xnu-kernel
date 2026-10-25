@@ -55,6 +55,9 @@ static int32_t adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t ar
     return scm_status[scm_calls++];
 }
 static bool adreno8_cx_changed, powered;
+static bool clock_boot_ok = true;
+static unsigned clock_boot_calls;
+static bool adreno8_clock_boot(void) { clock_boot_calls++; return clock_boot_ok; }
 static uint32_t adreno8_cx_saved_gdscr;
 static const void *adreno8_speeds;
 static bool adreno8_gpucc_answers(void) { return true; }
@@ -150,6 +153,14 @@ int main(void) {
     reject_gemnoc = false; branches = 0;
     regs[GPUCC_GMU_RCGR / 4 + 1] = 0x100000;
     assert(adreno8_step_clocks() && branches > 1 && (*gemnoc & CBCR_ENABLE));
+    assert(clock_boot_calls == 0);
+    clock_boot_ok = false; adreno8_gmu_from_pll = 1;
+    regs[GPUCC_GMU_RCGR / 4 + 1] = 0x100000;
+    unsigned prior_writes = writes; branches = 0;
+    assert(!adreno8_step_clocks() && clock_boot_calls == 1 && writes == prior_writes && branches == 1);
+    assert(regs[GPUCC_GMU_RCGR / 4 + 1] == 0x100000);
+    clock_boot_ok = true; branches = 0;
+    assert(adreno8_step_clocks() && clock_boot_calls == 2 && branches > 1);
 }
 '''
 with tempfile.TemporaryDirectory(prefix="adreno8-config-") as directory:

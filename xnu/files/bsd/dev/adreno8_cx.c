@@ -1,6 +1,7 @@
 /* SM8750 GPU power, clocks, CMD DB and SCM initialization. */
 #include "adreno8_private.h"
 #include "adreno8_rpmh_private.h"
+#include "adreno8_clock_private.h"
 
 #define printf adreno8_say
 
@@ -13,7 +14,7 @@
  * GPUCC register access in step 2.
  */
 
-static struct adreno8_block adreno8_gcc = { "gcc", 0x00100000, 0x80000 };
+struct adreno8_block adreno8_gcc = { "gcc", 0x00100000, 0x80000 };
 
 /* dt: reserved-memory cmd_db@81c60000, 0x20000: the boot loader's list of what RPMh can switch */
 
@@ -348,12 +349,10 @@ adreno8_step_outside(void)
 /* ---- step 2: the GPU's clock controller, as left ------------------------------------------------------- */
 
 /*
- * dt: clock-controller@3d90000. The register list is drivers/clk/qcom/gpucc-sm8750.c: one power
- * switch (CX; there is no GX one for the OS to pull: the 3D core's power is the GMU firmware's
- * to give, through its PWR_CLK), thirteen branches, two clock sources over one PLL. TAYCAN_ELU,
- * the PLL, is a known set of values at unverified offsets on this SoC, so it is read, not
- * written: the GMU is left on the crystal's rate, which its firmware runs at anyway (the
- * "gmu clk" vote in the firmware's HFI protocol starts at TCXO). (TODO: PLL offsets.)
+ * DT clock-controller@3d90000: gpucc-sun.c and clk-alpha-pll.c define the Sun
+ * TAYCAN_ELU offsets. This step reads the inherited power, branch, PLL and RCG
+ * state. Step 5 keeps the GMU on the crystal by default; adreno8_gmuclk=1 uses
+ * the complete GMU/HUB clock path in adreno8_clock.c.
  */
 
 struct adreno8_block adreno8_gpucc = { "gpucc", 0x03d90000, 0x10000 };
@@ -381,7 +380,7 @@ adreno8_cx_is_on(void)
 bool
 adreno8_step_gpucc(void)
 {
-	adreno8_announce("read the GPU's clock controller as the boot loader left it: power switch, thirteen branches, two clock sources; the PLL area read only, its offsets are unverified (gpucc-sm8750.c)");
+	adreno8_announce("read the GPU clock controller's inherited power, branches, PLL and clock sources; Sun offsets follow gpucc-sun.c and clk-alpha-pll.c; this step performs no writes");
 	if (!adreno8_gpucc_answers()) {
 		printf("adreno8: %u: the GPU's clock controller does not answer (all ones)\n", adreno8_step);
 		return false;
@@ -608,17 +607,13 @@ adreno8_step_clocks(void)
 	if (!adreno8_gemnoc_on())
 		return false;
 
-	adreno8_announce("in the GPU's clock controller: the GMU's clock source to the crystal (parent 0; adreno8_gmuclk=1 would ask PLL0_OUT_EVEN, parent 2, whose PLL offsets are unverified: see the header)");
-	if (!adreno8_clock_source("gmu_clk_src", GPUCC_GMU_RCGR, adreno8_gmu_from_pll ? (2u << 8) | 1u : 0)) {
-		return false;
-	}
 	if (adreno8_gmu_from_pll) {
-		adreno8_announce("the PLL area again, now that a vote for it is out (offsets unverified: read for the record)");
-		for (unsigned i = 0; i < 8; i++) {
-			adreno8_get(&adreno8_gpucc, "pll0 area, read only", 4 * i);
-		}
+		if (!adreno8_clock_boot()) return false;
+	} else {
+		adreno8_announce("select the GMU crystal clock for the default clock experiment");
+		if (!adreno8_clock_source("gmu_clk_src", GPUCC_GMU_RCGR, 0)) return false;
 	}
-	adreno8_announce("enable GPUCC GMU, AHB and MEMNOC_GFX (0x90f4) branches; MEMNOC_GFX is independent of the two GCC branches; keep the loader's HUB source and tolerate optional branch halt timeouts");
+	adreno8_announce("enable GPUCC GMU, AHB and MEMNOC_GFX (0x90f4) branches; MEMNOC_GFX is independent of the two GCC branches; optional branch halt timeouts remain tolerated");
 	if (!adreno8_clock_on(&adreno8_gpucc, "cxo", GPUCC_CX_CBCR, true) ||
 	    !adreno8_clock_on(&adreno8_gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, true) ||
 	    !adreno8_clock_on(&adreno8_gpucc, "ahb", GPUCC_AHB_CBCR, false) ||

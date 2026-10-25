@@ -53,7 +53,8 @@
  * adreno8_arc_read=1  stage-1 diagnostic: Apps DRV2 cx.lvl then mx.lvl reads; requires explicit
  *                  touchscreen=0 and a host cold reset after any register write
  * adreno8_speed=N     GX operating point; only 1 (160 MHz) is exposed before SKU selection
- * adreno8_gmuclk=1    select the GPU PLL clock parent; default uses the crystal
+ * adreno8_gmuclk=1    retain CX/MX votes, initialize GMU 650/HUB 200 MHz, then GMU 500
+ *                  after START; requires touchscreen=0 wfi=0 wfe_mode=0; default uses the crystal
  * adreno8_return=1    return to the resident loader after cleanup
  *
  * Firmware family is gen80000, as loaded by Android and specified by the vendor gen8.0.0

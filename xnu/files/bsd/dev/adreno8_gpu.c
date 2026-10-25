@@ -262,20 +262,9 @@ gpu_protect(void)
 static bool
 gpu_hwcg(void)
 {
-	/* a8xx_set_hwcg(false) keeps gating disabled until after the first CP_INIT. */
-	if (adreno8_direct_ring) {
-		gpu_gmu_write(GMU(GEN8_GMUAO_CGC_MODE_CNTL), 0);
-		gpu_gmu_write(GMU(GEN8_GMUAO_CGC_DELAY_CNTL), 0);
-		gpu_gmu_write(GMU(GEN8_GMUAO_CGC_HYST_CNTL), 0);
-		gpu_write(GEN8_RBBM_CLOCK_CNTL_GLOBAL, 1);
-		gpu_write(GEN8_RBBM_CGC_GLOBAL_LOAD_CMD, 0);
-		uint32_t gbif = gpu_read(GEN8_GBIF_CX_CONFIG);
-		if (gbif == 0xffffffffu)
-			return gpu_fail("GBIF clock-gating read");
-		gpu_write(GEN8_GBIF_CX_CONFIG, gbif & ~1u);
-		adreno8_settle();
-		return gpu_state != GPU_FAILED;
-	}
+	/* Preserve inherited clock-gating settings before CP_INIT. */
+	if (adreno8_direct_ring)
+		return true;
 	gpu_write(GEN8_RBBM_CGC_0_PC, 0x702);
 	for (unsigned i = 0; i < A8_COUNT(a8_ao_hwcg); i++)
 		gpu_gmu_write(GMU(a8_ao_hwcg[i].reg), a8_ao_hwcg[i].value);

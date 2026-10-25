@@ -290,8 +290,7 @@ void adreno8_wr(vm_offset_t address, uint32_t value)
         if (reg == 0x81c) assert(value != 3u<<12);
         if (reg == 0x84d) assert(value == (current_pipe == 1 ? 0x6f : 0xf));
         if (reg >= 0xf800 && reg <= 0xf803) assert(value == 0);
-        if (reg == 0x9a) assert(value == 1);
-        if (reg == 0x9b) assert(value == 0);
+        assert(reg != 0x9a && reg != 0x9b);
         if (reg == 0x9c) assert(false);
         for (unsigned i=0;i<7;i++) if (reg == ring_setup_regs[i]) {
             assert(ring_input_mask == 7 && !ring_wptr_writes);
@@ -584,7 +583,7 @@ static void check_direct_ring(void)
     assert(gpu_regs[0][0x808]==0xc0600008 && gpu_regs[0][0x809]==0);
     assert(gpu_regs[0][0x806]==10 && gpu_regs[0][0x807]==10 && gpu_regs[0][0x80a]==0);
     assert(((uint32_t *)device_memory[3])[0]==10 && ((uint32_t *)device_memory[3])[2]==0);
-    assert(gpu_regs[0][0x9a]==1 && gpu_regs[0][0x9b]==0 && gpu_regs[0][0x3c00]==0xabcdef00);
+    assert(gpu_regs[0][0x9a]==0 && gpu_regs[0][0x9b]==0 && gpu_regs[0][0x3c00]==0xabcdef01);
     assert(!gmu_regs[GMU(0x23b09)/4] && !gmu_regs[GMU(0x23b0a)/4] && !gmu_regs[GMU(0x23b0b)/4]);
     for(unsigned i=0;i<4096;i++) assert(!device_memory[2][i]);
     prepare_ring(); ring_fence_drops=3; ring_fence_extra=2; ring_rbbm=1;
@@ -619,8 +618,6 @@ static void check_direct_ring(void)
     assert(!adreno8_gpu_cp_init()); ring_retained(0);
     prepare_ring(); ring_bv_shadow=UINT32_MAX;
     assert(!adreno8_gpu_cp_init()); ring_retained(0);
-    prepare_ring(); gpu_regs[0][0x3c00]=UINT32_MAX;
-    assert(!adreno8_gpu_cp_init() && !ring_wptr_writes); ring_retained(0);
     for(unsigned i=0;i<2;i++) {
         prepare_ring(); gpu_regs[0][i?0x807:0x806]=1;
         assert(!adreno8_gpu_cp_init() && !ring_wptr_writes); ring_retained(0);

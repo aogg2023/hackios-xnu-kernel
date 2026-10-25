@@ -338,8 +338,8 @@ int main(int argc,char **argv) {
     assert(argc>=2); scenario=atoi(argv[1]); if(argc>2)fail_at=atoi(argv[2]); setup();
     bool result=adreno8_rpmh_clock_prepare();
     if(fail_at) assert(!result && writes==fail_at && adreno8_reset_required);
-    else assert(result==(scenario<=2 || scenario==14 || scenario==61));
-    if((scenario>=3 && scenario<=13) || (scenario>=15 && scenario<=19)) assert(!reads && !writes && !lookups);
+    else assert(result==(scenario<=2 || scenario==14 || scenario==16 || scenario==18 || scenario==61));
+    if((scenario>=3 && scenario<=13) || scenario==15 || scenario==17 || scenario==19) assert(!reads && !writes && !lookups);
     if((scenario>=20 && scenario<=45) || scenario==63) assert(!writes && !triggers);
     if(result) {
         assert(lookups==2 && triggers==2 && voltage_writes==2 && writes==34);
@@ -419,9 +419,9 @@ def main():
         run(production, target, highest_cases, model=HIGHEST_MODEL)
         highest_mutations = [
             ("highest_stage", "adreno8_step != 5 ||", "", (9,)),
-            ("highest_newest", "(adreno8_newest_step != 5 && adreno8_newest_step != 17) ||", "", (10,)),
-            ("highest_reject_17", "(adreno8_newest_step != 5 && adreno8_newest_step != 17)", "adreno8_newest_step != 5", (14,)),
-            ("highest_newest_range", "(adreno8_newest_step != 5 && adreno8_newest_step != 17)", "(adreno8_newest_step < 5 || adreno8_newest_step > 17)", (15,)),
+            ("highest_newest", "(adreno8_newest_step != 5 && adreno8_newest_step < 17) ||", "", (10,)),
+            ("highest_reject_17", "(adreno8_newest_step != 5 && adreno8_newest_step < 17)", "adreno8_newest_step != 5", (14,)),
+            ("highest_newest_range", "(adreno8_newest_step != 5 && adreno8_newest_step < 17)", "(adreno8_newest_step < 5 || adreno8_newest_step > 17)", (15,)),
             ("highest_prior_read", "|| read_used", "|| (read_used && false)", (11,)),
             ("highest_map", "memcmp(votes[i].levels, expected, count * sizeof(expected[0])) != 0", "false", (24,)),
             ("highest_padding", "level != (j < count ? expected[j] : 0)", "false && level != (j < count ? expected[j] : 0)", (27,)),

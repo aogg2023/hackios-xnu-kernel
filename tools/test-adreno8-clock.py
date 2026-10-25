@@ -210,14 +210,14 @@ int main(void) {
     for(unsigned j=0;j<sizeof(phases)/sizeof(*phases);j++) {
         reset(NORMAL); adreno8_gmu_from_pll=2;
         adreno8_step=phases[j]; adreno8_newest_step=limits[i];
-        bool admitted=phases[j]==5 && (limits[i]==5 || limits[i]==17);
+        bool admitted=phases[j]==5 && (limits[i]==5 || limits[i]>=17);
         assert(adreno8_clock_boot()==admitted);
         if(!admitted) { assert(!reads && !writes && !resource_calls); closed(); }
         reset(NORMAL); adreno8_gmu_from_pll=2; adreno8_newest_step=17;
         assert(adreno8_clock_boot());
         adreno8_step=phases[j]; adreno8_newest_step=limits[i];
         unsigned diagnostic_writes=writes, diagnostic_reads=reads;
-        admitted=phases[j]==14 && limits[i]==17;
+        admitted=phases[j]==14 && limits[i]>=17;
         assert(adreno8_clock_started()==admitted);
         if(admitted) {
             assert(clock_state==CLOCK_RUNNING && gpu[4]==0x44440034);
@@ -380,11 +380,12 @@ static void check(uint32_t mode, uint32_t asked, uint32_t only, uint32_t skip, u
 int main(void) {
     check(2,5,0,0,0x1f);
     check(2,17,0,0,0x1ffff);
+    check(2,18,0,0,0x3ffff); check(2,23,0,0,0x7fffff); check(2,UINT32_MAX,0,0,0x7fffff);
     const uint32_t rejected[][3]={
         {5,14,0}, {5,5,0}, {5,0,1u<<4}, {14,0,0}, {14,5,0},
-        {23,0,0}, {UINT32_MAX,0,0}, {4,0,0}, {0,0,0}, {5,0,1u<<31},
+        {4,0,0}, {0,0,0}, {5,0,1u<<31},
         {17,5,0}, {17,17,0}, {17,0,1u<<13}, {17,0,1u<<31},
-        {16,0,0}, {18,0,0}
+        {16,0,0}
     };
     for(unsigned i=0;i<sizeof(rejected)/sizeof(*rejected);i++)
         check(2,rejected[i][0],rejected[i][1],rejected[i][2],0);
@@ -520,8 +521,8 @@ def main():
             ("no-inherited-HUB-range-check", 'if (hub_parent != 0 && (hub_source & 0x371f) != 0x505)',
              '(void)hub_parent; if (false)'),
             ("diagnostic-wrong-stage", 'adreno8_step != 5 ||', ''),
-            ("diagnostic-wrong-limit", '(adreno8_newest_step != 5 && adreno8_newest_step != 17)', 'false'),
-            ("diagnostic-START-wrong-limit", 'adreno8_newest_step == 17 && ', ''),
+            ("diagnostic-wrong-limit", '(adreno8_newest_step != 5 && adreno8_newest_step < 17)', 'false'),
+            ("diagnostic-START-wrong-limit", 'adreno8_newest_step >= 17 && ', ''),
             ("diagnostic-START-wrong-phase", ' && adreno8_step == 14', ''),
             ("diagnostic-START-unknown-mode", '!(adreno8_gmu_from_pll == 2 &&', '!(true &&'),
             ("parent-gate-before-source-check", '!pll_configure() || !hub_parent()', '!hub_parent() || !pll_configure()'),
@@ -544,7 +545,7 @@ def main():
                            for i, name in enumerate(names, 1))
         run("init-admission", INIT_STUB + phases + init, cases=INIT_CASES)
         admission_mutations = [
-            ("asked", "(asked != 5 && asked != 17) || ", ""),
+            ("asked", "(asked != 5 && asked < 17) || ", ""),
             ("only", "only != 0 ||", ""),
             ("skip", "adreno8_skip_steps != 0", "false"),
             ("keep", " || !adreno8_gpu8_keep", ""),

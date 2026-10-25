@@ -217,7 +217,7 @@ adreno8_clock_boot(void)
 {
 	if (!adreno8_gmu_from_pll) return true;
 	if (adreno8_gmu_from_pll == 2 && (adreno8_step != 5 ||
-	    (adreno8_newest_step != 5 && adreno8_newest_step != 17)))
+	    (adreno8_newest_step != 5 && adreno8_newest_step < 17)))
 		return clock_fail("short clock diagnostic admission");
 	if (clock_state == CLOCK_FAILED) return false;
 	if (clock_state != CLOCK_COLD)
@@ -257,7 +257,7 @@ adreno8_clock_started(void)
 {
 	if (!adreno8_gmu_from_pll) return true;
 	if (adreno8_gmu_from_pll != 1 && !(adreno8_gmu_from_pll == 2 &&
-	    adreno8_newest_step == 17 && adreno8_step == 14))
+	    adreno8_newest_step >= 17 && adreno8_step == 14))
 		return clock_fail("short clock diagnostic START admission");
 	if (clock_state == CLOCK_RUNNING) return clock_verify(1000000000) || clock_fail("running verification");
 	if (clock_state != CLOCK_BOOT) return clock_fail("START order");

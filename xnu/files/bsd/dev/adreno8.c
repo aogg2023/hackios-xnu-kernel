@@ -60,9 +60,9 @@
  * adreno8_speed=N     GX operating point; only 1 (160 MHz) is exposed before SKU selection
  * adreno8_gmuclk=1    retain CX/MX votes, initialize GMU 650/HUB 200 MHz, then GMU 500
  *                  after START; requires touchscreen=0 wfi=0 wfe_mode=0; default uses the crystal
- * adreno8_gmuclk=2    full stages 1..5 or 1..17: highest supported CX/MX WRITE completion;
+ * adreno8_gmuclk=2    full stages 1..5 or 1..17 and later: highest supported CX/MX WRITE completion;
  *                  same explicit zero parameters, no preceding ARC READ, keep=1 return=0;
- *                  retain requests until cold reset; stage 17 permits START and CP initialization
+ *                  retain requests until cold reset; stage 17 and later permit START and CP commands
  * adreno8_return=1    return to the resident loader after cleanup
  *
  * Firmware family is gen80000, as loaded by Android and specified by the vendor gen8.0.0
@@ -408,9 +408,9 @@ adreno8_init(void)
 		printf("adreno8: empty_powerup=1 requires adreno8=17, keep=1 return=0 without only, skip or raw_nop; no steps attempted\n");
 		return;
 	}
-	if (adreno8_gmu_from_pll == 2 && ((asked != 5 && asked != 17) || only != 0 ||
+	if (adreno8_gmu_from_pll == 2 && ((asked != 5 && asked < 17) || only != 0 ||
 	    adreno8_skip_steps != 0 || !adreno8_gpu8_keep || adreno8_gpu8_return)) {
-		printf("adreno8: gmuclk=2 requires adreno8=5 or 17, keep=1 return=0 without only or skip; no steps attempted\n");
+		printf("adreno8: gmuclk=2 requires adreno8=5 or 17 and later, keep=1 return=0 without only or skip; no steps attempted\n");
 		return;
 	}
 	if (asked > count) {

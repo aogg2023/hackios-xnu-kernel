@@ -9,6 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DEV = ROOT / "xnu/files/bsd/dev"
 
 FENCES = r'''
+/* adreno8_bo.c's clock: each reading BO_CHECK_NS or more after the last unless a case stops it */
+static uint64_t bo_clock, bo_clock_step = 1ull << 40;
+static uint64_t bo_test_clock(void) { return bo_clock += bo_clock_step; }
 static bool commands_verified, context_verified, memory_healthy, hfi_healthy, idle_ok;
 static bool adreno8_reset_required;
 static unsigned closed, idle_calls, eop_waits, eop_delay;
@@ -45,7 +48,7 @@ static void fresh(void) {
     adreno8_gmu_space.context = GMU_CONTEXT;
     memset(&adreno8_secure_space, 0, sizeof(adreno8_secure_space));
     adreno8_secure_space.context = SECURE_CONTEXT;
-    bo_state = BO_COLD;
+    bo_state = BO_COLD; bo_checked = 0; bo_clock_step = 1ull << 40;
     commands_verified = context_verified = memory_healthy = hfi_healthy = idle_ok = true;
     adreno8_reset_required = true; /* Secure transfer retains pages through the normal boot. */
     closed = idle_calls = eop_waits = eop_delay = 0; pending_entry = NULL;
@@ -89,6 +92,16 @@ int main(int argc, char **argv) {
     assert(writes == old_writes && allocation_count == old_allocations);
     context_verified = true;
     assert(adreno8_bo_enable() && adreno8_bo_ready() && idle_calls == 1);
+    if (mode == 24) {
+        /* within BO_CHECK_NS of a check that passed the state answers; after it the check runs again */
+        bo_clock_step = 0;
+        assert(adreno8_bo_ready());
+        hfi_healthy = false;
+        assert(adreno8_bo_ready() && !closed);
+        bo_clock_step = 1ull << 40;
+        assert(!adreno8_bo_ready() && closed);
+        stays_closed(ADRENO8_GPU_IOVA_START, 4096); release_all(); return 0;
+    }
     if (mode >= 1 && mode <= 5) {
         const uint64_t bad_sizes[] = {0, 1, 4095, UINT64_MAX, (1ULL << 32)};
         assert(!adreno8_bo_reserve(bad_sizes[mode - 1]));
@@ -225,8 +238,8 @@ def main():
             (target / name).write_text((DEV / name).read_text())
         (target / "adreno8_smmu.c").write_text(fixture["driver"])
         (target / "adreno8_bo.c").write_text((DEV / "adreno8_bo.c").read_text())
-        source = ('#include "adreno8_smmu.c"\n' + FENCES + '\n#include "adreno8_bo.c"\n'
-            '#undef printf\n' + setup + CASES)
+        source = ('#include "adreno8_smmu.c"\n' + FENCES + '\n#define mach_absolute_time bo_test_clock\n'
+            '#include "adreno8_bo.c"\n#undef mach_absolute_time\n#undef printf\n' + setup + CASES)
         path = target / "check.c"
         path.write_text(source)
         for page_size in (4096, 16384):
@@ -236,11 +249,11 @@ def main():
                 capture_output=True, text=True)
             if compiled.returncode:
                 raise RuntimeError(compiled.stderr)
-            for mode in range(24):
+            for mode in range(25):
                 result = subprocess.run([str(binary), str(mode)], capture_output=True, text=True)
                 if result.returncode:
                     raise RuntimeError(f"PAGE_SIZE={page_size}, mode={mode}:\n" + result.stdout + result.stderr)
-            print(f"External BO: 24 ownership/lifecycle scenarios, PAGE_SIZE={page_size}: PASS")
+            print(f"External BO: 25 ownership/lifecycle scenarios, PAGE_SIZE={page_size}: PASS")
 
 
 if __name__ == "__main__":

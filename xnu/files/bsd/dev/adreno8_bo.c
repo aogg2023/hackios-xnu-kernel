@@ -24,13 +24,27 @@ bo_fail(const char *what)
 	return false;
 }
 
+/*
+ * The full health check reads some twenty GPU, GMU and SMMU registers and drains the HFI queues;
+ * the dispatch layer asks several times per submission and on every poll of a wait. Within
+ * BO_CHECK_NS of a check that passed, the state alone answers, so a fault is noticed by the
+ * next check at most that much later. Completion polling drains the HFI queues on its own.
+ */
+#define BO_CHECK_NS 1000000ull              /* 1 ms */
+static uint64_t bo_checked;
+
 bool
 adreno8_bo_ready(void)
 {
+	uint64_t now = mach_absolute_time(), since;
+
 	if (bo_state != BO_ENABLED) return false;
+	absolutetime_to_nanoseconds(now - bo_checked, &since);
+	if (bo_checked != 0 && since < BO_CHECK_NS) return true;
 	if (!adreno8_gpu_commands_ready() || !adreno8_gpu_memory_ready() ||
 	    !adreno8_hwsched_ready() || !adreno8_hfi_poll() || adreno8_gpu_faulted())
 		return bo_fail("health check");
+	bo_checked = now;
 	return true;
 }
 

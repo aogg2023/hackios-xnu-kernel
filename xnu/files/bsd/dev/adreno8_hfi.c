@@ -105,10 +105,112 @@ adreno8_hfi_failed(void)
 	return false;
 }
 
+static bool
+adreno8_hfi_health(void)
+{
+	uint32_t irq = adreno8_rd(adreno8_gmu.base + GMU_GMU2HOST_INFO);
+	uint32_t init = adreno8_rd(adreno8_gmu.base + GMU_FW_INIT_RESULT);
+
+	adreno8_wr(adreno8_gmu.base + GMU_GMU2HOST_CLR, irq & 5u);
+	if ((irq & (1u << 15)) || (init & GMU_FW_FAILED)) {
+		printf("adreno8: %u: GMU fault during HFI: interrupt %#x init %#x\n", adreno8_step, irq, init);
+		return false;
+	}
+	if (adreno8_gpu8_secure_mode == SECURE_MODE_TRANSLATION_B && adreno8_gpu_faulted()) {
+		printf("adreno8: HFI stopped after an address-space fault\n");
+		return false;
+	}
+	return true;
+}
+
+/* The ACK waiter and EOP polling use the same message handling. A bounded drain
+ * keeps a producer that fills a queue continuously from extending a timeout. */
+static bool
+adreno8_hfi_pump(uint32_t request, bool *ack, unsigned *notices)
+{
+	uint32_t resp[ADRENO8_HFI_MAX_DWORDS], id = request & 0xff;
+
+	if (!adreno8_hfi_health()) return false;
+	for (unsigned queue = 2; queue != 0; queue--) {
+		for (unsigned seen = 0; seen < ADRENO8_HFI_QUEUE_DWORDS / 4; seen++) {
+			int words = adreno8_queue_read(queue, resp);
+			uint32_t type, received_id;
+
+			if (words == 0) break;
+			if (words < 0) {
+				printf("adreno8: %u: HFI queue %u has invalid indices or message length\n", adreno8_step, queue);
+				return false;
+			}
+			type = (resp[0] >> 16) & 0xf;
+			received_id = resp[0] & 0xff;
+			if (type == 1) {
+				if (words < 3) {
+					printf("adreno8: %u: short HFI ACK (%d words)\n", adreno8_step, words);
+					return false;
+				}
+				/* Gen8 echoes the full header; warmboot recording may change bit 19. */
+				if (!request || queue != 1 || (resp[1] & ~(1u << 19)) != request) {
+					if ((*notices)++ < 8)
+						printf("adreno8: %u: unrelated HFI ACK %#x; waiting for %#x\n", adreno8_step, resp[1], request);
+					continue;
+				}
+				/* These HWSCHED messages share gen8_hfi_send_cmd_async's status contract. */
+				bool hwsched = id == 10 || id == 128 || id == 129 || id == 131 || id == 134;
+				if (hwsched ? resp[2] == 0xffffffffu : resp[2] != 0) {
+					printf("adreno8: %u: HFI %u failed: %#x\n", adreno8_step, id, resp[2]);
+					return false;
+				}
+				*ack = true;
+			} else if (type == 0 && (received_id == 100 || received_id == 150)) {
+				printf("adreno8: %u: HFI fatal message %u data %#x (%d words)\n",
+				    adreno8_step, received_id, words >= 2 ? resp[1] : 0, words);
+				return false;
+			} else if (type == 0 && received_id == 133) {
+				/* EOP memory remains the completion check; this packet is a notification. */
+				if (queue != 1 || words != 15) return false;
+			} else if (type == 0 && received_id == 101 && words >= 4) {
+				if ((*notices)++ < 8)
+					printf("adreno8: %u: GMU debug type %u timestamp %u data %#x\n", adreno8_step, resp[1], resp[2], resp[3]);
+			} else if (type == 0 && (received_id == 20 || received_id == 110)) {
+				uint32_t reply[10], reply_words = 0;
+				if (id != 10 || queue != 1 ||
+				    !adreno8_hwsched_request(resp, (uint32_t)words, reply, &reply_words) ||
+				    !adreno8_hfi_reply(received_id, reply, reply_words)) {
+					printf("adreno8: START resource request %u failed (%d words)\n", received_id, words);
+					return false;
+				}
+			} else {
+				if (id == 10 && queue == 1) {
+					printf("adreno8: unexpected START response %#x (%d words)\n", resp[0], words);
+					return false;
+				}
+				if ((*notices)++ < 8)
+					printf("adreno8: %u: unhandled HFI header %#x (%d words)\n", adreno8_step, resp[0], words);
+			}
+		}
+	}
+	return adreno8_hfi_health();
+}
+
+bool
+adreno8_hfi_poll(void)
+{
+	unsigned notices = 0;
+	bool ack = false;
+	if (adreno8_gmu.base == 0 || adreno8_hfi_view_table == 0 ||
+	    adreno8_hfi_view_resp == 0 || adreno8_hfi_view_debug == 0 ||
+	    !adreno8_hfi_pump(0, &ack, &notices)) {
+		adreno8_hwsched_memory_failed();
+		adreno8_gmu_post_mortem();
+		return false;
+	}
+	return true;
+}
+
 bool
 adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, const char *what)
 {
-	uint32_t msg[ADRENO8_HFI_MAX_DWORDS], resp[ADRENO8_HFI_MAX_DWORDS];
+	uint32_t msg[ADRENO8_HFI_MAX_DWORDS];
 	uint64_t start, elapsed = 0;
 	unsigned notices = 0;
 
@@ -118,100 +220,24 @@ adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, const cha
 	}
 	adreno8_hfi_seq = (adreno8_hfi_seq + 1) & 0xfff;
 	msg[0] = (adreno8_hfi_seq << 20) | ((count + 1) << 8) | id;
-	for (uint32_t i = 0; i < count; i++) {
-		msg[i + 1] = payload[i];
-	}
+	for (uint32_t i = 0; i < count; i++) msg[i + 1] = payload[i];
 	start = mach_absolute_time();
 	if (!adreno8_queue_write(msg, count + 1)) {
 		printf("adreno8: %u: could not queue HFI %u (%s)\n", adreno8_step, id, what);
 		return adreno8_hfi_failed();
 	}
 	for (;;) {
-		uint32_t irq = adreno8_rd(adreno8_gmu.base + GMU_GMU2HOST_INFO);
-		uint32_t init = adreno8_rd(adreno8_gmu.base + GMU_FW_INIT_RESULT);
 		bool ack = false;
-
 		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);
 		/* START includes synchronous memory mapping work; its total budget is five seconds. */
 		if (elapsed >= (id == 10 ? 5000000000ULL : 1000000000ULL)) {
 			printf("adreno8: %u: HFI %u (%s) sequence %u timed out\n", adreno8_step, id, what, msg[0] >> 20);
 			break;
 		}
-		/* Poll both queues even if a notification was cleared before its index became visible. */
-		adreno8_wr(adreno8_gmu.base + GMU_GMU2HOST_CLR, irq & 5u);
-		for (unsigned queue = 2; queue != 0; queue--) {
-			int words = adreno8_queue_read(queue, resp);
-			uint32_t type, received_id;
-
-			if (words == 0) {
-				continue;
-			}
-			if (words < 0) {
-				printf("adreno8: %u: HFI queue %u has invalid indices or message length\n", adreno8_step, queue);
-				goto failed;
-			}
-			type = (resp[0] >> 16) & 0xf;
-			received_id = resp[0] & 0xff;
-			if (type == 1) {
-				if (words < 3) {
-					printf("adreno8: %u: short HFI ACK (%d words)\n", adreno8_step, words);
-					goto failed;
-				}
-				/* Gen8 echoes the complete request header; bit 19 may differ after warmboot recording. */
-				if (queue != 1 || (resp[1] & ~(1u << 19)) != msg[0]) {
-					if (notices++ < 8) {
-						printf("adreno8: %u: unrelated HFI ACK %#x; waiting for %#x\n", adreno8_step, resp[1], msg[0]);
-					}
-					continue;
-				}
-				/* HWSCHED START/RAW use UINT32_MAX as failure; generic requests use errno-style zero success. */
-				if ((id == 10 || id == 131) ? resp[2] == 0xffffffffu : resp[2] != 0) {
-					printf("adreno8: %u: HFI %u (%s) failed: %#x\n", adreno8_step, id, what, resp[2]);
-					return adreno8_hfi_failed();
-				}
-				ack = true;
-			} else if (type == 0 && received_id == 100) {
-				printf("adreno8: %u: GMU HFI error %#x (%d words)\n", adreno8_step, words >= 2 ? resp[1] : 0, words);
-				goto failed;
-			} else if (type == 0 && received_id == 101 && words >= 4) {
-				if (notices++ < 8) {
-					printf("adreno8: %u: GMU debug type %u timestamp %u data %#x\n", adreno8_step, resp[1], resp[2], resp[3]);
-				}
-			} else {
-				if (type == 0 && (received_id == 20 || received_id == 110)) {
-					uint32_t reply[10], reply_words = 0;
-
-					if (id != 10 || queue != 1 ||
-					    !adreno8_hwsched_request(resp, (uint32_t)words, reply, &reply_words) ||
-					    !adreno8_hfi_reply(received_id, reply, reply_words)) {
-						printf("adreno8: START resource request %u failed (%d words)\n", received_id, words);
-						goto failed;
-					}
-					continue;
-				}
-				if (id == 10 && queue == 1) {
-					printf("adreno8: unexpected START response %#x (%d words)\n", resp[0], words);
-					goto failed;
-				}
-				if (notices++ < 8) {
-					printf("adreno8: %u: unhandled HFI header %#x (%d words)\n", adreno8_step, resp[0], words);
-				}
-			}
-		}
-		if ((irq & (1u << 15)) || (init & GMU_FW_FAILED)) {
-			printf("adreno8: %u: GMU fault during HFI: interrupt %#x init %#x\n", adreno8_step, irq, init);
-			break;
-		}
-		if (adreno8_gpu8_secure_mode == SECURE_MODE_TRANSLATION_B && adreno8_gpu_faulted()) {
-			printf("adreno8: HFI stopped after an address-space fault\n");
-			goto failed;
-		}
-		if (ack) {
-			return true;
-		}
+		if (!adreno8_hfi_pump(msg[0], &ack, &notices)) break;
+		if (ack) return true;
 		adreno8_sleep_us(100);
 	}
-failed:
 	adreno8_hwsched_memory_failed();
 	adreno8_gmu_post_mortem();
 	return false;

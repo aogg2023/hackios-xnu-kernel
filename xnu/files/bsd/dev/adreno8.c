@@ -25,6 +25,7 @@
  *  19  Leave secure mode
  *  20  GPU scratch write/read verification
  *  21  Fault, queue, power and counter diagnostics
+ *  22  Standard HWSCHED context: two non-privileged IBs, timestamps and unregister
  *
  * adreno8=N           execute steps 1..N
  * adreno8_only=K      execute only step K; its prerequisites must already exist in this kernel
@@ -330,7 +331,7 @@ adreno8_init(void)
 		adreno8_step_first_words, adreno8_step_gmu_memory, adreno8_step_smmu_read, adreno8_step_gmu_space, adreno8_step_firmware,
 		adreno8_step_gmu_start, adreno8_step_queues, adreno8_step_tables, adreno8_step_hwsched,
 		adreno8_step_gx_power, adreno8_gpu_memory_enable, adreno8_gpu_cp_init, adreno8_step_zap,
-		adreno8_step_secure_exit, adreno8_gpu_scratch_test, adreno8_step_last_look
+		adreno8_step_secure_exit, adreno8_gpu_scratch_test, adreno8_step_last_look, adreno8_context_test
 	};
 	const unsigned count = sizeof(each) / sizeof(each[0]);
 	uint32_t asked = 0, only = 0, one = 0, completed = 0;

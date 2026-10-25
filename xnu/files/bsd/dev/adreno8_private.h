@@ -397,5 +397,7 @@ bool
 adreno8_step_gx_power(void);
 bool
 adreno8_step_last_look(void);
+bool
+adreno8_context_test(void);
 
 #endif /* _DEV_ADRENO8_PRIVATE_H */

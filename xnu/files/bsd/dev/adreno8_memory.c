@@ -254,6 +254,17 @@ adreno8_gpu_alloc(const char *name, uint32_t size, uint32_t alignment, uint32_t 
 	return adreno8_memory_alloc(name, (uint32_t)rounded, alignment, prot, 0, false);
 }
 
+struct adreno8_memory *
+adreno8_gmu_alloc(const char *name, uint32_t size, uint32_t alignment, uint32_t prot)
+{
+	uint64_t rounded = ((uint64_t)size + MEMORY_GRANULE - 1) & ~(uint64_t)(MEMORY_GRANULE - 1);
+
+	if (size == 0 || rounded > MEMORY_BLOCK_LIMIT || prot == 0) {
+		return NULL;
+	}
+	return adreno8_memory_alloc(name, (uint32_t)rounded, alignment, 0, prot, false);
+}
+
 bool
 adreno8_gpu_memory_ready(void)
 {

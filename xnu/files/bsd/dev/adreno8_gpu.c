@@ -12,6 +12,7 @@
 #include "adreno8_memory_private.h"
 #include "adreno8_hwsched_private.h"
 #include "adreno8_gpu_private.h"
+#include "adreno8_context_private.h"
 
 #define printf adreno8_say
 #define A8_COUNT(a) (sizeof(a) / sizeof((a)[0]))
@@ -427,4 +428,16 @@ adreno8_gpu_scratch_test(void)
 	gpu_state = GPU_TESTED;
 	printf("adreno8: GPU CP wrote %#x to scratch; idle and SMMU checks passed; OOB and resources held until cold reset\n", expected);
 	return true;
+}
+
+bool
+adreno8_gpu_commands_ready(void)
+{
+	return gpu_state == GPU_TESTED && gpu_status_ok();
+}
+
+bool
+adreno8_gpu_wait_idle(const char *what)
+{
+	return gpu_state == GPU_TESTED && gpu_wait_idle(what);
 }

@@ -344,6 +344,16 @@ gpu_register_config(void)
 {
 	if (!gpu_aperture(0))
 		return false;
+	/* a8xx hw_init releases CX and GX halts before configuring the core. */
+	if (adreno8_direct_ring) {
+		const uint32_t release[] = { GEN8_GBIF_HALT, GEN8_RBBM_GBIF_HALT };
+		for (unsigned i = 0; i < A8_COUNT(release); i++) {
+			gpu_write(release[i], 0);
+			adreno8_settle();
+			if (gpu_read(release[i]) != 0)
+				return gpu_fail("ordinary GBIF halt release readback");
+		}
+	}
 	/* Polling owns error handling during this cold-reset experiment. */
 	gpu_write(GEN8_RBBM_INT_0_MASK, 0);
 	gpu_write(GEN8_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);

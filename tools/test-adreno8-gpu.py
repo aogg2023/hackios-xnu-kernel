@@ -197,6 +197,7 @@ static uint32_t ring_fault, ring_bv, ring_bv_shadow, ring_rbbm, ring_fence_extra
 static const uint32_t ring_setup_regs[] = {0x800,0x801,0x802,0x804,0x805,0x808,0x809};
 static unsigned ring_sqe_writes, ring_setup_fault_at, ring_setup_fault;
 static unsigned ring_halt_reads;
+static unsigned ring_halt_clears, ring_halt_drop, ring_halt_observe_fault;
 static const uint32_t halt_regs[]={0x3c45,0x3c46,0x00a,0x00b};
 
 static void ring_setup_wait(void)
@@ -219,6 +220,9 @@ uint32_t adreno8_rd(vm_offset_t address)
     assert(last_mmio != MMIO_READ);
     if (adreno8_direct_ring && address == adreno8_gmu.base + GMU_AHB_FENCE_STATUS)
         assert(last_mmio == MMIO_BARRIER);
+    if (adreno8_direct_ring && ring_setup_read_mask!=127 &&
+        (address==adreno8_gpu.base+4*0x3c45 || address==adreno8_gpu.base+4*0x00a))
+        assert(last_mmio==MMIO_BARRIER);
     last_mmio = MMIO_READ;
     if (address >= adreno8_gmu.base && address < adreno8_gmu.base + adreno8_gmu.size) {
         gmu_reads++;
@@ -230,8 +234,9 @@ uint32_t adreno8_rd(vm_offset_t address)
     uint32_t reg = (address - adreno8_gpu.base) / 4;
     if (adreno8_direct_ring) {
         for(unsigned i=0;i<4;i++) if(reg==halt_regs[i]) {
-            assert(ring_setup_read_mask==127); ring_halt_reads++;
+            if(ring_setup_read_mask==127) ring_halt_reads++;
         }
+        if(reg==ring_halt_observe_fault && ring_setup_read_mask==127) return UINT32_MAX;
         if (reg == ring_read_fault) return UINT32_MAX;
         for (unsigned i=0;i<7;i++) if (reg == ring_setup_regs[i]) ring_setup_read_mask |= 1u<<i;
     }
@@ -261,7 +266,12 @@ void adreno8_wr(vm_offset_t address, uint32_t value)
     uint32_t reg = (address - adreno8_gpu.base) / 4;
     if (adreno8_direct_ring) {
         assert(!raw_calls);
-        for(unsigned i=0;i<4;i++) assert(reg!=halt_regs[i]);
+        for(unsigned i=0;i<4;i++) if(reg==halt_regs[i]) {
+            assert(!(i&1) && value==0 && ring_halt_clears==(i?1u:0u));
+            ring_halt_clears |= i?2:1;
+            if(reg==ring_halt_drop) return;
+        }
+        if(reg!=0x81c && reg!=0x3c45 && reg!=0x00a) assert(ring_halt_clears==3);
         if (reg == 0x81c) assert(value != 3u<<12);
         if (reg == 0x84d) assert(value == (current_pipe == 1 ? 0x6f : 0xf));
         if (reg >= 0xf800 && reg <= 0xf803) assert(value == 0);
@@ -464,7 +474,7 @@ static void reset(void)
     ring_bv=ring_bv_shadow=ring_rbbm=ring_fence_extra=0;
     ordinary_ok=poll_ok=gmu_smmu_ok=ring_rptr_moves=ring_shadow_moves=ring_alloc_ok=true;
     ring_sqe_writes=ring_setup_fault_at=ring_setup_fault=ring_setup_completed=0;
-    ring_halt_reads=0;
+    ring_halt_reads=ring_halt_clears=ring_halt_drop=ring_halt_observe_fault=0;
     setup_waits = 0;
     diagnostic_reads = diagnostic_writes = diagnostic_offset = 0;
     last_mmio = MMIO_NONE; barriers = gmu_reads = gmu_writes = 0;
@@ -625,8 +635,8 @@ static void check_ring_setup_only(void)
     assert(!adreno8_gpu_cp_init()); ring_retained(0);
     assert(setup_waits==100 && ring_setup_completed==1);
     assert(ring_input_mask==7 && ring_setup_read_mask==127);
-    assert(ring_halt_reads==4 && gpu_regs[0][0x3c45]==8 && gpu_regs[0][0x3c46]==3);
-    assert(gpu_regs[0][0x00a]==1 && gpu_regs[0][0x00b]==1);
+    assert(ring_halt_reads==4 && gpu_regs[0][0x3c45]==0 && gpu_regs[0][0x3c46]==3);
+    assert(gpu_regs[0][0x00a]==0 && gpu_regs[0][0x00b]==1);
     assert(!ring_sqe_writes && !ring_wptr_writes && !ring_payloads);
     for(unsigned fault=1;fault<=4;fault++) for(unsigned at=1;at<=100;at+=99) {
         prepare_ring(); raw_nop_asked=3; ring_setup_fault=fault; ring_setup_fault_at=at;
@@ -637,7 +647,7 @@ static void check_ring_setup_only(void)
     assert(!adreno8_gpu_cp_init()); ring_retained(0);
     assert(!setup_waits && !ring_setup_completed && !ring_sqe_writes && !ring_wptr_writes);
     for(unsigned i=0;i<4;i++) {
-        prepare_ring(); raw_nop_asked=3; ring_read_fault=halt_regs[i];
+        prepare_ring(); raw_nop_asked=3; ring_halt_observe_fault=halt_regs[i];
         assert(!adreno8_gpu_cp_init()); ring_retained(0);
         assert(ring_halt_reads==i+1 && !setup_waits && !ring_sqe_writes && !ring_wptr_writes);
     }
@@ -807,157 +817,158 @@ int main(int argc, char **argv)
 }
 '''
 
-with tempfile.TemporaryDirectory(prefix="adreno8-gpu-test-") as temp:
-    cfile = Path(temp) / "gpu.c"
-    cfile.write_text(source)
-    for page in (4096, 16384):
-        binary = Path(temp) / f"gpu-{page}"
-        subprocess.run(["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
-                        f"-DPAGE_SIZE={page}", "-I", str(DEV), str(cfile), "-o", str(binary)], check=True)
-        subprocess.run([str(binary), str(args.firmware_dir / "gen80000_sqe.fw"),
-                        str(args.firmware_dir / "gen80000_aqe.fw")], check=True)
-
-    production = (DEV / "adreno8_gpu.c").read_text()
-    variants = {}
-    for function in ("gpu_read", "gpu_write", "gpu_gmu_read", "gpu_gmu_write"):
-        start = production.index(function + "(")
-        end = production.index("\n}\n", start) + 3
-        body = production[start:end]
-        without = body.replace("\tadreno8_settle();\n", "", 1)
-        variants[function + "_missing_barrier"] = production[:start] + without + production[end:]
-        if function in ("gpu_read", "gpu_gmu_read"):
-            needle = "\tuint32_t value;\n" if function == "gpu_read" else "\tuint32_t value ="
-            moved = without.replace(needle, "\tadreno8_settle();\n" + needle, 1)
-        elif function == "gpu_write":
-            moved = without[:-2] + "\tadreno8_settle();\n}\n"
-        else:
-            moved = without.replace("\tadreno8_wr(adreno8_gmu.base + offset, value);",
-                "\tadreno8_wr(adreno8_gmu.base + offset, value);\n\tadreno8_settle();", 1)
-        variants[function + "_barrier_wrong_side"] = production[:start] + moved + production[end:]
-    checks = [(name, mutated, None) for name, mutated in variants.items()]
-    private = (DEV / "adreno8_gpu_private.h").read_text()
-    tpl1_entry = "{ GEN8_TPL1_DBG_ECO_CNTL, 0x10000000, A8_BIT(A8_PIPE_NONE) }"
-    assert private.count(tpl1_entry) == 1
-    checks.append(("tpl1_bit20_restored", production,
-                   private.replace(tpl1_entry, tpl1_entry.replace("0x10000000", "0x10100000"))))
-    for name, before, after in (
-        ("tpl1_startup_bit20", "gpu_write(a8_noncontext[i].reg, a8_noncontext[i].value);",
-         "gpu_write(a8_noncontext[i].reg, a8_noncontext[i].value | (a8_noncontext[i].reg == 0xb600 ? 1u << 20 : 0));"),
-        ("tpl1_powerup_bit20", "words[at++] = gpu_read(a8_powerup_ifpc[i]);",
-         "words[at++] = gpu_read(a8_powerup_ifpc[i]) | (a8_powerup_ifpc[i] == 0xb600 ? 1u << 20 : 0);"),
-    ):
-        assert production.count(before) == 1, name
-        checks.append((name, production.replace(before, after), None))
-    empty_variants = [
-        ("empty-not-cleared", "memset((void *)powerup->memory, 0, powerup->size);", ""),
-        ("empty-partial-clear", "memset((void *)powerup->memory, 0, powerup->size);",
-         "memset((void *)powerup->memory, 0, 64);"),
-        ("empty-wrong-buffer", "memset((void *)powerup->memory, 0, powerup->size);",
-         "memset((void *)scratch->memory, 0, scratch->size);"),
-        ("empty-not-published", "if (!adreno8_memory_publish(powerup, 0, powerup->size))", "if (false)"),
-        ("empty-partial-publish", "if (!adreno8_memory_publish(powerup, 0, powerup->size))",
-         "if (!adreno8_memory_publish(powerup, 0, 64))"),
-        ("empty-publish-failure-ignored", "if (!adreno8_memory_publish(powerup, 0, powerup->size))",
-         "if ((void)adreno8_memory_publish(powerup, 0, powerup->size), false)"),
-        ("empty-wrong-IOVA", "adreno8_pm4_cp_init(words, A8_COUNT(words), powerup->gpu_address)",
-         "adreno8_pm4_cp_init(words, A8_COUNT(words), scratch->gpu_address)"),
-        ("empty-omitted-original-config", "!gpu_oob_get() || !gpu_register_config() ||",
-         "!gpu_oob_get() || (!empty_powerup && !gpu_register_config()) ||"),
-        ("empty-promoted-ready", '\tif (empty_powerup)\n\t\treturn gpu_fail("empty powerup diagnostic acknowledged and idle; stop");', ""),
-        ("empty-value-guard", "empty_powerup != 1 || ", ""),
-        ("empty-step-guard", "adreno8_step != 17 || ", ""),
-        ("empty-limit-guard", "adreno8_newest_step != 17 ||", ""),
-        ("empty-keep-guard", "!adreno8_gpu8_keep || ", ""),
-        ("empty-return-guard", "adreno8_gpu8_return || ", ""),
-        ("empty-skip-guard", "adreno8_skip_steps != 0 || ", ""),
-        ("empty-NOP-guard", "|| raw_nop != 0", ""),
-    ]
-    cp_source = production[production.index("\nbool\nadreno8_gpu_cp_init("):production.index("\nbool\nadreno8_gpu_cp_ready(")]
-    for name, before, after in empty_variants:
-        assert before in cp_source, name
-        changed = cp_source.replace(before, after, 1)
-        checks.append((name, production.replace(cp_source, changed, 1), None))
-    ring_variants = [
-        ("ring-size", '"direct ring", 32768, 4096', '"direct ring", 4096, 4096'),
-        ("ring-write-permission", '32768, 4096, ADRENO8_MEM_READ | ADRENO8_MEM_PRIV',
-         '32768, 4096, ADRENO8_MEM_READ | ADRENO8_MEM_WRITE | ADRENO8_MEM_PRIV'),
-        ("ring-zero", 'memset((void *)ring->memory, 0, ring->size);', ''),
-        ("ring-initial-publication", '!adreno8_memory_publish(ring, 0, ring->size)', 'false'),
-        ("ring-shadow-publication", '!adreno8_memory_publish(scratch, 0, scratch->size)', 'false'),
-        ("ring-powerup-publication", '!adreno8_memory_publish(powerup, 0, powerup->size)', 'false'),
-        ("ring-control", '{ GEN8_CP_RB_CNTL_GC, 0x20c }', '{ GEN8_CP_RB_CNTL_GC, 0x30c }'),
-        ("ring-BV-shadow-offset", 'scratch->gpu_address + 8', 'scratch->gpu_address + 4'),
-        ("ring-readback", 'if (gpu_read(setup[i].reg) != setup[i].value)', 'if (false)'),
-        ("ring-SQE-readback", 'if (gpu_read(GEN8_CP_SQE_CNTL) != 1)', 'if (false)'),
-        ("ring-command-publication", '!adreno8_memory_publish(ring, 0, count * 4)', 'false'),
-        ("ring-fence-mask", 'if (!(fence & 1u))', 'if (!(fence & 2u))'),
-        ("ring-fence-bound", 'i < 200; i++', 'i < 201; i++'),
-        ("ring-HFI-health", '!adreno8_hfi_poll() || !gpu_status_ok()', '!gpu_status_ok()'),
-        ("ring-RPTR-completion", 'rptr == count && br_shadow == count', 'br_shadow == count'),
-        ("ring-shadow-completion", 'rptr == count && br_shadow == count', 'rptr == count'),
-        ("ring-BV-too-strict", 'rptr == count && br_shadow == count', 'rptr == count && br_shadow == count && bv == count'),
-        ("ring-GMU-idle", '!(gpu_gmu_read(GMU(GEN8_GMUAO_GPU_CX_BUSY_STATUS)) & (1u << 23))', 'true'),
-        ("ring-RBBM-idle", '!(gpu_read(GEN8_RBBM_STATUS) & ~1u)', 'true'),
-        ("ring-ready-promotion", 'return gpu_fail("direct ring diagnostic complete; stop");', 'gpu_state=GPU_CP_READY; return true;'),
-        ("ring-LPAC", 'if (adreno8_direct_ring && pipe == A8_PIPE_LPAC)', 'if (false)'),
-        ("ring-trusted-range", 'adreno8_direct_ring ? 0 : ADRENO8_SECURE_IOVA_START', 'ADRENO8_SECURE_IOVA_START'),
-    ]
-    ring_body = re.search(r"static bool\ngpu_direct_ring_init\(.*?\n}", production, re.S)[0]
-    for name, before, after in ring_variants:
-        owner = ring_body if before in ring_body else production
-        assert before in owner, name
-        checks.append((name, production.replace(owner, owner.replace(before, after, 1), 1), None))
-    for name, before, after in (
-        ("ring-cold-indices", 'if (gpu_read(GEN8_CP_RB_RPTR_BR) != 0 || gpu_read(GEN8_CP_RB_WPTR_GC) != 0)', 'if (false)'),
-        ("ring-WPTR-value", 'if (!gpu_ring_wptr(count))', 'if (!gpu_ring_wptr(count + 1))'),
-    ):
-        assert before in production, name
-        checks.append((name, production.replace(before, after, 1), None))
-    fenced = re.search(r"static bool\ngpu_ring_wptr\(.*?\n}", production, re.S)[0]
-    missing_barrier = fenced.replace('adreno8_wr(adreno8_gpu.base + 4u * GEN8_CP_RB_WPTR_GC, value);\n\t\tadreno8_settle();',
-                                     'adreno8_wr(adreno8_gpu.base + 4u * GEN8_CP_RB_WPTR_GC, value);')
-    assert missing_barrier != fenced
-    checks.append(("ring-WPTR-post-barrier", production.replace(fenced, missing_barrier, 1), None))
-    hwcg = re.search(r"static bool\ngpu_hwcg\(.*?\n}", production, re.S)[0]
-    checks.append(("ring-HWCG-enabled", production.replace(hwcg, hwcg.replace('if (adreno8_direct_ring)', 'if (false)', 1), 1), None))
-    setup_only = re.search(r"\tif \(setup_only\) \{.*?\n\t}", ring_body, re.S)[0]
-    setup_mutations = [
-        ("setup-dispatch", 'gpu_direct_ring_init(raw_nop == 3)', 'gpu_direct_ring_init(false)'),
-        ("setup-SQE-started", 'if (setup_only) {', 'if (setup_only) { gpu_write(GEN8_CP_SQE_CNTL,1);'),
-        ("setup-window-short", 'i < 100; i++', 'i < 99; i++'),
-        ("setup-HFI-health", '!adreno8_hfi_poll() || !gpu_status_ok()', '!gpu_status_ok()'),
-        ("setup-CP-health", '!adreno8_hfi_poll() || !gpu_status_ok()', '!adreno8_hfi_poll()'),
-        ("setup-ready", 'return gpu_fail("ordinary setup-only diagnostic stop");', 'gpu_state=GPU_CP_READY; return true;'),
-        ("setup-mode-guard", '(raw_nop != 0 && raw_nop != 3)', 'false'),
-        ("setup-halt-read-missing", 'i < A8_COUNT(halt); i++', 'i < A8_COUNT(halt)-1; i++'),
-        ("setup-halt-all1", 'if (value == 0xffffffffu)', 'if (false)'),
-        ("setup-halt-cleared", 'uint32_t value = gpu_read(halt[i]);', 'gpu_write(halt[i],0); uint32_t value = gpu_read(halt[i]);'),
-    ]
-    for name,before,after in setup_mutations:
-        owner=setup_only if before in setup_only else production
-        assert before in owner,name
-        checks.append((name,production.replace(owner,owner.replace(before,after,1),1),None))
-    final_check = setup_only.replace('\t\t\tadreno8_sleep_us(100000);\n','').replace(
-        '\t\t\t\treturn gpu_fail("ordinary setup-only HFI or GPU fault");',
-        '\t\t\t\treturn gpu_fail("ordinary setup-only HFI or GPU fault");\n\t\t\tadreno8_sleep_us(100000);')
-    checks.append(("setup-final-check",production.replace(setup_only,final_check,1),None))
-    for name, mutated, mutated_header in checks:
-        assert mutated != production or (mutated_header is not None and mutated_header != private), name
-        variant = Path(temp) / name
-        variant.mkdir()
-        (variant / "adreno8_gpu.c").write_text(mutated)
-        if mutated_header is not None:
-            (variant / "adreno8_gpu_private.h").write_text(mutated_header)
-        (variant / "gpu.c").write_text(source)
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory(prefix="adreno8-gpu-test-") as temp:
+        cfile = Path(temp) / "gpu.c"
+        cfile.write_text(source)
         for page in (4096, 16384):
-            binary = variant / f"gpu-{page}"
+            binary = Path(temp) / f"gpu-{page}"
             subprocess.run(["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
-                            f"-DPAGE_SIZE={page}", "-I", str(DEV), str(variant / "gpu.c"), "-o", str(binary)], check=True)
-            result = subprocess.run([str(binary), str(args.firmware_dir / "gen80000_sqe.fw"),
-                                     str(args.firmware_dir / "gen80000_aqe.fw")], capture_output=True, text=True)
-            assert result.returncode != 0 and "assert" in result.stderr.lower(), (name, page, result.stderr)
-    print(f"GPU MMIO barrier mutations rejected: {len(variants)} variants x 2 page sizes")
-    print("GPU TPL1 catalog/startup/powerup mutations rejected: 3 variants x 2 page sizes")
-    print(f"GPU empty powerup mutations rejected: {len(empty_variants)} variants x 2 page sizes")
-    print(f"GPU ordinary ring mutations rejected: {len(ring_variants) + 4} variants x 2 page sizes")
-    print(f"GPU ordinary setup-only mutations rejected: {len(setup_mutations) + 1} variants x 2 page sizes")
+                            f"-DPAGE_SIZE={page}", "-I", str(DEV), str(cfile), "-o", str(binary)], check=True)
+            subprocess.run([str(binary), str(args.firmware_dir / "gen80000_sqe.fw"),
+                            str(args.firmware_dir / "gen80000_aqe.fw")], check=True)
+
+        production = (DEV / "adreno8_gpu.c").read_text()
+        variants = {}
+        for function in ("gpu_read", "gpu_write", "gpu_gmu_read", "gpu_gmu_write"):
+            start = production.index(function + "(")
+            end = production.index("\n}\n", start) + 3
+            body = production[start:end]
+            without = body.replace("\tadreno8_settle();\n", "", 1)
+            variants[function + "_missing_barrier"] = production[:start] + without + production[end:]
+            if function in ("gpu_read", "gpu_gmu_read"):
+                needle = "\tuint32_t value;\n" if function == "gpu_read" else "\tuint32_t value ="
+                moved = without.replace(needle, "\tadreno8_settle();\n" + needle, 1)
+            elif function == "gpu_write":
+                moved = without[:-2] + "\tadreno8_settle();\n}\n"
+            else:
+                moved = without.replace("\tadreno8_wr(adreno8_gmu.base + offset, value);",
+                    "\tadreno8_wr(adreno8_gmu.base + offset, value);\n\tadreno8_settle();", 1)
+            variants[function + "_barrier_wrong_side"] = production[:start] + moved + production[end:]
+        checks = [(name, mutated, None) for name, mutated in variants.items()]
+        private = (DEV / "adreno8_gpu_private.h").read_text()
+        tpl1_entry = "{ GEN8_TPL1_DBG_ECO_CNTL, 0x10000000, A8_BIT(A8_PIPE_NONE) }"
+        assert private.count(tpl1_entry) == 1
+        checks.append(("tpl1_bit20_restored", production,
+                       private.replace(tpl1_entry, tpl1_entry.replace("0x10000000", "0x10100000"))))
+        for name, before, after in (
+            ("tpl1_startup_bit20", "gpu_write(a8_noncontext[i].reg, a8_noncontext[i].value);",
+             "gpu_write(a8_noncontext[i].reg, a8_noncontext[i].value | (a8_noncontext[i].reg == 0xb600 ? 1u << 20 : 0));"),
+            ("tpl1_powerup_bit20", "words[at++] = gpu_read(a8_powerup_ifpc[i]);",
+             "words[at++] = gpu_read(a8_powerup_ifpc[i]) | (a8_powerup_ifpc[i] == 0xb600 ? 1u << 20 : 0);"),
+        ):
+            assert production.count(before) == 1, name
+            checks.append((name, production.replace(before, after), None))
+        empty_variants = [
+            ("empty-not-cleared", "memset((void *)powerup->memory, 0, powerup->size);", ""),
+            ("empty-partial-clear", "memset((void *)powerup->memory, 0, powerup->size);",
+             "memset((void *)powerup->memory, 0, 64);"),
+            ("empty-wrong-buffer", "memset((void *)powerup->memory, 0, powerup->size);",
+             "memset((void *)scratch->memory, 0, scratch->size);"),
+            ("empty-not-published", "if (!adreno8_memory_publish(powerup, 0, powerup->size))", "if (false)"),
+            ("empty-partial-publish", "if (!adreno8_memory_publish(powerup, 0, powerup->size))",
+             "if (!adreno8_memory_publish(powerup, 0, 64))"),
+            ("empty-publish-failure-ignored", "if (!adreno8_memory_publish(powerup, 0, powerup->size))",
+             "if ((void)adreno8_memory_publish(powerup, 0, powerup->size), false)"),
+            ("empty-wrong-IOVA", "adreno8_pm4_cp_init(words, A8_COUNT(words), powerup->gpu_address)",
+             "adreno8_pm4_cp_init(words, A8_COUNT(words), scratch->gpu_address)"),
+            ("empty-omitted-original-config", "!gpu_oob_get() || !gpu_register_config() ||",
+             "!gpu_oob_get() || (!empty_powerup && !gpu_register_config()) ||"),
+            ("empty-promoted-ready", '\tif (empty_powerup)\n\t\treturn gpu_fail("empty powerup diagnostic acknowledged and idle; stop");', ""),
+            ("empty-value-guard", "empty_powerup != 1 || ", ""),
+            ("empty-step-guard", "adreno8_step != 17 || ", ""),
+            ("empty-limit-guard", "adreno8_newest_step != 17 ||", ""),
+            ("empty-keep-guard", "!adreno8_gpu8_keep || ", ""),
+            ("empty-return-guard", "adreno8_gpu8_return || ", ""),
+            ("empty-skip-guard", "adreno8_skip_steps != 0 || ", ""),
+            ("empty-NOP-guard", "|| raw_nop != 0", ""),
+        ]
+        cp_source = production[production.index("\nbool\nadreno8_gpu_cp_init("):production.index("\nbool\nadreno8_gpu_cp_ready(")]
+        for name, before, after in empty_variants:
+            assert before in cp_source, name
+            changed = cp_source.replace(before, after, 1)
+            checks.append((name, production.replace(cp_source, changed, 1), None))
+        ring_variants = [
+            ("ring-size", '"direct ring", 32768, 4096', '"direct ring", 4096, 4096'),
+            ("ring-write-permission", '32768, 4096, ADRENO8_MEM_READ | ADRENO8_MEM_PRIV',
+             '32768, 4096, ADRENO8_MEM_READ | ADRENO8_MEM_WRITE | ADRENO8_MEM_PRIV'),
+            ("ring-zero", 'memset((void *)ring->memory, 0, ring->size);', ''),
+            ("ring-initial-publication", '!adreno8_memory_publish(ring, 0, ring->size)', 'false'),
+            ("ring-shadow-publication", '!adreno8_memory_publish(scratch, 0, scratch->size)', 'false'),
+            ("ring-powerup-publication", '!adreno8_memory_publish(powerup, 0, powerup->size)', 'false'),
+            ("ring-control", '{ GEN8_CP_RB_CNTL_GC, 0x20c }', '{ GEN8_CP_RB_CNTL_GC, 0x30c }'),
+            ("ring-BV-shadow-offset", 'scratch->gpu_address + 8', 'scratch->gpu_address + 4'),
+            ("ring-readback", 'if (gpu_read(setup[i].reg) != setup[i].value)', 'if (false)'),
+            ("ring-SQE-readback", 'if (gpu_read(GEN8_CP_SQE_CNTL) != 1)', 'if (false)'),
+            ("ring-command-publication", '!adreno8_memory_publish(ring, 0, count * 4)', 'false'),
+            ("ring-fence-mask", 'if (!(fence & 1u))', 'if (!(fence & 2u))'),
+            ("ring-fence-bound", 'i < 200; i++', 'i < 201; i++'),
+            ("ring-HFI-health", '!adreno8_hfi_poll() || !gpu_status_ok()', '!gpu_status_ok()'),
+            ("ring-RPTR-completion", 'rptr == count && br_shadow == count', 'br_shadow == count'),
+            ("ring-shadow-completion", 'rptr == count && br_shadow == count', 'rptr == count'),
+            ("ring-BV-too-strict", 'rptr == count && br_shadow == count', 'rptr == count && br_shadow == count && bv == count'),
+            ("ring-GMU-idle", '!(gpu_gmu_read(GMU(GEN8_GMUAO_GPU_CX_BUSY_STATUS)) & (1u << 23))', 'true'),
+            ("ring-RBBM-idle", '!(gpu_read(GEN8_RBBM_STATUS) & ~1u)', 'true'),
+            ("ring-ready-promotion", 'return gpu_fail("direct ring diagnostic complete; stop");', 'gpu_state=GPU_CP_READY; return true;'),
+            ("ring-LPAC", 'if (adreno8_direct_ring && pipe == A8_PIPE_LPAC)', 'if (false)'),
+            ("ring-trusted-range", 'adreno8_direct_ring ? 0 : ADRENO8_SECURE_IOVA_START', 'ADRENO8_SECURE_IOVA_START'),
+        ]
+        ring_body = re.search(r"static bool\ngpu_direct_ring_init\(.*?\n}", production, re.S)[0]
+        for name, before, after in ring_variants:
+            owner = ring_body if before in ring_body else production
+            assert before in owner, name
+            checks.append((name, production.replace(owner, owner.replace(before, after, 1), 1), None))
+        for name, before, after in (
+            ("ring-cold-indices", 'if (gpu_read(GEN8_CP_RB_RPTR_BR) != 0 || gpu_read(GEN8_CP_RB_WPTR_GC) != 0)', 'if (false)'),
+            ("ring-WPTR-value", 'if (!gpu_ring_wptr(count))', 'if (!gpu_ring_wptr(count + 1))'),
+        ):
+            assert before in production, name
+            checks.append((name, production.replace(before, after, 1), None))
+        fenced = re.search(r"static bool\ngpu_ring_wptr\(.*?\n}", production, re.S)[0]
+        missing_barrier = fenced.replace('adreno8_wr(adreno8_gpu.base + 4u * GEN8_CP_RB_WPTR_GC, value);\n\t\tadreno8_settle();',
+                                         'adreno8_wr(adreno8_gpu.base + 4u * GEN8_CP_RB_WPTR_GC, value);')
+        assert missing_barrier != fenced
+        checks.append(("ring-WPTR-post-barrier", production.replace(fenced, missing_barrier, 1), None))
+        hwcg = re.search(r"static bool\ngpu_hwcg\(.*?\n}", production, re.S)[0]
+        checks.append(("ring-HWCG-enabled", production.replace(hwcg, hwcg.replace('if (adreno8_direct_ring)', 'if (false)', 1), 1), None))
+        setup_only = re.search(r"\tif \(setup_only\) \{.*?\n\t}", ring_body, re.S)[0]
+        setup_mutations = [
+            ("setup-dispatch", 'gpu_direct_ring_init(raw_nop == 3)', 'gpu_direct_ring_init(false)'),
+            ("setup-SQE-started", 'if (setup_only) {', 'if (setup_only) { gpu_write(GEN8_CP_SQE_CNTL,1);'),
+            ("setup-window-short", 'i < 100; i++', 'i < 99; i++'),
+            ("setup-HFI-health", '!adreno8_hfi_poll() || !gpu_status_ok()', '!gpu_status_ok()'),
+            ("setup-CP-health", '!adreno8_hfi_poll() || !gpu_status_ok()', '!adreno8_hfi_poll()'),
+            ("setup-ready", 'return gpu_fail("ordinary setup-only diagnostic stop");', 'gpu_state=GPU_CP_READY; return true;'),
+            ("setup-mode-guard", '(raw_nop != 0 && raw_nop != 3)', 'false'),
+            ("setup-halt-read-missing", 'i < A8_COUNT(halt); i++', 'i < A8_COUNT(halt)-1; i++'),
+            ("setup-halt-all1", 'if (value == 0xffffffffu)', 'if (false)'),
+            ("setup-halt-cleared", 'uint32_t value = gpu_read(halt[i]);', 'gpu_write(halt[i],0); uint32_t value = gpu_read(halt[i]);'),
+        ]
+        for name,before,after in setup_mutations:
+            owner=setup_only if before in setup_only else production
+            assert before in owner,name
+            checks.append((name,production.replace(owner,owner.replace(before,after,1),1),None))
+        final_check = setup_only.replace('\t\t\tadreno8_sleep_us(100000);\n','').replace(
+            '\t\t\t\treturn gpu_fail("ordinary setup-only HFI or GPU fault");',
+            '\t\t\t\treturn gpu_fail("ordinary setup-only HFI or GPU fault");\n\t\t\tadreno8_sleep_us(100000);')
+        checks.append(("setup-final-check",production.replace(setup_only,final_check,1),None))
+        for name, mutated, mutated_header in checks:
+            assert mutated != production or (mutated_header is not None and mutated_header != private), name
+            variant = Path(temp) / name
+            variant.mkdir()
+            (variant / "adreno8_gpu.c").write_text(mutated)
+            if mutated_header is not None:
+                (variant / "adreno8_gpu_private.h").write_text(mutated_header)
+            (variant / "gpu.c").write_text(source)
+            for page in (4096, 16384):
+                binary = variant / f"gpu-{page}"
+                subprocess.run(["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
+                                f"-DPAGE_SIZE={page}", "-I", str(DEV), str(variant / "gpu.c"), "-o", str(binary)], check=True)
+                result = subprocess.run([str(binary), str(args.firmware_dir / "gen80000_sqe.fw"),
+                                         str(args.firmware_dir / "gen80000_aqe.fw")], capture_output=True, text=True)
+                assert result.returncode != 0 and "assert" in result.stderr.lower(), (name, page, result.stderr)
+        print(f"GPU MMIO barrier mutations rejected: {len(variants)} variants x 2 page sizes")
+        print("GPU TPL1 catalog/startup/powerup mutations rejected: 3 variants x 2 page sizes")
+        print(f"GPU empty powerup mutations rejected: {len(empty_variants)} variants x 2 page sizes")
+        print(f"GPU ordinary ring mutations rejected: {len(ring_variants) + 4} variants x 2 page sizes")
+        print(f"GPU ordinary setup-only mutations rejected: {len(setup_mutations) + 1} variants x 2 page sizes")

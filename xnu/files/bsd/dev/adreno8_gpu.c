@@ -31,9 +31,13 @@ gpu_fail(const char *what)
 	return false;
 }
 
+/* gen8_start and kgsl_regmap_read/write at d50b305f7da9 use ordered readl/writel.
+ * Keep their before-write/after-read ordering for GPU and GMU/AO accesses;
+ * adreno8_settle supplies the stronger dsb sy in both diagnostic and direct paths. */
 static uint32_t
 gpu_read(uint32_t reg)
 {
+	uint32_t value;
 	if (gpu_state == GPU_FAILED)
 		return 0;
 	if (!adreno8_gpu.base || reg >= adreno8_gpu.size / sizeof(uint32_t)) {
@@ -41,8 +45,11 @@ gpu_read(uint32_t reg)
 		return 0;
 	}
 	if (adreno8_pause_ms && adreno8_step == adreno8_newest_step)
-		return adreno8_get(&adreno8_gpu, "command register", 4u * reg);
-	return adreno8_rd(adreno8_gpu.base + 4u * reg);
+		value = adreno8_get(&adreno8_gpu, "command register", 4u * reg);
+	else
+		value = adreno8_rd(adreno8_gpu.base + 4u * reg);
+	adreno8_settle();
+	return value;
 }
 
 static void
@@ -54,11 +61,26 @@ gpu_write(uint32_t reg, uint32_t value)
 		gpu_fail("register write outside mapped aperture");
 		return;
 	}
-	if (adreno8_pause_ms && adreno8_step == adreno8_newest_step) {
+	adreno8_settle();
+	if (adreno8_pause_ms && adreno8_step == adreno8_newest_step)
 		adreno8_put(&adreno8_gpu, "command register", 4u * reg, value);
-		return;
-	}
-	adreno8_wr(adreno8_gpu.base + 4u * reg, value);
+	else
+		adreno8_wr(adreno8_gpu.base + 4u * reg, value);
+}
+
+static uint32_t
+gpu_gmu_read(uint32_t offset)
+{
+	uint32_t value = adreno8_rd(adreno8_gmu.base + offset);
+	adreno8_settle();
+	return value;
+}
+
+static void
+gpu_gmu_write(uint32_t offset, uint32_t value)
+{
+	adreno8_settle();
+	adreno8_wr(adreno8_gmu.base + offset, value);
 }
 
 static bool
@@ -86,7 +108,7 @@ gpu_accessible(void)
 	if (gpu_state == GPU_FAILED || !oob_acked || !adreno8_hwsched_ready() ||
 	    !adreno8_gpu_memory_ready() || adreno8_gpu_faulted())
 		return false;
-	return GMU_PWR_GX_UP(adreno8_rd(adreno8_gmu.base + GMU_PWR_CLK_STATUS));
+	return GMU_PWR_GX_UP(gpu_gmu_read(GMU_PWR_CLK_STATUS));
 }
 
 static bool
@@ -112,7 +134,7 @@ gpu_wait_idle(const char *what)
 	for (unsigned i = 0; i < 2000; i++) {
 		if (!gpu_status_ok())
 			return false;
-		if (!(adreno8_rd(adreno8_gmu.base + GMU(GEN8_GMUAO_GPU_CX_BUSY_STATUS)) & (1u << 23)))
+		if (!(gpu_gmu_read(GMU(GEN8_GMUAO_GPU_CX_BUSY_STATUS)) & (1u << 23)))
 			return gpu_status_ok();
 		adreno8_sleep_us(100);
 	}
@@ -181,16 +203,16 @@ gpu_oob_get(void)
 	/* gen8_gmu_oob_set(oob_gpu): request bit 30, response bit 31. */
 	adreno8_reset_required = true;
 	oob_requested = true;
-	adreno8_wr(adreno8_gmu.base + GMU_HOST2GMU_SET, 1u << 30);
+	gpu_gmu_write(GMU_HOST2GMU_SET, 1u << 30);
 	adreno8_settle();
 	for (unsigned i = 0; i < 1000; i++) {
-		if (adreno8_rd(adreno8_gmu.base + GMU_GMU2HOST_INFO) & (1u << 31)) {
+		if (gpu_gmu_read(GMU_GMU2HOST_INFO) & (1u << 31)) {
 			oob_acked = true;
 			break;
 		}
 		adreno8_sleep_us(100);
 	}
-	adreno8_wr(adreno8_gmu.base + GMU_GMU2HOST_CLR, 1u << 31);
+	gpu_gmu_write(GMU_GMU2HOST_CLR, 1u << 31);
 	adreno8_settle();
 	if (!oob_acked || !gpu_accessible())
 		return gpu_fail("OOB acknowledgement or GX power");
@@ -236,7 +258,7 @@ gpu_hwcg(void)
 {
 	gpu_write(GEN8_RBBM_CGC_0_PC, 0x702);
 	for (unsigned i = 0; i < A8_COUNT(a8_ao_hwcg); i++)
-		adreno8_wr(adreno8_gmu.base + GMU(a8_ao_hwcg[i].reg), a8_ao_hwcg[i].value);
+		gpu_gmu_write(GMU(a8_ao_hwcg[i].reg), a8_ao_hwcg[i].value);
 	gpu_write(GEN8_RBBM_CLOCK_CNTL_GLOBAL, 1);
 	gpu_write(GEN8_RBBM_CGC_GLOBAL_LOAD_CMD, 1);
 	gpu_write(GEN8_RBBM_CGC_P2S_TRIG_CMD, 1);
@@ -314,7 +336,7 @@ gpu_register_config(void)
 	gpu_write(GEN8_UCHE_TRAP_BASE_HI, 0x1ffff);
 	gpu_write(GEN8_UCHE_WRITE_THRU_BASE_LO, 0xfffff000);
 	gpu_write(GEN8_UCHE_WRITE_THRU_BASE_HI, 0x1ffff);
-	adreno8_wr(adreno8_gmu.base + GMU(GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_1), 4);
+	gpu_gmu_write(GMU(GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_1), 4);
 	/* sun-gpu.dtsi: UBWC 5, min-access-length 32; gen8_0_0 highest_bank_bit 16. */
 	if (!gpu_pipe_write(2, GEN8_GRAS_NC_MODE_CNTL, 0x60) ||
 	    !gpu_pipe_write(1, GEN8_GRAS_NC_MODE_CNTL, 0x60) ||
@@ -330,10 +352,10 @@ gpu_register_config(void)
 		return false;
 	gpu_write(GEN8_RBBM_INTERFACE_HANG_INT_CNTL, 0x40cfffff);
 	gpu_write(GEN8_RBBM_SLICE_INTERFACE_HANG_INT_CNTL, 1u << 30);
-	adreno8_wr(adreno8_gmu.base + GMU(GEN8_GMUAO_GPU_CX_BUSY_MASK), 0xff000000);
-	uint32_t counter = adreno8_rd(adreno8_gmu.base + GMU(GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_0));
-	adreno8_wr(adreno8_gmu.base + GMU(GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_0), (counter & ~0xffu) | 0x20);
-	adreno8_wr(adreno8_gmu.base + GMU(GEN8_GMUCX_POWER_COUNTER_ENABLE), 1);
+	gpu_gmu_write(GMU(GEN8_GMUAO_GPU_CX_BUSY_MASK), 0xff000000);
+	uint32_t counter = gpu_gmu_read(GMU(GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_0));
+	gpu_gmu_write(GMU(GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_0), (counter & ~0xffu) | 0x20);
+	gpu_gmu_write(GMU(GEN8_GMUCX_POWER_COUNTER_ENABLE), 1);
 	if (!gpu_protect())
 		return false;
 	/* No LLCC slices are allocated; vendor LLCC helpers return in this case. */

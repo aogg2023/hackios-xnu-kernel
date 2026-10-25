@@ -98,7 +98,7 @@ uint32_t adreno8_rd(vm_offset_t);
 void adreno8_wr(vm_offset_t, uint32_t);
 uint32_t adreno8_get(struct adreno8_block *, const char *, uint32_t);
 void adreno8_put(struct adreno8_block *, const char *, uint32_t, uint32_t);
-void adreno8_settle(void) {}
+void adreno8_settle(void);
 void adreno8_hold(bool single_access) { (void)single_access; }
 void adreno8_sleep_us(uint32_t us) { (void)us; }
 const uint8_t *redwood_image_file(const char *, const char *, uint64_t *, int *);
@@ -109,6 +109,8 @@ static unsigned gx_reads, gx_writes, raw_calls, allocation_count, publish_count;
 static unsigned diagnostic_reads, diagnostic_writes;
 static uint32_t diagnostic_offset;
 static uint32_t max_gx_offset;
+static enum { MMIO_NONE, MMIO_BARRIER, MMIO_READ, MMIO_WRITE } last_mmio;
+static unsigned barriers, gmu_reads, gmu_writes;
 static bool smmu_ok = true, hfi_ok = true, oob_ok = true, clock_ok = true;
 static bool raw_ok = true, idle_ok = true, memory_on, smmu_after_raw, corrupt_scratch, acquire_ok = true;
 static struct adreno8_memory allocations[4];
@@ -116,10 +118,16 @@ static uint8_t *device_memory[4], *files[2];
 static uint64_t file_sizes[2];
 static uint32_t allocation_prot[4];
 
+void adreno8_settle(void) { last_mmio = MMIO_BARRIER; barriers++; }
+
 uint32_t adreno8_rd(vm_offset_t address)
 {
-    if (address >= adreno8_gmu.base && address < adreno8_gmu.base + adreno8_gmu.size)
+    assert(last_mmio != MMIO_READ);
+    last_mmio = MMIO_READ;
+    if (address >= adreno8_gmu.base && address < adreno8_gmu.base + adreno8_gmu.size) {
+        gmu_reads++;
         return gmu_regs[(address - adreno8_gmu.base) / 4];
+    }
     assert(address >= adreno8_gpu.base && address + 4 <= adreno8_gpu.base + adreno8_gpu.size && !(address & 3));
     gx_reads++;
     if (address - adreno8_gpu.base > max_gx_offset) max_gx_offset = address - adreno8_gpu.base;
@@ -131,7 +139,10 @@ uint32_t adreno8_rd(vm_offset_t address)
 
 void adreno8_wr(vm_offset_t address, uint32_t value)
 {
+    assert(last_mmio == MMIO_BARRIER);
+    last_mmio = MMIO_WRITE;
     if (address >= adreno8_gmu.base && address < adreno8_gmu.base + adreno8_gmu.size) {
+        gmu_writes++;
         uint32_t reg = (address - adreno8_gmu.base) / 4;
         gmu_regs[reg] = value;
         if (reg == GMU_HOST2GMU_SET / 4 && value == 1u << 30 && oob_ok) {
@@ -206,6 +217,7 @@ bool adreno8_hwsched_ready(void) { return hfi_ok; }
 bool adreno8_hwsched_raw(const uint32_t *pm4_words, uint32_t words, const char *name)
 {
     (void)name;
+    assert(last_mmio != MMIO_READ);
     assert(oob_requested && oob_acked && memory_on && adreno8_reset_required);
     raw_calls++;
     if (!raw_ok) return false;
@@ -247,6 +259,7 @@ bool adreno8_hwsched_raw(const uint32_t *pm4_words, uint32_t words, const char *
 
 static void reset(void)
 {
+    assert(last_mmio != MMIO_READ);
     for (unsigned i = 0; i < allocation_count; i++) { free((void *)allocations[i].memory); free(device_memory[i]); }
     memset(allocations, 0, sizeof(allocations)); memset(gpu_regs, 0, sizeof(gpu_regs)); memset(gmu_regs, 0, sizeof(gmu_regs));
     gpu_state = GPU_COLD; sqe = aqe = powerup = scratch = NULL; oob_requested = oob_acked = false;
@@ -254,6 +267,7 @@ static void reset(void)
     max_gx_offset = 0; adreno8_gpu.size = GPU_MAPPING_SIZE;
     adreno8_pause_ms = adreno8_step = adreno8_newest_step = 0;
     diagnostic_reads = diagnostic_writes = diagnostic_offset = 0;
+    last_mmio = MMIO_NONE; barriers = gmu_reads = gmu_writes = 0;
     smmu_ok = hfi_ok = oob_ok = clock_ok = raw_ok = idle_ok = acquire_ok = true;
     smmu_after_raw = corrupt_scratch = memory_on = adreno8_reset_required = false;
     gmu_regs[GMU_PWR_CLK_STATUS / 4] = 3;
@@ -318,11 +332,26 @@ int main(int argc, char **argv)
     assert(gpu_regs[0][GEN8_RBBM_SECVID_TSB_TRUSTED_SIZE] == 0xfffff000u);
     assert(max_gx_offset == 4 * GEN8_RBBM_SECVID_TSB_CNTL && max_gx_offset == 0x3e00c);
     assert(!diagnostic_reads && !diagnostic_writes);
+    assert(gmu_reads && gmu_writes && last_mmio == MMIO_BARRIER);
+
+    reset(); gpu_write(0, 1);
+    assert(last_mmio == MMIO_WRITE && barriers == 1);
+    assert(gpu_read(0) == 1 && last_mmio == MMIO_BARRIER && barriers == 2);
+    reset(); gpu_gmu_write(GMU(GEN8_GMUCX_POWER_COUNTER_ENABLE), 1);
+    assert(last_mmio == MMIO_WRITE && barriers == 1);
+    assert(gpu_gmu_read(GMU(GEN8_GMUCX_POWER_COUNTER_ENABLE)) == 1);
+    assert(last_mmio == MMIO_BARRIER && barriers == 2 && gmu_reads == 1 && gmu_writes == 1);
 
     reset(); adreno8_pause_ms = 100; adreno8_step = adreno8_newest_step = 17;
     gpu_write(GEN8_SP_HLSQ_GC_GMEM_RANGE_MIN_LO, 0x04000000);
+    assert(last_mmio == MMIO_WRITE && barriers == 1);
     assert(gpu_read(GEN8_SP_HLSQ_GC_GMEM_RANGE_MIN_LO) == 0x04000000);
+    assert(last_mmio == MMIO_BARRIER && barriers == 2);
     assert(diagnostic_reads == 1 && diagnostic_writes == 1 && diagnostic_offset == 0x2b840);
+    reset(); prepare(); adreno8_pause_ms = 100; adreno8_step = adreno8_newest_step = 17;
+    assert(adreno8_gpu_cp_init() && adreno8_gpu_secure_exit() && adreno8_gpu_scratch_test());
+    assert(diagnostic_reads == gx_reads && diagnostic_writes == gx_writes);
+    assert(gmu_reads && gmu_writes && last_mmio == MMIO_BARRIER);
     reset(); adreno8_pause_ms = 100; adreno8_step = 16; adreno8_newest_step = 17;
     gpu_write(0, 1); assert(gpu_read(0) == 1 && !diagnostic_reads && !diagnostic_writes);
     reset(); adreno8_step = adreno8_newest_step = 17;
@@ -370,7 +399,7 @@ int main(int argc, char **argv)
     reset(); prepare(); assert(adreno8_gpu_cp_init() && adreno8_gpu_secure_exit());
     acquire_ok = false; assert(!adreno8_gpu_scratch_test() && gpu_state == GPU_FAILED);
     reset(); free(files[0]); free(files[1]);
-    puts("gen8.0.0 vendor aperture/tables, bounded MMIO, PM4, firmware and startup failures passed");
+    puts("gen8.0.0 vendor aperture/tables, bounded ordered MMIO, PM4, firmware and startup failures passed");
     return 0;
 }
 '''
@@ -384,3 +413,35 @@ with tempfile.TemporaryDirectory(prefix="adreno8-gpu-test-") as temp:
                         f"-DPAGE_SIZE={page}", "-I", str(DEV), str(cfile), "-o", str(binary)], check=True)
         subprocess.run([str(binary), str(args.firmware_dir / "gen80000_sqe.fw"),
                         str(args.firmware_dir / "gen80000_aqe.fw")], check=True)
+
+    production = (DEV / "adreno8_gpu.c").read_text()
+    variants = {}
+    for function in ("gpu_read", "gpu_write", "gpu_gmu_read", "gpu_gmu_write"):
+        start = production.index(function + "(")
+        end = production.index("\n}\n", start) + 3
+        body = production[start:end]
+        without = body.replace("\tadreno8_settle();\n", "", 1)
+        variants[function + "_missing_barrier"] = production[:start] + without + production[end:]
+        if function in ("gpu_read", "gpu_gmu_read"):
+            needle = "\tuint32_t value;\n" if function == "gpu_read" else "\tuint32_t value ="
+            moved = without.replace(needle, "\tadreno8_settle();\n" + needle, 1)
+        elif function == "gpu_write":
+            moved = without[:-2] + "\tadreno8_settle();\n}\n"
+        else:
+            moved = without.replace("\tadreno8_wr(adreno8_gmu.base + offset, value);",
+                "\tadreno8_wr(adreno8_gmu.base + offset, value);\n\tadreno8_settle();", 1)
+        variants[function + "_barrier_wrong_side"] = production[:start] + moved + production[end:]
+    for name, mutated in variants.items():
+        assert mutated != production, name
+        variant = Path(temp) / name
+        variant.mkdir()
+        (variant / "adreno8_gpu.c").write_text(mutated)
+        (variant / "gpu.c").write_text(source)
+        for page in (4096, 16384):
+            binary = variant / f"gpu-{page}"
+            subprocess.run(["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
+                            f"-DPAGE_SIZE={page}", "-I", str(DEV), str(variant / "gpu.c"), "-o", str(binary)], check=True)
+            result = subprocess.run([str(binary), str(args.firmware_dir / "gen80000_sqe.fw"),
+                                     str(args.firmware_dir / "gen80000_aqe.fw")], capture_output=True, text=True)
+            assert result.returncode != 0 and "assert" in result.stderr.lower(), (name, page, result.stderr)
+    print(f"GPU MMIO barrier mutations rejected: {len(variants)} variants x 2 page sizes")

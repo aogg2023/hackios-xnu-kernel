@@ -766,6 +766,10 @@ adreno8_space_on(struct adreno8_gpu_space *space, uint32_t stream, uint32_t matc
 	    adreno8_space_faulted(space)) {
 		goto fail;
 	}
+	if (space == &adreno8_gpu_space) {
+		/* Compare the inherited CB0 ACTLR with the vendor's per-stream configuration. */
+		adreno8_get(&adreno8_smmu, "gpu cb actlr", cb + 0x04);
+	}
 	printf("adreno8: %u: %s translation enabled: stream %u, context %u, root PA %#llx\n", adreno8_step,
 	    space->name, stream, space->context, space->tables[0].phys);
 	return true;

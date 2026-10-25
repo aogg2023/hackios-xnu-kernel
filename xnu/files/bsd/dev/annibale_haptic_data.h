@@ -17,7 +17,7 @@
 #define ARB_CNFG_PHYS           0x0c42d000UL
 #define ARB_CNFG_SIZE           0x004000UL
 #define ARB_CHNLS_PHYS          0x0c500000UL
-#define ARB_CHNLS_SIZE          0x00400000UL            /* all of the device tree's "chnls": 0x1000 a channel; haptics are 648 to 650 */
+#define ARB_CHANNEL_SIZE        0x1000UL                /* one write channel of the device tree's 4 MB "chnls" */
 #define ARB_OBSRV_PHYS          0x0c440000UL
 #define ARB_OBSRV_SIZE          0x0080000UL
 

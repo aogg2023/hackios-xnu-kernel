@@ -78,7 +78,7 @@ static uint8_t timer_original;                  /* channel 0's safety timer as f
 #define ARB_CNFG_PHYS           0x0c42d000UL
 #define ARB_CNFG_SIZE           0x004000UL
 #define ARB_CHNLS_PHYS          0x0c500000UL
-#define ARB_CHNLS_SIZE          0x00400000UL            /* all of the device tree's "chnls": 0x1000 a channel; flash is 617 */
+#define ARB_CHANNEL_SIZE        0x1000UL                /* one write channel of the device tree's 4 MB "chnls" */
 #define ARB_OBSRV_PHYS          0x0c440000UL
 #define ARB_OBSRV_SIZE          0x0080000UL
 
@@ -107,7 +107,7 @@ static uint8_t timer_original;                  /* channel 0's safety timer as f
 #define OPC_EXT_READ            13
 #define TRANSACT_TIMEOUT_US     2000
 
-static vm_offset_t arb_core, arb_cnfg, arb_chnls, arb_obsrvr;
+static vm_offset_t arb_core, arb_cnfg, arb_obsrvr;
 
 /* the one peripheral: slave 1 function 0xee, the device tree's reg <0xee00 ...> */
 #define FLASH_PPID              0x1ee
@@ -117,6 +117,7 @@ static struct {
 	uint16_t        apid;
 	bool            found, exact, ours;       /* the entry, the device tree's ppid byte for byte, ours to write */
 	unsigned        owner;                    /* the system that may write through it */
+	vm_offset_t     channel;                  /* its write channel, mapped once it is known (channel 617 on this phone) */
 } flash;
 
 static int say(const char *format, ...) __printflike(1, 2);
@@ -234,11 +235,11 @@ spmi_write16(uint16_t addr, uint8_t value)
 	if (!flash.ours) {
 		return "the arbiter lets another system write the module";
 	}
-	if (0x1000UL * ((uint64_t)flash.apid + 1) > ARB_CHNLS_SIZE) {
-		return "the module's channel is outside the mapped window";
+	if (flash.channel == 0) {
+		return "the module's write channel is not mapped";
 	}
 	nanoseconds_to_absolutetime(TRANSACT_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
-	channel = arb_chnls + 0x1000UL * flash.apid;
+	channel = flash.channel;
 	annibale_spmi_lock();
 	wr(channel + CH_WDATA0, value);
 	wr(channel + CH_CMD, CMD_OPC(OPC_EXT_WRITE) | CMD_REG(addr) | (1 - 1));
@@ -336,9 +337,8 @@ bring_up_locked(void)
 	    ARB_OBSRV_PHYS);
 	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
 	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
-	arb_chnls = ml_io_map(ARB_CHNLS_PHYS, ARB_CHNLS_SIZE);
 	arb_obsrvr = ml_io_map(ARB_OBSRV_PHYS, ARB_OBSRV_SIZE);
-	if (arb_core == 0 || arb_cnfg == 0 || arb_chnls == 0 || arb_obsrvr == 0) {
+	if (arb_core == 0 || arb_cnfg == 0 || arb_obsrvr == 0) {
 		say("torch: the arbiter's windows cannot be mapped: no flashlight\n");
 		broken = true;
 		return false;
@@ -379,6 +379,13 @@ bring_up_locked(void)
 	}
 	if (!flash.found) {
 		say("torch: no channel of the arbiter is the flash module (slave 1, function %#x)\n", FLASH_FUNCTION);
+		broken = true;
+		return false;
+	}
+	/* (the whole 4 MB of write channels cannot be mapped this early in the boot: kmem_alloc fails) */
+	flash.channel = ml_io_map(ARB_CHNLS_PHYS + ARB_CHANNEL_SIZE * flash.apid, ARB_CHANNEL_SIZE);
+	if (flash.channel == 0) {
+		say("torch: the write channel %u cannot be mapped: nothing is written\n", flash.apid);
 		broken = true;
 		return false;
 	}

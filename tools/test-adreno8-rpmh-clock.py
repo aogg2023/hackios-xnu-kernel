@@ -49,7 +49,7 @@ static uint32_t adreno8_rpmh_lookup(const char *name, uint16_t *levels, unsigned
 static uint32_t adreno8_get(struct adreno8_block *block, const char *name, uint32_t off) {
     assert(!poisoned_poll);
     assert(block->phys == 0x16520000 && block->size == 0x10000 && off < 0x10000 && !(off & 3));
-    assert(off == 0 || off == 4 || off == 0xc || off == 0xd28 || off == 0xfc8 ||
+    assert(off == 0 || off == 4 || off == 0xc || off == 0xd28 || off == 0x1268 ||
         off == ARC_CONTROL || off == ARC_STATUS || off == ARC_ENABLE || off == ARC_WAIT ||
         off == ARC_MSGID || off == ARC_ADDRESS || off == ARC_DATA || off == ARC_COMMAND_STATUS ||
         off == ARC_RESPONSE || off == ARC_IRQ_ENABLE || off == ARC_IRQ_STATUS ||
@@ -65,7 +65,7 @@ static uint32_t adreno8_get(struct adreno8_block *block, const char *name, uint3
         regs[ARC_IRQ_ENABLE / 4] |= 1u << 5;
     if (scenario == 49 && !strcmp(name, "irq enable before restore"))
         regs[ARC_IRQ_ENABLE / 4] |= 1u << 5;
-    if (scenario == 51 && triggers == 3 && !strcmp(name, "TCS2 control after completion"))
+    if (scenario == 51 && triggers == 3 && !strcmp(name, "TCS1 control after completion"))
         regs[ARC_CONTROL / 4] |= 2;
     if (scenario == 57 && triggers == 2 && off == 4) regs[1] |= 1u << 24;
     if (off == ARC_RESPONSE) { assert(done && !tx_write); responses++; }
@@ -112,7 +112,7 @@ static uint32_t adreno8_rd(vm_offset_t address) {
         done = true;
         if (tx_write) votes[tx_resource] = regs[ARC_DATA / 4];
         if (scenario == 47 && tx_write) votes[tx_resource]--;
-        regs[ARC_IRQ_STATUS / 4] |= ARC_TCS_BIT | 2;
+        regs[ARC_IRQ_STATUS / 4] |= ARC_TCS_BIT | 4;
         regs[ARC_COMMAND_STATUS / 4] = scenario == 46 && triggers == 3 ? 1u << 8 : ARC_COMMAND_DONE;
         regs[ARC_STATUS / 4] = 1;
         regs[ARC_RESPONSE / 4] = scenario == 58 && triggers == 4 ? 11 : votes[tx_resource];
@@ -120,10 +120,13 @@ static uint32_t adreno8_rd(vm_offset_t address) {
     return regs[ARC_IRQ_STATUS / 4];
 }
 static void setup(void) {
+    assert(ARC_WAIT == 0xfc0 && ARC_CONTROL == 0xfc4 && ARC_STATUS == 0xfc8 && ARC_ENABLE == 0xfcc);
+    assert(ARC_MSGID == 0xfd4 && ARC_ADDRESS == 0xfd8 && ARC_DATA == 0xfdc);
+    assert(ARC_COMMAND_STATUS == 0xfe0 && ARC_RESPONSE == 0xfe4 && ARC_TCS_BIT == 2);
     adreno8_gmu_from_pll = 1;
     regs[0]=0x30800; regs[1]=0x04010100; regs[3]=0x800c8104;
     regs[ARC_CONTROL / 4]=initial_control; regs[ARC_STATUS / 4]=1;
-    regs[0xd28 / 4]=regs[0xfc8 / 4]=1;
+    regs[0xd28 / 4]=regs[0x1268 / 4]=1;
     regs[ARC_IRQ_ENABLE / 4]=initial_irq; regs[ARC_DATA / 4]=0xdeadbeef;
     for(unsigned i=3;i<8;i++) regs[(0xd00+i*0x2a0+0x28)/4]=1;
     switch(scenario) {
@@ -138,7 +141,7 @@ static void setup(void) {
     case 15: regs[(0xd00+5*0x2a0+0x24)/4]=1; break;
     case 16: regs[(0xd00+7*0x2a0+0x28)/4]=0; break;
     case 17: regs[0xd28/4]=0; break;
-    case 18: regs[0xfc8/4]=0; break;
+    case 18: regs[0x1268/4]=0; break;
     case 19: regs[ARC_STATUS/4]=0; break;
     case 20: regs[ARC_ENABLE/4]=1; break;
     case 21: regs[ARC_WAIT/4]=1; break;
@@ -169,7 +172,7 @@ int main(int argc,char **argv) {
         assert(voltage_writes==expected_writes && adreno8_reset_required);
         assert(regs[ARC_CONTROL/4]==initial_control && !regs[ARC_ENABLE/4] && !regs[ARC_WAIT/4]);
         assert(regs[ARC_IRQ_ENABLE/4]==(initial_irq | (scenario==49?1u<<5:0)));
-        assert(regs[ARC_IRQ_STATUS/4]==2);
+        assert(regs[ARC_IRQ_STATUS/4]==4);
     }
     if(!result && !fail_at && scenario<=28) assert(!voltage_writes);
     if(scenario==40 || scenario==41 || scenario==42 || scenario==43 || scenario==44 || scenario==45)
@@ -180,8 +183,8 @@ int main(int argc,char **argv) {
     if(scenario==63) assert(writes==44 && triggers==3 && voltage_writes==1);
     for(unsigned i=0;i<0x10000/4;i++) {
         unsigned off=4*i;
-        bool tcs2=off>=ARC_WAIT && off<=ARC_RESPONSE;
-        if(off!=ARC_IRQ_ENABLE && off!=ARC_IRQ_STATUS && !tcs2 &&
+        bool tcs1=off>=ARC_WAIT && off<=ARC_RESPONSE;
+        if(off!=ARC_IRQ_ENABLE && off!=ARC_IRQ_STATUS && !tcs1 &&
            !(scenario==57 && off==4)) assert(regs[i]==before[i]);
     }
     unsigned old_reads=reads, old_writes=writes;
@@ -217,6 +220,8 @@ def main():
     cases = [(n,) for n in range(64) if n not in (39, 54, 56)]
     cases += [(0, n) for n in range(1, 91) if n not in (8, 12, 22, 26, 38, 43, 53, 57, 69, 74, 84, 88)]
     mutations = [
+        ("wrong_slot_offset", "#define ARC_MSGID 0xfd4u", "#define ARC_MSGID 0x1274u", (0,)),
+        ("wrong_slot_irq", "#define ARC_TCS_BIT (1u << 1)", "#define ARC_TCS_BIT (1u << 2)", (0,)),
         ("drop_inherited", "if (required[i] < votes[i].selector) required[i] = votes[i].selector;", "", (31,)),
         ("wrong_selector_units", "votes[i].selector = required[i];", "votes[i].selector = 128;", (0,)),
         ("skip_write_ack", "if (!arc_transfer(&votes[i], true) ||", "if (false ||", (0,)),
@@ -231,8 +236,8 @@ def main():
          'arc_write("premature cleanup", ARC_ENABLE, 0); printf("adreno8: ARC transaction completion unconfirmed;', (42,)),
         ("poll_unreadable", 'if (irq == 0xffffffffu) {', 'if (false) {', (62,)),
         ("command_unreadable", 'command == 0xffffffffu ||', '', (61,)),
-        ("restore_unreadable", 'if (irq == 0xffffffffu ||\n\t    !arc_write("irq restore TCS2 bit",',
-         'if (!arc_write("irq restore TCS2 bit",', (63,)),
+        ("restore_unreadable", 'if (irq == 0xffffffffu ||\n\t    !arc_write("irq restore TCS1 bit",',
+         'if (!arc_write("irq restore TCS1 bit",', (63,)),
     ]
     with tempfile.TemporaryDirectory(prefix="adreno8-rpmh-clock-") as directory:
         target = Path(directory)

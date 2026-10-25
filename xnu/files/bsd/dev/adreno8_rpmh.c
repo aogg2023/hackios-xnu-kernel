@@ -1,5 +1,5 @@
 /*
- * Apps DRV2 ARC transactions: fixed MiCode rpmh-rsc.c v3 layout and trigger order,
+ * Apps DRV2 ACTIVE TCS1 ARC transactions: fixed MiCode rpmh-rsc.c v3 layout and trigger order,
  * https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/f66f8c8bcbe38044fab61d44ea7f7c224f82b3ea/drivers/soc/qcom/rpmh-rsc.c
  * plus upstream read protocol from edbafe65eef2b58625db1e113fbbfb1fe10c0291:
  * https://git.kernel.org/linus/edbafe65eef2b58625db1e113fbbfb1fe10c0291
@@ -13,16 +13,16 @@
 #define ARC_IRQ_ENABLE 0xd00u
 #define ARC_IRQ_STATUS 0xd04u
 #define ARC_IRQ_CLEAR 0xd08u
-#define ARC_WAIT 0x1260u
-#define ARC_CONTROL 0x1264u
-#define ARC_STATUS 0x1268u
-#define ARC_ENABLE 0x126cu
-#define ARC_MSGID 0x1274u
-#define ARC_ADDRESS 0x1278u
-#define ARC_DATA 0x127cu
-#define ARC_COMMAND_STATUS 0x1280u
-#define ARC_RESPONSE 0x1284u
-#define ARC_TCS_BIT (1u << 2)
+#define ARC_WAIT 0xfc0u
+#define ARC_CONTROL 0xfc4u
+#define ARC_STATUS 0xfc8u
+#define ARC_ENABLE 0xfccu
+#define ARC_MSGID 0xfd4u
+#define ARC_ADDRESS 0xfd8u
+#define ARC_DATA 0xfdcu
+#define ARC_COMMAND_STATUS 0xfe0u
+#define ARC_RESPONSE 0xfe4u
+#define ARC_TCS_BIT (1u << 1)
 #define ARC_AMC_ENABLE (1u << 16)
 #define ARC_AMC_TRIGGER (1u << 24)
 #define ARC_COMMAND_DONE ((1u << 8) | (1u << 16))
@@ -54,7 +54,7 @@ arc_write(const char *name, uint32_t offset, uint32_t value)
 	adreno8_settle();
 	if (arc_read(name, offset) == value)
 		return true;
-	printf("adreno8: ARC register verification failed at %#x; retain TCS2 until reset\n", offset);
+	printf("adreno8: ARC register verification failed at %#x; retain TCS1 until reset\n", offset);
 	return false;
 }
 
@@ -74,12 +74,12 @@ arc_transfer(struct arc_vote *vote, bool write)
 {
 	uint32_t address = vote->address, control, irq_before, irq, command = 0, response;
 	if (!arc_identity() || (write && vote->selector >= vote->count)) return false;
-	control = arc_read("TCS2 control", ARC_CONTROL);
+	control = arc_read("TCS1 control", ARC_CONTROL);
 	irq_before = arc_read("irq enable", ARC_IRQ_ENABLE);
 	if (irq_before == 0xffffffffu || (control & ~ARC_AMC_ENABLE) != 0 ||
 	    arc_read("TCS0 status", 0xd28) != 1 || arc_read("TCS1 status", 0xfc8) != 1 ||
-	    arc_read("TCS2 status", ARC_STATUS) != 1 ||
-	    arc_read("TCS2 enable", ARC_ENABLE) != 0 || arc_read("TCS2 wait", ARC_WAIT) != 0 ||
+	    arc_read("TCS2 status", 0x1268) != 1 ||
+	    arc_read("TCS1 enable", ARC_ENABLE) != 0 || arc_read("TCS1 wait", ARC_WAIT) != 0 ||
 	    (arc_read("irq status", ARC_IRQ_STATUS) & ARC_TCS_BIT) != 0) {
 		printf("adreno8: ARC transaction prerequisites failed; no registers written\n");
 		return false;
@@ -88,22 +88,22 @@ arc_transfer(struct arc_vote *vote, bool write)
 	/* A failed write or an unanswered request has no verified cancellation path.
 	 * The reset requirement precedes the first write and remains set after success. */
 	adreno8_reset_required = true;
-	if (!arc_write("TCS2 clear trigger", ARC_CONTROL, control & ~ARC_AMC_TRIGGER) ||
-	    !arc_write("TCS2 clear enable", ARC_CONTROL, 0) ||
-	    !arc_write("TCS2 ARC message", ARC_MSGID, write ? 0x10108u : 0x108u) ||
-	    !arc_write("TCS2 ARC address", ARC_ADDRESS, address))
+	if (!arc_write("TCS1 clear trigger", ARC_CONTROL, control & ~ARC_AMC_TRIGGER) ||
+	    !arc_write("TCS1 clear enable", ARC_CONTROL, 0) ||
+	    !arc_write("TCS1 ARC message", ARC_MSGID, write ? 0x10108u : 0x108u) ||
+	    !arc_write("TCS1 ARC address", ARC_ADDRESS, address))
 		return false;
-	if (write && (!arc_write("TCS2 ARC selector", ARC_DATA, vote->selector) ||
-	    !arc_write("TCS2 ARC wait", ARC_WAIT, 1)))
+	if (write && (!arc_write("TCS1 ARC selector", ARC_DATA, vote->selector) ||
+	    !arc_write("TCS1 ARC wait", ARC_WAIT, 1)))
 		return false;
-	if (!arc_write("TCS2 command enable", ARC_ENABLE, 1))
+	if (!arc_write("TCS1 command enable", ARC_ENABLE, 1))
 		return false;
 	irq = arc_read("irq enable before request", ARC_IRQ_ENABLE);
-	if (irq != irq_before || !arc_write("irq enable TCS2", ARC_IRQ_ENABLE, irq | ARC_TCS_BIT) ||
-	    !arc_write("TCS2 AMC enable", ARC_CONTROL, ARC_AMC_ENABLE))
+	if (irq != irq_before || !arc_write("irq enable TCS1", ARC_IRQ_ENABLE, irq | ARC_TCS_BIT) ||
+	    !arc_write("TCS1 AMC enable", ARC_CONTROL, ARC_AMC_ENABLE))
 		return false;
 	adreno8_settle();
-	adreno8_put(&arc_rsc, "TCS2 ARC request trigger", ARC_CONTROL, ARC_AMC_ENABLE | ARC_AMC_TRIGGER);
+	adreno8_put(&arc_rsc, "TCS1 ARC request trigger", ARC_CONTROL, ARC_AMC_ENABLE | ARC_AMC_TRIGGER);
 	adreno8_settle();
 
 	/* Match the upstream ten-second completion bound without per-poll log output. */
@@ -111,7 +111,7 @@ arc_transfer(struct arc_vote *vote, bool write)
 		irq = adreno8_rd(arc_rsc.base + ARC_IRQ_STATUS);
 		adreno8_settle();
 		if (irq == 0xffffffffu) {
-			printf("adreno8: ARC poll returned an unreadable IRQ status; retain TCS2 until reset\n");
+			printf("adreno8: ARC poll returned an unreadable IRQ status; retain TCS1 until reset\n");
 			return false;
 		}
 		if (irq & ARC_TCS_BIT)
@@ -120,39 +120,39 @@ arc_transfer(struct arc_vote *vote, bool write)
 	}
 	irq = arc_read("irq status after request", ARC_IRQ_STATUS);
 	if (irq != 0xffffffffu && (irq & ARC_TCS_BIT))
-		command = arc_read("TCS2 command status", ARC_COMMAND_STATUS);
+		command = arc_read("TCS1 command status", ARC_COMMAND_STATUS);
 	if (irq == 0xffffffffu || !(irq & ARC_TCS_BIT) || command == 0xffffffffu ||
 	    (command & ARC_COMMAND_DONE) != ARC_COMMAND_DONE ||
-	    arc_read("TCS2 completion status", ARC_STATUS) != 1) {
-		printf("adreno8: ARC transaction completion unconfirmed; retain TCS2 and IRQ state until reset\n");
+	    arc_read("TCS1 completion status", ARC_STATUS) != 1) {
+		printf("adreno8: ARC transaction completion unconfirmed; retain TCS1 and IRQ state until reset\n");
 		return false;
 	}
 	if (!write) {
-		response = arc_read("TCS2 ARC response", ARC_RESPONSE);
+		response = arc_read("TCS1 ARC response", ARC_RESPONSE);
 		if (response >= vote->count) {
-			printf("adreno8: ARC response %#x exceeds %u CMD DB levels; retain TCS2 until reset\n",
+			printf("adreno8: ARC response %#x exceeds %u CMD DB levels; retain TCS1 until reset\n",
 			    response, vote->count);
 			return false;
 		}
 		vote->selector = response;
 	}
-	irq = arc_read("TCS2 control after completion", ARC_CONTROL);
+	irq = arc_read("TCS1 control after completion", ARC_CONTROL);
 	if ((irq & ~(ARC_AMC_ENABLE | ARC_AMC_TRIGGER)) != 0 ||
-	    !arc_write("TCS2 completed clear trigger", ARC_CONTROL, irq & ~ARC_AMC_TRIGGER) ||
-	    !arc_write("TCS2 completed clear enable", ARC_CONTROL, 0) ||
-	    !arc_write("TCS2 completed command disable", ARC_ENABLE, 0))
+	    !arc_write("TCS1 completed clear trigger", ARC_CONTROL, irq & ~ARC_AMC_TRIGGER) ||
+	    !arc_write("TCS1 completed clear enable", ARC_CONTROL, 0) ||
+	    !arc_write("TCS1 completed command disable", ARC_ENABLE, 0))
 		return false;
-	if (write && !arc_write("TCS2 completed clear wait", ARC_WAIT, 0))
+	if (write && !arc_write("TCS1 completed clear wait", ARC_WAIT, 0))
 		return false;
 	adreno8_settle();
-	adreno8_put(&arc_rsc, "TCS2 completed IRQ clear", ARC_IRQ_CLEAR, ARC_TCS_BIT);
+	adreno8_put(&arc_rsc, "TCS1 completed IRQ clear", ARC_IRQ_CLEAR, ARC_TCS_BIT);
 	adreno8_settle();
 	if ((arc_read("irq status after clear", ARC_IRQ_STATUS) & ARC_TCS_BIT) != 0 ||
-	    !arc_write("TCS2 restore initial control", ARC_CONTROL, control))
+	    !arc_write("TCS1 restore initial control", ARC_CONTROL, control))
 		return false;
 	irq = arc_read("irq enable before restore", ARC_IRQ_ENABLE);
 	if (irq == 0xffffffffu ||
-	    !arc_write("irq restore TCS2 bit", ARC_IRQ_ENABLE, irq & ~(ARC_TCS_BIT & ~irq_before)))
+	    !arc_write("irq restore TCS1 bit", ARC_IRQ_ENABLE, irq & ~(ARC_TCS_BIT & ~irq_before)))
 		return false;
 	return true;
 }
@@ -191,7 +191,7 @@ adreno8_rpmh_arc_read(void)
 		printf("adreno8: ARC read requires explicit touchscreen=0 to exclude the other DRV2 writer\n");
 		return false;
 	}
-	/* Reuse TCS2 only after the preceding read has completed and restored it. */
+	/* Reuse TCS1 only after the preceding read has completed and restored it. */
 	if (!arc_resource_read("cx.lvl", &vote) || !arc_resource_read("mx.lvl", &vote))
 		return false;
 	arc_state = ARC_READ_COMPLETE;

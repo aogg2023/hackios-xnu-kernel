@@ -62,7 +62,7 @@ static uint32_t adreno8_rpmh_lookup(const char *name, uint16_t *levels, unsigned
         assert(regs[ARC_CONTROL / 4] == initial_control && !regs[ARC_ENABLE / 4]);
         assert(!(regs[ARC_IRQ_STATUS / 4] & ARC_TCS_BIT));
         assert(regs[ARC_IRQ_ENABLE / 4] == (initial_irq | (scenario == 28 ? 1u << 5 : 0)));
-        if (scenario == 50) regs[0xfc8 / 4] = 0;
+        if (scenario == 50) regs[0x1268 / 4] = 0;
         if (scenario == 51) regs[ARC_IRQ_STATUS / 4] |= ARC_TCS_BIT;
         if (scenario == 52) regs[0] = 0x30700;
     }
@@ -85,7 +85,7 @@ static uint32_t adreno8_get(struct adreno8_block *b, const char *name, uint32_t 
         !strcmp(name, "irq enable before restore"))
         regs[ARC_IRQ_ENABLE / 4] |= 1u << 5;
     if ((scenario == 30 || (scenario == 49 && lookups == 2)) &&
-        !strcmp(name, "TCS2 control after completion"))
+        !strcmp(name, "TCS1 control after completion"))
         regs[ARC_CONTROL / 4] |= 2;
     if (off == ARC_RESPONSE) { assert(done); responses++; }
     return regs[off / 4];
@@ -122,7 +122,7 @@ static uint32_t adreno8_rd(vm_offset_t address) {
     if (scenario == 59) { poisoned_poll=true; return UINT32_MAX; }
     if (transaction_polls == 3 && scenario != 23 && !(scenario == 43 && lookups == 2)) {
         done = true;
-        regs[ARC_IRQ_STATUS / 4] |= ARC_TCS_BIT | 2;
+        regs[ARC_IRQ_STATUS / 4] |= ARC_TCS_BIT | 4;
         regs[ARC_COMMAND_STATUS / 4] = scenario == 24 || (scenario == 44 && lookups == 2) ?
             1u << 8 : ARC_COMMAND_DONE;
         regs[ARC_STATUS / 4] = scenario == 25 || (scenario == 45 && lookups == 2) ? 0 : 1;
@@ -131,11 +131,14 @@ static uint32_t adreno8_rd(vm_offset_t address) {
     return regs[ARC_IRQ_STATUS / 4];
 }
 static void prepare(void) {
+    assert(ARC_WAIT == 0xfc0 && ARC_CONTROL == 0xfc4 && ARC_STATUS == 0xfc8 && ARC_ENABLE == 0xfcc);
+    assert(ARC_MSGID == 0xfd4 && ARC_ADDRESS == 0xfd8 && ARC_DATA == 0xfdc);
+    assert(ARC_COMMAND_STATUS == 0xfe0 && ARC_RESPONSE == 0xfe4 && ARC_TCS_BIT == 2);
     regs[0] = 0x30800; regs[1] = 0x04010100; regs[3] = 0x800c8104;
     regs[ARC_STATUS / 4] = 1; regs[ARC_CONTROL / 4] = initial_control;
-    regs[0xd28 / 4] = regs[0xfc8 / 4] = 1;
-    regs[ARC_IRQ_ENABLE / 4] = initial_irq; regs[0x127c / 4] = 0xdeadbeef;
-    regs[0xd2c / 4] = 0x7f; regs[0x1270 / 4] = 0x5a5a;
+    regs[0xd28 / 4] = regs[0x1268 / 4] = 1;
+    regs[ARC_IRQ_ENABLE / 4] = initial_irq; regs[ARC_DATA / 4] = 0xdeadbeef;
+    regs[0xd2c / 4] = 0x7f; regs[0xfd0 / 4] = 0x5a5a;
     switch (scenario) {
     case 0: flag_present = false; break;
     case 1: flag = 0; break;
@@ -158,12 +161,12 @@ static void prepare(void) {
     case 18: level_count = 0; break;
     case 19: level_count = 65; break;
     case 21: initial_control = regs[ARC_CONTROL / 4] = 0; break;
-    case 22: initial_irq = regs[ARC_IRQ_ENABLE / 4] = 5; break;
+    case 22: initial_irq = regs[ARC_IRQ_ENABLE / 4] = 3; break;
     case 26: response_value = level_count; break;
     case 33: response_value = 0; break;
     case 34: regs[0] = UINT32_MAX; break;
     case 35: regs[0xd28 / 4] = 0; break;
-    case 36: regs[0xfc8 / 4] = 0; break;
+    case 36: regs[0x1268 / 4] = 0; break;
     case 37: regs[ARC_IRQ_ENABLE / 4] = UINT32_MAX; break;
     case 38: mx_address = 0; break;
     case 39: mx_address = 0x40000; break;
@@ -189,7 +192,7 @@ int main(int argc, char **argv) {
         assert(result && writes == 28 && triggers == 2 && responses == 2 && lookups == 2 && adreno8_reset_required);
         assert(regs[ARC_CONTROL / 4] == initial_control && !regs[ARC_ENABLE / 4] && !regs[ARC_WAIT / 4]);
         assert(regs[ARC_IRQ_ENABLE / 4] == (initial_irq | (scenario == 28 || scenario == 54 ? 1u << 5 : 0)));
-        assert(regs[ARC_IRQ_STATUS / 4] == 2);
+        assert(regs[ARC_IRQ_STATUS / 4] == 4);
     } else {
         assert(!result);
         if (scenario <= 19 || (scenario >= 34 && scenario <= 37) || scenario == 53)
@@ -212,8 +215,8 @@ int main(int argc, char **argv) {
         if (scenario == 59) assert(polls == 1 && !sleeps && !done);
         if (scenario >= 20 && scenario <= 30 && !success) assert(lookups == 1);
     }
-    assert(regs[0x127c / 4] == 0xdeadbeef);
-    assert(regs[0xd2c / 4] == before[0xd2c / 4] && regs[0x1270 / 4] == before[0x1270 / 4]);
+    assert(regs[ARC_DATA / 4] == 0xdeadbeef);
+    assert(regs[0xd2c / 4] == before[0xd2c / 4] && regs[0xfd0 / 4] == before[0xfd0 / 4]);
     unsigned saved_writes = writes, saved_reads = reads;
     if (scenario <= 1) assert(adreno8_rpmh_arc_read());
     else assert(!adreno8_rpmh_arc_read());
@@ -250,26 +253,30 @@ def main():
         if args.mutations:
             mutations = [
                 ("resource_write", "write ? 0x10108u : 0x108u", "write ? 0x10108u : 0x10108u", (20,)),
-                ("command_data_write", "ARC_ADDRESS, address)", "0x127cu, address)", (20,)),
+                ("command_data_write", "ARC_ADDRESS, address)", "0xfdcu, address)", (20,)),
                 ("missing_reset", "adreno8_reset_required = true;", "adreno8_reset_required = false;", (20,)),
                 ("repeat_allowed", "asked != 1 || arc_state != ARC_COLD", "asked != 1 || false", (20,)),
                 ("touch_implicit_zero", '!PE_parse_boot_argn("touchscreen", &touch, sizeof(touch)) || touch != 0',
                  'PE_parse_boot_argn("touchscreen", &touch, sizeof(touch)) && touch != 0', (4,)),
                 ("unknown_parameter", "asked != 1 || arc_state != ARC_COLD", "asked == 0 || arc_state != ARC_COLD", (2,)),
-                ("response_from_data", 'arc_read("TCS2 ARC response", ARC_RESPONSE)',
-                 'arc_read("TCS2 ARC response", 0x127c)', (20,)),
+                ("response_from_data", 'arc_read("TCS1 ARC response", ARC_RESPONSE)',
+                 'arc_read("TCS1 ARC response", 0xfdc)', (20,)),
                 ("timeout_cleanup", 'printf("adreno8: ARC transaction completion unconfirmed;',
                  'arc_write("premature clear", ARC_ENABLE, 0); printf("adreno8: ARC transaction completion unconfirmed;', (23,)),
                 ("irq_snapshot_restore", "irq & ~(ARC_TCS_BIT & ~irq_before)", "irq_before", (28,)),
                 ("clear_peer_irq", "ARC_IRQ_CLEAR, ARC_TCS_BIT", "ARC_IRQ_CLEAR, 0xffffffffu", (20,)),
                 ("incomplete_command", '(command & ARC_COMMAND_DONE) != ARC_COMMAND_DONE',
                  "false", (24,)),
+                ("wrong_slot_offset", "#define ARC_MSGID 0xfd4u", "#define ARC_MSGID 0x1274u", (20,)),
+                ("wrong_slot_irq", "#define ARC_TCS_BIT (1u << 1)", "#define ARC_TCS_BIT (1u << 2)", (20,)),
+                ("tcs1_busy", 'arc_read("TCS1 status", 0xfc8) != 1', "false", (10,)),
+                ("tcs2_busy", 'arc_read("TCS2 status", 0x1268) != 1', "false", (36,)),
                 ("other_tcs_busy", 'arc_read("TCS0 status", 0xd28) != 1', "false", (35,)),
                 ("skip_register_verify", "if (arc_read(name, offset) == value)", "if (true)", (20, 3)),
-                ("commands_stay_enabled", '"TCS2 completed command disable", ARC_ENABLE, 0',
-                 '"TCS2 completed command disable", ARC_ENABLE, 1', (20,)),
-                ("restore_trigger", '"TCS2 restore initial control", ARC_CONTROL, control)',
-                 '"TCS2 restore initial control", ARC_CONTROL, control | ARC_AMC_TRIGGER)', (20,)),
+                ("commands_stay_enabled", '"TCS1 completed command disable", ARC_ENABLE, 0',
+                 '"TCS1 completed command disable", ARC_ENABLE, 1', (20,)),
+                ("restore_trigger", '"TCS1 restore initial control", ARC_CONTROL, control)',
+                 '"TCS1 restore initial control", ARC_CONTROL, control | ARC_AMC_TRIGGER)', (20,)),
                 ("stale_irq", '(arc_read("irq status", ARC_IRQ_STATUS) & ARC_TCS_BIT) != 0', "false", (13,)),
                 ("read_mx_after_cx_failure", '!arc_resource_read("cx.lvl", &vote) || !arc_resource_read("mx.lvl", &vote)',
                  '(unsigned)!arc_resource_read("cx.lvl", &vote) | (unsigned)!arc_resource_read("mx.lvl", &vote)', (23,)),

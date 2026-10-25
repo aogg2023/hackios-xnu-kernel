@@ -146,10 +146,16 @@ adreno8_rd(vm_offset_t address)
 	return value;
 }
 
+extern void loader_log_line(const char *line);
+
 void __attribute__((noinline))
 adreno8_wr(vm_offset_t address, uint32_t value)
 {
+	/* CP_SQE_CNTL is dword 0x815; these RAM-only lines surround the raw store after any access pause. */
+	bool ordinary_sqe = adreno8_direct_ring && adreno8_gpu.base && address == adreno8_gpu.base + 0x2054;
+	if (ordinary_sqe) loader_log_line("adreno8: ordinary SQE raw STR enter\n");
 	__asm__ volatile ("str %w0, [%1]" : : "r" (value), "r" (address) : "memory");
+	if (ordinary_sqe) loader_log_line("adreno8: ordinary SQE raw STR returned\n");
 }
 
 /* A stretch of registers; mapped when a step first needs it. */

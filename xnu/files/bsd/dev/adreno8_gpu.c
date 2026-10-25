@@ -14,6 +14,8 @@
 #include "adreno8_gpu_private.h"
 #include "adreno8_context_private.h"
 
+extern void loader_log_line(const char *line);
+
 #define printf adreno8_say
 #define A8_COUNT(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -471,6 +473,7 @@ gpu_direct_ring_init(uint32_t raw_mode)
 			/* a8xx_recover at efbda69d92e6 writes 3 to halt SQE. */
 			gpu_write(GEN8_CP_SQE_CNTL, 3);
 			adreno8_settle();
+			loader_log_line("adreno8: ordinary SQE HALT DSB returned\n");
 			if (gpu_read(GEN8_CP_SQE_CNTL) != 3)
 				return gpu_fail("ordinary SQE HALT readback");
 		}
@@ -496,6 +499,7 @@ gpu_direct_ring_init(uint32_t raw_mode)
 	}
 	gpu_write(GEN8_CP_SQE_CNTL, 1);
 	adreno8_settle();
+	loader_log_line("adreno8: ordinary SQE start DSB returned\n");
 	if (gpu_read(GEN8_CP_SQE_CNTL) != 1)
 		return gpu_fail("direct ring SQE enable readback");
 	uint32_t count = adreno8_pm4_cp_init((uint32_t *)ring->memory, ring->size / 4, powerup->gpu_address);

@@ -170,6 +170,7 @@ void adreno8_wr(vm_offset_t, uint32_t);
 uint32_t adreno8_get(struct adreno8_block *, const char *, uint32_t);
 void adreno8_put(struct adreno8_block *, const char *, uint32_t, uint32_t);
 void adreno8_settle(void);
+void loader_log_line(const char *line) { (void)line; }
 void adreno8_hold(bool single_access) { (void)single_access; }
 static unsigned setup_waits;
 static void ring_setup_wait(void);

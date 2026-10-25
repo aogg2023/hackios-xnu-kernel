@@ -41,6 +41,7 @@ enum { NORMAL, LEGACY, TIMEOUT, FW_ERROR, WRONG_QUEUE, BAD_VERSION, SHORT_ACK,
 #define GMU_FW_INIT_RESULT 12
 #define GMU_FW_FAILED 0xe00
 static int adreno8_say(const char *format, ...) { return 0; }
+static void adreno8_announce(const char *format, ...) { (void)format; }
 #define printf adreno8_say
 static bool adreno8_cx_ready(void) { return cx_ready; }
 static uint64_t mach_absolute_time(void) { return clock_ns; }

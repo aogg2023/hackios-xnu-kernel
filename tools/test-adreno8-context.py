@@ -50,6 +50,7 @@ enum { NORMAL, DELAY_EOP, RETIRE_ONLY, NACK_REGISTER, NACK_POINTERS, NACK_CLOSE,
 #define GMU_FW_FAILED 0xe00
 #define SECURE_MODE_TRANSLATION_B 4u
 static int adreno8_say(const char *format, ...) { (void)format; return 0; }
+static void adreno8_announce(const char *format, ...) { (void)format; }
 #define printf adreno8_say
 static void adreno8_settle(void) {}
 static uint64_t mach_absolute_time(void) { return clock_ns; }

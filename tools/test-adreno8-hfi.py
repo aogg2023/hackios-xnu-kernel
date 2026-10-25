@@ -23,7 +23,7 @@ static uint32_t table[1024], command[1024], response[1024], debug[1024], regs[4]
 static struct block adreno8_gmu;
 static vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd;
 static vm_offset_t adreno8_hfi_view_resp, adreno8_hfi_view_debug;
-static unsigned adreno8_step, scenario, sleeps, failures, response_reads, barriers;
+static unsigned adreno8_step, scenario, sleeps, failures, response_reads, barriers, diagnostic_calls;
 static uint64_t clock_ns;
 static uint32_t sent_header;
 #define GMU_HOST2GMU_SET 0
@@ -32,6 +32,9 @@ static uint32_t sent_header;
 #define GMU_FW_INIT_RESULT 12
 #define GMU_FW_FAILED 0xe00
 static int adreno8_say(const char *format, ...) { return 0; }
+static void adreno8_announce(const char *format, ...) {
+    (void)format; diagnostic_calls++; clock_ns += 2000000000ULL;
+}
 #define printf adreno8_say
 static void append(unsigned queue, const uint32_t *msg, unsigned words) {
     uint32_t *h = table + ADRENO8_HFI_HEADER(queue);
@@ -102,7 +105,7 @@ static void reset(unsigned test) {
     adreno8_hfi_view_cmd = (uintptr_t)command;
     adreno8_hfi_view_resp = (uintptr_t)response;
     adreno8_hfi_view_debug = (uintptr_t)debug;
-    scenario = test; sleeps = failures = response_reads = barriers = 0;
+    scenario = test; sleeps = failures = response_reads = barriers = diagnostic_calls = 0;
     clock_ns = 0;
 }
 int main(void) {
@@ -158,6 +161,10 @@ int main(void) {
     assert(!adreno8_hfi_send(14, NULL, 1, "test"));
     assert(!adreno8_hfi_send(14, msg, UINT32_MAX, "test"));
     assert(!adreno8_hfi_send(14, msg, 255, "test"));
+    reset(1); assert(adreno8_hfi_send(131, msg, 2, "RAW diagnostic pauses"));
+    assert(clock_ns == 4000000000ULL && diagnostic_calls == 2 && sleeps == 0);
+    reset(0); assert(!adreno8_hfi_send(131, msg, 2, "RAW timeout after pauses"));
+    assert(clock_ns == 5000000000ULL && diagnostic_calls == 2 && sleeps == 10000);
     puts("HFI layout, wrap, space, lengths, ACK identity, async errors and bounded waits: PASS");
 }
 '''

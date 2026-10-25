@@ -46,9 +46,13 @@ adreno8_queue_write(const uint32_t *msg, uint32_t dwords)
 		write = (write + 1) % ADRENO8_HFI_QUEUE_DWORDS;
 	}
 	adreno8_settle();
+	bool raw = (msg[0] & 0x000f00ffu) == 131;
+	if (raw) adreno8_announce("RAW131 payload ready: %u dwords; producer publication follows", dwords);
 	adreno8_wr(header + 44, write);
 	adreno8_settle();
+	if (raw) adreno8_announce("RAW131 producer published at %u; doorbell follows", write);
 	adreno8_wr(adreno8_gmu.base + GMU_HOST2GMU_SET, 1);
+	if (raw) printf("adreno8: RAW131 doorbell write returned\n");
 	return true;
 }
 
@@ -221,11 +225,12 @@ adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, const cha
 	adreno8_hfi_seq = (adreno8_hfi_seq + 1) & 0xfff;
 	msg[0] = (adreno8_hfi_seq << 20) | ((count + 1) << 8) | id;
 	for (uint32_t i = 0; i < count; i++) msg[i + 1] = payload[i];
-	start = mach_absolute_time();
 	if (!adreno8_queue_write(msg, count + 1)) {
 		printf("adreno8: %u: could not queue HFI %u (%s)\n", adreno8_step, id, what);
 		return adreno8_hfi_failed();
 	}
+	/* Start the ACK budget after queue publication and its optional diagnostic pauses. */
+	start = mach_absolute_time();
 	for (;;) {
 		bool ack = false;
 		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);

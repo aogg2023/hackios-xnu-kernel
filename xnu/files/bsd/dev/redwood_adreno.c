@@ -3468,7 +3468,7 @@ redwood_adreno_init(void)
 				    gpu_va >= 2 ? ", with that much again left unmapped after every buffer" : "",
 				    gpu_va);
 			}
-			RedwoodGPUStart();
+			if (!RedwoodGPUStart()) legacy_gpu_stop();
 			return;
 		}
 		if (!by_itself) {

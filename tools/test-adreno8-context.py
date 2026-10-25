@@ -247,6 +247,7 @@ static void reset(unsigned next_mode) {
     context_queue = context_timestamps = test_ib = test_result = NULL;
     context_queue_view = context_timestamp_view = 0;
     context_last = context_sequence = 0;
+    context_tested = false;
     mode = next_mode;
 }
 static void prepare_ib(void) {
@@ -261,9 +262,15 @@ static uint32_t submit(void) {
     return adreno8_context_submit(&address, &words, 1);
 }
 int main(void) {
+    reset(NORMAL);
+    assert(!adreno8_context_wait_idle("before self-test") && idle_calls == 0 && !closed);
     reset(NORMAL); ack_status = 7; /* Vendor accepts every status except UINT32_MAX. */
     assert(adreno8_context_test() && allocation_count == 4 && dispatches == 2 && command_count == 3);
     assert(context_state == CONTEXT_PREPARED && context_last == 2 && idle_calls == 4);
+    assert(adreno8_context_wait_idle("after self-test") && idle_calls == 5);
+    context_last = 0;
+    assert(adreno8_context_wait_idle("without a pending timestamp") && idle_calls == 6);
+    context_last = 2;
     assert(allocations[0].publishes == 1 && allocations[1].publishes == 1);
     assert(allocations[0].acquires == 0 && allocations[1].acquires == 0);
     assert(!adreno8_context_done(3) && adreno8_context_done(2));

@@ -11,6 +11,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "xnu/files/iokit/Kernel/RedwoodGPU.cpp"
 MEMORY = SOURCE.with_name("RedwoodGPUMemory.inc")
+SUBMIT = SOURCE.with_name("RedwoodGPUSubmit.inc")
 LEGACY = ROOT / "xnu/files/bsd/dev/redwood_gpu_service.inc"
 
 
@@ -134,6 +135,8 @@ struct IOUserClient {
     void terminate() { inactive = true; }
     void free() {}
 };
+static bool a830;
+static bool redwood_platform_is_annibale() { return a830; }
 static bool ready, mapped_ok, unmap_ok, fence_done, recover_ok;
 static unsigned map_calls, unmap_calls, freed_addresses, done_calls, submit_calls, map_fail_at;
 static uint32_t submit_answer;
@@ -169,7 +172,7 @@ static void reset() {
     assert(gGPULock->depth == 0);
     for (auto *m : IOMemoryDescriptor::allocated) delete m;
     IOMemoryDescriptor::allocated.clear();
-    ready = mapped_ok = unmap_ok = fence_done = true;
+    a830 = false; ready = mapped_ok = unmap_ok = fence_done = true;
     recover_ok = false;
     map_calls = unmap_calls = freed_addresses = done_calls = submit_calls = map_fail_at = 0;
     submit_answer = 17; next_address = 0x40000000; now = 0;
@@ -390,13 +393,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mutations", action="store_true")
     args = parser.parse_args()
-    source, memory, legacy = SOURCE.read_text(), MEMORY.read_text(), LEGACY.read_text()
-    legacy_functions = function(legacy, "redwood_gpu_mapped") + function(legacy, "redwood_gpu_unmap")
+    source = SOURCE.read_text().replace('#include "RedwoodGPUSubmit.inc"', SUBMIT.read_text())
+    memory, legacy = MEMORY.read_text(), LEGACY.read_text()
+    legacy_functions = function(legacy, "legacy_gpu_mapped") + function(legacy, "legacy_gpu_unmap")
     with tempfile.TemporaryDirectory(prefix="redwood-gpu-lifetime-") as temporary:
         folder = Path(temporary)
         execute(unit(source, memory), folder, "lifecycle_4k", page_size=4096)
         execute(unit(source, memory), folder, "lifecycle_16k")
-        execute(LEGACY_MODEL + legacy_functions + LEGACY_CASES, folder, "legacy")
+        execute(LEGACY_MODEL + legacy_functions + LEGACY_CASES.replace("redwood_gpu_", "legacy_gpu_"), folder, "legacy")
         if args.mutations:
             changes = [
                 ("release_stopped", memory, "gGPUReported || !redwood_gpu_ready() || (b->fence", "gGPUReported || (b->fence", False),
@@ -413,7 +417,7 @@ def main():
                 execute(unit(changed if in_source else source, memory if in_source else changed), folder, name, False)
             changed = legacy_functions.replace("return cleared && synced;", "return true;")
             assert changed != legacy_functions
-            execute(LEGACY_MODEL + changed + LEGACY_CASES, folder, "ignore_tlb", False)
+            execute(LEGACY_MODEL + changed + LEGACY_CASES.replace("redwood_gpu_", "legacy_gpu_"), folder, "ignore_tlb", False)
             print("8 lifecycle mutations detected")
 
 

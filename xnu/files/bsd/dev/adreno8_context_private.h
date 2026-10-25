@@ -19,5 +19,8 @@ bool adreno8_context_done(uint32_t timestamp);
 uint32_t adreno8_context_last(void);
 bool adreno8_context_close(void);
 bool adreno8_context_test(void);
+/* Require the completed stage-22 self-test, latest EOP and GPU idle. The caller
+ * keeps submissions serialized until its page-table operation has finished. */
+bool adreno8_context_wait_idle(const char *what);
 
 #endif

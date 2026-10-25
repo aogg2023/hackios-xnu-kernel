@@ -8,6 +8,9 @@
 #define ADRENO8_MEM_EXEC  4u
 #define ADRENO8_MEM_PRIV  8u
 
+#define ADRENO8_GPU_IOVA_START 0x10000000u
+#define ADRENO8_GPU_IOVA_END   0xe0000000u
+
 /* kgsl_iommu.h at d50b305f7da9: KGSL_IOMMU_SECURE_BASE32 starts the 32-bit secure
  * subset of the SECVID trusted range. The allocator's uint32_t exclusive
  * end leaves the final 4 KiB page unused. */

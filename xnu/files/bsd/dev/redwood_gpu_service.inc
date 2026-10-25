@@ -1,3 +1,5 @@
+#include "redwood_gpu_private.h"
+
 /* ---- the GPU kept on, for the system to draw with --------------------------------------------------- */
 
 /*
@@ -11,7 +13,7 @@
  *
  * Boot-arg gpu_recover=1: a submission the core never finishes does not cost the rest of the
  * run. The core's own half is reset and started again, and what was outstanding is given up
- * (redwood_gpu_recover() below, which says what is done and which source says so). Without it
+ * (legacy_gpu_recover() below, which says what is done and which source says so). Without it
  * such a submission is only reported, and the GPU stays stopped.
  */
 #define GPU_CHIP_ID             0x06030500ull   /* dt: qcom,chipid */
@@ -30,7 +32,7 @@
 #define CP_INDIRECT_BUFFER      0x3f
 #define EVENT_INVALIDATE_DEPTH  0x18
 #define EVENT_INVALIDATE_COLOR  0x19
-/* and, for a core that has stopped answering (gpu_recover=1: redwood_gpu_recover() below) */
+/* and, for a core that has stopped answering (gpu_recover=1: legacy_gpu_recover() below) */
 #define RBBM_SW_RESET_CMD       GPU_WORD(0x0043)        /* a6xx.xml; 1 holds the 3D core's own half (GX) in reset */
 #define RBBM_INT_CLEAR_CMD      GPU_WORD(0x0037)        /* the bits of rbbm_int_0_status written here are forgotten */
 #define GMU_PWR_COL_KEEPALIVE   GMU_WORD(0x50c3)        /* a6xx_gmu.xml; 1: the GMU keeps the core powered, whatever it makes of it */
@@ -62,7 +64,7 @@ static unsigned gpu_free_count;
  * ring at 0x01000000, the microcode at 0x01100000, the scratch page at 0x01200000, the test's
  * target at 0x10000000 -- and those are constants and not allocations: there is one of each
  * for the whole run. From GPU_ADDRESSES_START up the addresses are handed out a buffer at a
- * time by redwood_gpu_address() out of gpu_free, which is this driver's whole allocator: a
+ * time by legacy_gpu_address() out of gpu_free, which is this driver's whole allocator: a
  * list of what is not in use, lowest first, first fit, coalesced when given back.
  *
  * That division of labour is Linux's msm, not an invention here. There the kernel picks an
@@ -123,7 +125,7 @@ gpu_address_span(uint64_t size)
 	return gpu_va >= 2 ? span + GPU_ADDRESS_GRANULE : span;
 }
 
-extern void RedwoodGPUStart(void);
+extern bool RedwoodGPUStart(void);
 extern void RedwoodGPUStop(void);       /* takes the clients' lock, then calls redwood_gpu_stop() */
 static void gpu_block_stop(void);
 
@@ -137,7 +139,7 @@ static void gpu_block_stop(void);
  * a panic's in this respect, to see that work.
  */
 void
-redwood_gpu_stop(void)
+legacy_gpu_stop(void)
 {
 	if (gpu_kept) {
 		uint32_t waited = 0;
@@ -149,11 +151,11 @@ redwood_gpu_stop(void)
 		 * frame, the GMU may not answer. Half a second at the most; then its bus is halted
 		 * for good, and its power switched off from here.
 		 */
-		while (!redwood_gpu_done(gpu_fence) && waited < 5000) {
+		while (!legacy_gpu_done(gpu_fence) && waited < 5000) {
 			sleep_us(100);
 			waited++;
 		}
-		core_stuck = !redwood_gpu_done(gpu_fence);
+		core_stuck = !legacy_gpu_done(gpu_fence);
 		printf("adreno: the run is about to end: the GPU is given back (%s after %u us)\n",
 		    core_stuck ? "STILL AT WORK" : "it had finished what it was given", 100 * waited);
 		gpu_block_stop();
@@ -163,6 +165,10 @@ redwood_gpu_stop(void)
 void
 redwood_adreno_stop(void)
 {
+	if (redwood_platform_is_annibale()) {
+		RedwoodGPUStop();
+		return;
+	}
 	uint32_t dirty = 0;
 
 	if (gpu_kept && !(PE_parse_boot_argn("adreno_dirty", &dirty, sizeof(dirty)) && dirty)) {
@@ -171,14 +177,14 @@ redwood_adreno_stop(void)
 }
 
 bool
-redwood_gpu_ready(void)
+legacy_gpu_ready(void)
 {
 	return gpu_kept;
 }
 
 /* The answers to msm's GET_PARAM (Linux's adreno_get_param for this GPU; the numbers are msm_drm.h's). */
 bool
-redwood_gpu_parameter(uint32_t which, uint64_t *value)
+legacy_gpu_parameter(uint32_t which, uint64_t *value)
 {
 	switch (which) {
 	case 0x01:                              /* GPU_ID: none, the chip ID says it */
@@ -232,11 +238,11 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
 
 /*
  * Addresses for a buffer of so many bytes; 0: none left. The address is the buffer's from here
- * until redwood_gpu_address_free(): nothing moves a live buffer, which is what userspace is
+ * until legacy_gpu_address_free(): nothing moves a live buffer, which is what userspace is
  * promised when it asks MSM_INFO_GET_IOVA once and keeps the answer (as freedreno does).
  */
 uint64_t
-redwood_gpu_address(uint64_t size)
+legacy_gpu_address(uint64_t size)
 {
 	size = gpu_address_span(size);
 	for (unsigned i = 0; i < gpu_free_count; i++) {
@@ -258,7 +264,7 @@ redwood_gpu_address(uint64_t size)
 }
 
 void
-redwood_gpu_address_free(uint64_t address, uint64_t size)
+legacy_gpu_address_free(uint64_t address, uint64_t size)
 {
 	unsigned at;
 
@@ -302,7 +308,7 @@ redwood_gpu_address_free(uint64_t address, uint64_t size)
  * which is the distance to the one way this allocator fails: at 1024 it starts losing them.
  */
 void
-redwood_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes, unsigned *most, uint64_t *lost,
+legacy_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes, unsigned *most, uint64_t *lost,
     uint32_t *refused)
 {
 	*largest = 0;
@@ -319,15 +325,15 @@ redwood_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *h
 	*refused = gpu_va_refused;
 }
 
-/* One 4K page of ours at an address of the 3D core's; after the last of a buffer's, redwood_gpu_mapped(). */
+/* One 4K page of ours at an address of the 3D core's; after the last of a buffer's, legacy_gpu_mapped(). */
 bool
-redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+legacy_gpu_map(uint64_t address, uint64_t phys, bool read_only)
 {
 	return space_map(&core_space, address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
 }
 
 bool
-redwood_gpu_mapped(void)
+legacy_gpu_mapped(void)
 {
 	uint32_t context = smmu_context(&core_space);
 
@@ -342,26 +348,26 @@ redwood_gpu_mapped(void)
 }
 
 bool
-redwood_gpu_unmap(uint64_t address, uint64_t size)
+legacy_gpu_unmap(uint64_t address, uint64_t size)
 {
 	bool cleared = true;
 	for (uint64_t offset = 0; offset < size; offset += 4096) {
 		cleared &= space_map(&core_space, address + offset, 0, 0);
 	}
-	bool synced = redwood_gpu_mapped();
+	bool synced = legacy_gpu_mapped();
 	return cleared && synced;
 }
 
 /* Memory that the 3D core and a program see without this processor's cache in between: out of that cache. */
 void
-redwood_gpu_to_memory(void *start, uint64_t size)
+legacy_gpu_to_memory(void *start, uint64_t size)
 {
 	to_memory((vm_offset_t)start, size);
 }
 
 /* How far the 3D core has got. */
 bool
-redwood_gpu_done(uint32_t fence)
+legacy_gpu_done(uint32_t fence)
 {
 	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
 
@@ -370,7 +376,7 @@ redwood_gpu_done(uint32_t fence)
 }
 
 uint32_t
-redwood_gpu_last(void)
+legacy_gpu_last(void)
 {
 	return gpu_fence;
 }
@@ -425,7 +431,7 @@ gpu_times(void)
  * many of those took it under 0.1, 0.25, 0.5, 1, 2, 4 milliseconds and longer.
  */
 void
-redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
+legacy_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 {
 	gpu_times();
 	*microseconds = gpu_ticks * 10 / 192;
@@ -442,7 +448,7 @@ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]
  * full and the core is not reading it.
  */
 uint32_t
-redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+legacy_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
 	uint32_t wanted = 26 + 4 * count, room = 0;
 
@@ -487,7 +493,7 @@ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
 
 /* A submission does not come back: what the 3D core and its SMMU context say. */
 void
-redwood_gpu_report(const char *why)
+legacy_gpu_report(const char *why)
 {
 	uint32_t context = smmu_context(&core_space);
 
@@ -559,7 +565,7 @@ redwood_gpu_report(const char *why)
  * register it writes. Once per hang, that is evidence rather than noise.
  */
 bool
-redwood_gpu_recover(void)
+legacy_gpu_recover(void)
 {
 	uint32_t fence_status;
 

@@ -8,8 +8,6 @@
 #define MEMORY_COUNT 64u
 #define MEMORY_BLOCK_LIMIT (64u * 1024u * 1024u)
 #define MEMORY_TOTAL_LIMIT (128u * 1024u * 1024u)
-#define GPU_IOVA_START 0x10000000u
-#define GPU_IOVA_END 0xe0000000u
 #define GPU_MATCH 0u
 
 struct adreno8_memory_entry {
@@ -56,8 +54,8 @@ adreno8_memory_alloc(const char *name, uint32_t size, uint32_t alignment,
 	    allocated > MEMORY_TOTAL_LIMIT - adreno8_memory_bytes) {
 		return NULL;
 	}
-	if (gpu_prot && !adreno8_space_find_range(&adreno8_gpu_space, GPU_IOVA_START,
-	    GPU_IOVA_END, size, alignment, &gpu_address)) {
+	if (gpu_prot && !adreno8_space_find_range(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START,
+	    ADRENO8_GPU_IOVA_END, size, alignment, &gpu_address)) {
 		return NULL;
 	}
 	if (gmu_prot && (adreno8_gmu_space.table_count == 0 ||

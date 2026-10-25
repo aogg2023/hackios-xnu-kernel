@@ -26,6 +26,7 @@ static enum context_state context_state;
 static struct adreno8_memory *context_queue, *context_timestamps, *test_ib, *test_result;
 static vm_offset_t context_queue_view, context_timestamp_view;
 static uint32_t context_last, context_sequence;
+static bool context_tested;
 
 static bool
 context_fail(const char *what)
@@ -148,6 +149,15 @@ context_wait(uint32_t timestamp)
 	return true;
 }
 
+bool
+adreno8_context_wait_idle(const char *what)
+{
+	if (!context_tested || !context_health()) return false;
+	if ((context_last && !context_wait(context_last)) || !adreno8_gpu_wait_idle(what))
+		return context_fail("external buffer idle");
+	return true;
+}
+
 uint32_t
 adreno8_context_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
@@ -267,6 +277,7 @@ adreno8_context_test(void)
 		    CONTEXT_ID, pass, timestamp, result[0]);
 	}
 	if (!adreno8_context_close()) return false;
+	context_tested = true;
 	printf("adreno8: standard context reused for two non-privileged IBs and unregistered; resources retained until cold reset\n");
 	return true;
 }

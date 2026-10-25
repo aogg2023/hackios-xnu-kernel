@@ -184,9 +184,6 @@ adreno8_step_smmu_read(void)
 #define SMMU_CB_ATS1PR           0x800
 #define SMMU_CB_ATSR             0x8f0
 #define SMMU_IDR0_ATOSNS         (1u << 26)
-#define SMMU_PTE_XN              (3ULL << 53)
-#define SMMU_PTE_REQUIRED        (3ULL | 1ULL << 10 | 1ULL << 11)
-#define SMMU_PTE_VARIABLE        (3ULL << 6 | 3ULL << 8 | SMMU_PTE_XN)
 
 struct adreno8_gpu_space adreno8_gmu_space = { "gmu", GMU_CONTEXT };
 struct adreno8_gpu_space adreno8_gpu_space = { "gpu", 0 };
@@ -259,11 +256,30 @@ adreno8_space_new_table(struct adreno8_gpu_space *space, unsigned level, uint32_
 	return space->is_on ? 0 : adreno8_space_add_table(space, level, index);
 }
 
-static uint64_t *
+uint64_t *
 adreno8_space_entry(struct adreno8_gpu_space *space, uint32_t address)
 {
 	struct adreno8_space_table *leaf = adreno8_space_table(space, 2, address >> 21);
 	return leaf == NULL ? NULL : &((uint64_t *)leaf->table)[address >> 12 & 0x1ff];
+}
+
+bool
+adreno8_space_prepare_page(struct adreno8_gpu_space *space, uint32_t address)
+{
+	return (adreno8_space_table(space, 1, address >> 30) != NULL ||
+	    adreno8_space_add_table(space, 1, address >> 30) != 0) &&
+	    (adreno8_space_table(space, 2, address >> 21) != NULL ||
+	    adreno8_space_add_table(space, 2, address >> 21) != 0);
+}
+
+bool
+adreno8_space_publish(struct adreno8_gpu_space *space)
+{
+	if (!space->is_on) return false;
+	for (unsigned i = 0; i < space->table_count; i++) {
+		adreno8_to_memory(space->tables[i].table, SMMU_GRANULE);
+	}
+	return adreno8_space_sync(space);
 }
 
 bool
@@ -298,17 +314,14 @@ bool
 adreno8_space_map_region(struct adreno8_gpu_space *space, uint32_t address,
     vm_offset_t memory, uint32_t size, uint32_t prot)
 {
-	uint64_t attributes = SMMU_PTE_REQUIRED | 2ULL << 8;
+	uint64_t attributes = adreno8_space_attributes(prot);
 
-	if (!(prot & ADRENO8_MEM_READ) || (prot & ~15u) || memory == 0 || size == 0 ||
+	if (!attributes || memory == 0 || size == 0 ||
 	    ((address | memory | size) & SMMU_GRANULE_MASK) ||
 	    (uint64_t)address + size > (1ULL << 32) || memory + size < memory ||
 	    space->table_count == 0 || space->tables[0].level != 0) {
 		return false;
 	}
-	if (!(prot & ADRENO8_MEM_WRITE)) attributes |= 1ULL << 7;
-	if (!(prot & ADRENO8_MEM_PRIV)) attributes |= 1ULL << 6;
-	if (!(prot & ADRENO8_MEM_EXEC)) attributes |= SMMU_PTE_XN;
 	/* Preflight every PA and existing PTE before publishing any data mapping. */
 	for (uint64_t at = 0; at < size; at += SMMU_GRANULE) {
 		uint64_t phys = kvtophys(memory + at);
@@ -320,10 +333,7 @@ adreno8_space_map_region(struct adreno8_gpu_space *space, uint32_t address,
 	}
 	for (uint64_t at = 0; at < size; at += SMMU_GRANULE) {
 		uint32_t va = address + at;
-		if ((adreno8_space_table(space, 1, va >> 30) == NULL &&
-		    adreno8_space_add_table(space, 1, va >> 30) == 0) ||
-		    (adreno8_space_table(space, 2, va >> 21) == NULL &&
-		    adreno8_space_add_table(space, 2, va >> 21) == 0)) {
+		if (!adreno8_space_prepare_page(space, va)) {
 			return false;
 		}
 	}
@@ -333,10 +343,7 @@ adreno8_space_map_region(struct adreno8_gpu_space *space, uint32_t address,
 	/* Only invalid-to-valid additions are supported while a context is running.
 	 * The caller must retain backing memory on failure, including a TLB timeout. */
 	if (space->is_on) {
-		for (unsigned i = 0; i < space->table_count; i++) {
-			adreno8_to_memory(space->tables[i].table, SMMU_GRANULE);
-		}
-		return adreno8_space_sync(space);
+		return adreno8_space_publish(space);
 	}
 	return true;
 }
@@ -447,7 +454,10 @@ adreno8_space_verify(struct adreno8_gpu_space *space, bool atos)
 			if (pte == 0) {
 				continue;
 			}
+			bool external = space == &adreno8_gpu_space && space->context == 0;
+			if (external && pte == ADRENO8_PTE_EXTERNAL) continue;
 			uint64_t attributes = pte & ~PTE_ADDRESS;
+			if (external) attributes &= ~ADRENO8_PTE_EXTERNAL;
 			if ((attributes & ~SMMU_PTE_VARIABLE) != SMMU_PTE_REQUIRED ||
 			    (attributes & (3ULL << 8)) < (2ULL << 8) ||
 			    (pte & PTE_ADDRESS) == 0 || (pte & PTE_ADDRESS) >= SMMU_PHYS_LIMIT) {

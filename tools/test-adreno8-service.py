@@ -262,7 +262,7 @@ if __name__ == "__main__":
         variants = {
             "secure_iova_in_normal_range": ("adreno8_memory.c", memory.replace(
                 "&adreno8_secure_space, ADRENO8_SECURE_IOVA_START, ADRENO8_SECURE_IOVA_END",
-                "&adreno8_secure_space, GPU_IOVA_START, GPU_IOVA_END", 1), 0),
+                "&adreno8_secure_space, ADRENO8_GPU_IOVA_START, ADRENO8_GPU_IOVA_END", 1), 0),
             "normal_allocation_stays_closed": ("adreno8_memory.c", memory.replace(
                 closed, "state != SECURE_XFER_NOT_STARTED", 1), 0),
             "hfi_allocation_stays_closed": ("adreno8_memory.c", memory.replace(

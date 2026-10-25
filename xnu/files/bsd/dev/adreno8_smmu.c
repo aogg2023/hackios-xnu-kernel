@@ -335,14 +335,51 @@ adreno8_space_prepare_page(struct adreno8_gpu_space *space, uint32_t address)
 	    adreno8_space_add_table(space, 2, address >> 21) != 0);
 }
 
+/* What publishing has cost since the last line about it, written every 5 s while it goes on. */
+static struct {
+	uint32_t count;
+	uint64_t since, cleaning, total;
+} publish_cost;
+
+static void
+publish_note(unsigned tables, uint64_t began, uint64_t cleaned, uint64_t ended)
+{
+	uint64_t span, cleaning, total;
+
+	publish_cost.count++;
+	publish_cost.cleaning += cleaned - began;
+	publish_cost.total += ended - began;
+	if (publish_cost.since == 0) {
+		publish_cost.since = began;
+	}
+	absolutetime_to_nanoseconds(ended - publish_cost.since, &span);
+	if (span < 5 * NSEC_PER_SEC) {
+		return;
+	}
+	absolutetime_to_nanoseconds(publish_cost.cleaning, &cleaning);
+	absolutetime_to_nanoseconds(publish_cost.total, &total);
+	printf("adreno8: page tables published %u times in %llu ms: %u tables cleaned each, %llu us cleaning and %llu us in all on average\n",
+	    publish_cost.count, span / NSEC_PER_MSEC, tables, cleaning / 1000 / publish_cost.count, total / 1000 / publish_cost.count);
+	memset(&publish_cost, 0, sizeof(publish_cost));
+}
+
 bool
 adreno8_space_publish(struct adreno8_gpu_space *space)
 {
+	uint64_t began = mach_absolute_time(), cleaned;
+	bool quiet = adreno8_quiet, synced;
+
 	if (!space->is_on) return false;
 	for (unsigned i = 0; i < space->table_count; i++) {
 		adreno8_to_memory(space->tables[i].table, SMMU_GRANULE);
 	}
-	return adreno8_space_sync(space);
+	cleaned = mach_absolute_time();
+	/* (on every external buffer map and unmap while the GPU is in use: the TLB writes were announced at bring-up) */
+	adreno8_quiet = true;
+	synced = adreno8_space_sync(space);
+	adreno8_quiet = quiet;
+	publish_note(space->table_count, began, cleaned, mach_absolute_time());
+	return synced;
 }
 
 bool

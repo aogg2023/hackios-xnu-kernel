@@ -35,7 +35,7 @@ static uint32_t table[1024], commands[1024], responses[1024], debug[1024], regis
 static bool adreno8_direct_ring;
 static vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd;
 static vm_offset_t adreno8_hfi_view_resp, adreno8_hfi_view_debug;
-static uint32_t adreno8_step = 22, adreno8_gpu8_secure_mode = 4;
+static uint32_t adreno8_step = 22, adreno8_gpu8_secure_mode = 4, adreno8_inflight;
 static bool adreno8_reset_required;
 static bool gpu_ready, hardware_fault, closed, idle_ok = true;
 static unsigned failures, snapshots, idle_calls, command_count, dispatches, sleeps, mode;
@@ -43,7 +43,7 @@ static uint64_t clock_ns;
 static uint32_t ack_status, last_packet[255], last_packet_words, pending_timestamp, pending_read;
 enum { NORMAL, DELAY_EOP, RETIRE_ONLY, NACK_REGISTER, NACK_POINTERS, NACK_CLOSE,
        BAD_ACK, CONTEXT_BAD, ERROR_MESSAGE, CORRUPT_HFI, CORRUPT_RESULT, BAD_SOP,
-       GMU_FAULT, SMMU_FAULT, ALIAS_FAILURE, CORRUPT_CONTEXT, EOP_AHEAD, DELAY_READ, STUCK_READ };
+       GMU_FAULT, SMMU_FAULT, ALIAS_FAILURE, CORRUPT_CONTEXT, EOP_AHEAD, DELAY_READ, STUCK_READ, HOLD };
 #define GMU_HOST2GMU_SET 0
 #define GMU_GMU2HOST_INFO 4
 #define GMU_GMU2HOST_CLR 8
@@ -188,7 +188,7 @@ static void adreno8_wr(vm_offset_t address, uint32_t value) {
     }
     *(uint32_t *)address = value;
     if (address != adreno8_gmu.base + GMU_HOST2GMU_SET) return;
-    if (value == 4) { consume_context(); return; }
+    if (value == 4) { if (mode != HOLD) consume_context(); return; }
     assert(value == 1);
     uint32_t *q = table + ADRENO8_HFI_HEADER(0);
     unsigned read = q[10], size = (commands[read] >> 8) & 0xff;
@@ -220,6 +220,9 @@ static void adreno8_wr(vm_offset_t address, uint32_t value) {
 }
 static void adreno8_sleep_us(uint32_t us) {
     clock_ns += (uint64_t)us * 1000; sleeps++;
+    /* HOLD: the GPU takes one queued submission per sleep instead of at the doorbell. */
+    uint32_t *held = allocation_count ? (uint32_t *)allocations[0].device : NULL;
+    if (mode == HOLD && held && held[5] != held[6]) consume_context();
     if (pending_timestamp && sleeps % 5 == 0) {
         ((uint32_t *)allocations[1].device)[2] = pending_timestamp;
         pending_timestamp = 0;
@@ -255,6 +258,7 @@ static void reset(unsigned next_mode) {
     context_queue_view = context_timestamp_view = 0;
     context_last = context_sequence = 0;
     context_tested = false;
+    adreno8_inflight = 4;
     mode = next_mode;
 }
 static void prepare_ib(void) {
@@ -297,7 +301,7 @@ int main(void) {
     assert(last_packet_words == 11 && last_packet[0] >> 20 == 0 && adreno8_context_done(1));
 
     reset(NORMAL); prepare_ib(); q = (uint32_t *)context_queue_view; q[5] = 12;
-    assert(submit() == 0 && dispatches == 0 && context_state == CONTEXT_FAILED && closed);
+    assert(submit() == 0 && dispatches == 0 && context_state == CONTEXT_FAILED && closed && clock_ns >= 200000000ULL);
     assert(q[6] == 0 && allocation_count == 4);
     reset(NORMAL); prepare_ib(); q = (uint32_t *)context_queue_view; q[5] = 3;
     assert(submit() == 0 && dispatches == 0 && context_state == CONTEXT_FAILED);
@@ -328,12 +332,27 @@ int main(void) {
     reset(NORMAL); prepare_ib(); context_last = UINT32_MAX;
     ((uint32_t *)context_timestamp_view)[2] = UINT32_MAX;
     assert(submit() == 1 && adreno8_context_done(1));
+    /* Four submissions queue without waiting; the fifth waits for the first to retire. */
+    reset(NORMAL); prepare_ib(); mode = HOLD;
+    for (uint32_t i = 1; i <= 4; i++) assert(submit() == i);
+    assert(sleeps == 0 && dispatches == 0 && !adreno8_context_done(1));
+    assert(submit() == 5 && sleeps == 1 && dispatches == 1 && adreno8_context_done(1) && !adreno8_context_done(2));
+    /* adreno8_inflight=1: each submission waits for the one before. */
+    reset(NORMAL); prepare_ib(); mode = HOLD; adreno8_inflight = 1;
+    assert(submit() == 1 && sleeps == 0);
+    assert(submit() == 2 && sleeps == 1 && dispatches == 1);
+    /* Out-of-range values fall back to 1. */
+    reset(NORMAL); prepare_ib(); mode = HOLD; adreno8_inflight = 9;
+    assert(submit() == 1 && submit() == 2 && sleeps == 1);
+    /* A full queue is waited on until the GMU reads it; it fails only after the budget (above). */
+    reset(NORMAL); prepare_ib(); q = (uint32_t *)context_queue_view; q[5] = 12; pending_read = 0 + 1;
+    assert(submit() == 1 && sleeps == 3 && context_state == CONTEXT_REGISTERED);
     reset(NORMAL); gpu_ready = false;
     assert(!adreno8_context_test() && allocation_count == 0 && dispatches == 0);
     reset(NORMAL); idle_ok = false;
     assert(!adreno8_context_test() && dispatches == 1 && context_state == CONTEXT_FAILED);
     reset(NORMAL);
-    puts("HWSCHED context: wire sizes, permissions, cache views, wrap/full queue, two submits, reopen, ACK/EOP faults and retention: PASS");
+    puts("HWSCHED context: wire sizes, permissions, cache views, wrap/full queue, submissions in flight, reopen, ACK/EOP faults and retention: PASS");
     return 0;
 }
 '''

@@ -20,6 +20,7 @@
 #define CONTEXT_FLAGS 0x00101072u
 #define CONTEXT_NOTIFY (1u << 5)
 #define CONTEXT_WAIT_NS 200000000ULL
+#define CONTEXT_INFLIGHT_MAX 8u
 #define CONTEXT_CONSUME_NS 20000000ULL
 
 enum context_state { CONTEXT_COLD, CONTEXT_PREPARED, CONTEXT_REGISTERED, CONTEXT_FAILED };
@@ -170,6 +171,23 @@ context_consumed(void)
 	}
 }
 
+/* Waits until the GMU has read enough of the queue for `words` more; returns the write index. */
+static bool
+context_room(uint32_t words, uint32_t *write)
+{
+	uint64_t start = mach_absolute_time(), elapsed;
+	uint32_t read, empty;
+
+	for (;;) {
+		if (!context_queue_indices(&read, write)) return false;
+		empty = *write >= read ? CONTEXT_QUEUE_WORDS - (*write - read) : read - *write;
+		if (empty > words) return true;
+		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);
+		if (elapsed >= CONTEXT_WAIT_NS) return context_fail("queue full");
+		adreno8_sleep_us(100);
+	}
+}
+
 bool
 adreno8_context_wait_idle(const char *what)
 {
@@ -187,7 +205,7 @@ uint32_t
 adreno8_context_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
 	uint32_t msg[8 + ADRENO8_CONTEXT_MAX_IBS * 3] = {0};
-	uint32_t read, write, empty, length, aligned, timestamp;
+	uint32_t write, length, aligned, timestamp, depth;
 
 	/* Validate before registration or queue publication. IB_PRIV stays clear;
 	 * the HFI descriptor encodes each IB length in bytes. */
@@ -202,15 +220,13 @@ adreno8_context_submit(const uint64_t *addresses, const uint32_t *words, uint32_
 			return 0;
 		}
 	}
-	if (!context_register() || (context_last && !context_wait(context_last))) return 0;
-	if (!context_queue_indices(&read, &write)) return 0;
+	/* Up to `depth` submissions are outstanding: Mesa records and submits the next batch
+	 * while the GPU executes earlier ones. With `depth` outstanding, the oldest retires first. */
+	depth = adreno8_inflight >= 1 && adreno8_inflight <= CONTEXT_INFLIGHT_MAX ? adreno8_inflight : 1;
+	if (!context_register() || (context_last >= depth && !context_wait(context_last - depth + 1))) return 0;
 	length = 8 + count * 3;
 	aligned = (length + 3) & ~3u;
-	empty = write >= read ? CONTEXT_QUEUE_WORDS - (write - read) : read - write;
-	if (empty <= aligned) {
-		context_fail("queue full");
-		return 0;
-	}
+	if (!context_room(aligned, &write)) return 0;
 	timestamp = context_last + 1;
 	if (!timestamp) timestamp = 1;
 	context_sequence = (context_sequence + 1) & 0xfff;

@@ -58,6 +58,8 @@
  * adreno8_arc_read=1  stage-1 diagnostic: Apps DRV2 cx.lvl then mx.lvl reads; requires explicit
  *                  touchscreen=0 and a host cold reset after any register write
  * adreno8_speed=N     GX operating point; only 1 (160 MHz) is exposed before SKU selection
+ * adreno8_inflight=N  submissions the context queue may hold ahead of the GPU, 1 to 8 (default 4);
+ *                  1 waits for each submission before the next, as stage 23 first did
  * adreno8_gmuclk=1    retain CX/MX votes, initialize GMU 650/HUB 200 MHz, then GMU 500
  *                  after START; requires touchscreen=0 wfi=0 wfe_mode=0; default uses the crystal
  * adreno8_gmuclk=2    full stages 1..5 or 1..17 and later: highest supported CX/MX WRITE completion;
@@ -86,6 +88,8 @@
 uint32_t adreno8_skip_steps, adreno8_pause_ms = 2200, adreno8_fine, adreno8_watch_seconds = 20;
 
 uint32_t adreno8_speed_asked;                  /* adreno8_speed: 1 lowest (step 15) */
+
+uint32_t adreno8_inflight = 4;                 /* adreno8_inflight (adreno8_context_submit) */
 
 uint32_t adreno8_gmu_from_pll;                 /* adreno8_gmuclk */
 
@@ -371,6 +375,7 @@ adreno8_init(void)
 	PE_parse_boot_argn("adreno8_pause", &adreno8_pause_ms, sizeof(adreno8_pause_ms));
 	PE_parse_boot_argn("adreno8_watch", &adreno8_watch_seconds, sizeof(adreno8_watch_seconds));
 	PE_parse_boot_argn("adreno8_speed", &adreno8_speed_asked, sizeof(adreno8_speed_asked));
+	PE_parse_boot_argn("adreno8_inflight", &adreno8_inflight, sizeof(adreno8_inflight));
 	PE_parse_boot_argn("adreno8_gmuclk", &adreno8_gmu_from_pll, sizeof(adreno8_gmu_from_pll));
 	adreno8_gpu8_keep = PE_parse_boot_argn("adreno8_keep", &one, sizeof(one)) && one != 0;
 	one = 0;

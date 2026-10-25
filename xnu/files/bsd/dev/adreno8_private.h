@@ -86,7 +86,11 @@ struct adreno8_gpu_space {
 };
 
 #define GCC_DDRSS_GPU_AXI       0x71150         /* branch2_aon: memory clock (gcc-sm8750.c); its halt report is unreliable */
+#define GCC_GPU_GEMNOC_GFX      0x71010         /* gcc-sun.c: voted branch2_aon; GMU memnoc_clk */
 #define CBCR_ENABLE             (1u << 0)       /* a clock's control register: on */
+#define CBCR_HWCG               (1u << 1)
+#define CBCR_NOC_STATUS         (7u << 28)
+#define CBCR_NOC_ON             (2u << 28)
 #define CBCR_OFF                (1u << 31)      /* ... and whether it is in fact off */
 #define CMD_DB_PHYS             0x81c60000UL
 #define CMD_DB_SIZE             0x20000UL

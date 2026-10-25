@@ -6,11 +6,10 @@
 /* ---- step 1: what feeds the GPU from outside --------------------------------------------------------- */
 
 /*
- * dt: clock-controller@100000. Of the GPU's clocks here only gcc_ddrss_gpu_axi (0x71150, the
- * memory bus tap) is interesting and writable: gcc_gpu_cfg_ahb, the clock of the GPU clock
- * controller's own registers, is on this SoC among the clock controller's PROTECTED clocks --
- * the hypervisor's, with no clock driver entry in Linux at all -- so it is neither written nor
- * depended on; the loader runs it, and step 2 reads whether that is still true.
+ * gcc-sun.c defines independent DDRSS_GPU_AXI (0x71150) and GPU_GEMNOC_GFX (0x71010)
+ * branches. GPUCC MEMNOC_GFX (0x90f4) is another independent branch. GCC_GPU_CFG_AHB has
+ * no entry in gcc_sun_clocks[]; this probe preserves its loader configuration and checks
+ * GPUCC register access in step 2.
  */
 
 static struct adreno8_block adreno8_gcc = { "gcc", 0x00100000, 0x80000 };
@@ -281,7 +280,7 @@ adreno8_step_outside(void)
 	printf("adreno8: %u: bin %u: the 3D core has %u speeds, to %u Hz; levels %#x..%#x\n", adreno8_step, bin, adreno8_speeds_count,
 	    adreno8_speeds[adreno8_speeds_count - 1].hz, adreno8_speeds[0].level, adreno8_speeds[adreno8_speeds_count - 1].level);
 
-	adreno8_announce("read the GPU's memory clock in the global clock controller; its register-bus clock (gcc_gpu_cfg_ahb) is one of the hypervisor's PROTECTED clocks here: no offset, no driver, nothing to read or write -- the loader runs it and step 2 will show whether registers answer");
+	adreno8_announce("read GCC DDRSS_GPU_AXI; preserve the loader's CFG_AHB configuration because gcc_sun_clocks has no entry for it; step 2 checks GPUCC register access");
 	adreno8_get(&adreno8_gcc, "ddrss_gpu_axi", GCC_DDRSS_GPU_AXI);
 
 	adreno8_announce("look up the GPU's supplies and bus monitors in the boot loader's list of what RPMh can switch (memory at 0x81c60000)");
@@ -380,6 +379,27 @@ adreno8_clock_on(struct adreno8_block *b, const char *name, uint32_t cbcr, bool 
 	printf("adreno8: %u: %s %s stays off (%#x)%s\n", adreno8_step, b->name, name, adreno8_rd(b->base + cbcr),
 	    must ? "" : "; its status bit is not one to rely on, going on");
 	return !must;
+}
+
+static bool
+adreno8_gemnoc_on(void)
+{
+	uint32_t value = adreno8_set(&adreno8_gcc, "gpu_gemnoc_gfx", GCC_GPU_GEMNOC_GFX, CBCR_ENABLE);
+
+	/* gcc-sun.c uses BRANCH_HALT_VOTED. clk-branch.c skips halt polling
+	 * with HWCG enabled; otherwise CLK_OFF=0 or NOC_FSM=ON confirms enable. */
+	for (unsigned i = 0; i < 200; i++) {
+		if (value == 0xffffffffu || !(value & CBCR_ENABLE)) {
+			printf("adreno8: %u: GCC GPU GEMNOC enable vote was not accepted (%#x)\n", adreno8_step, value);
+			return false;
+		}
+		if ((value & CBCR_HWCG) || !(value & CBCR_OFF) || (value & CBCR_NOC_STATUS) == CBCR_NOC_ON)
+			return true;
+		adreno8_sleep_us(1);
+		value = adreno8_rd(adreno8_gcc.base + GCC_GPU_GEMNOC_GFX);
+	}
+	printf("adreno8: %u: GCC GPU GEMNOC enable timed out (%#x)\n", adreno8_step, value);
+	return false;
 }
 
 bool
@@ -522,7 +542,7 @@ adreno8_step_cx_awake(void)
 	return true;
 }
 
-/* ---- step 5: its clocks ---------------------------------------------------------------------------------- */
+/* ---- step 5: GMU clocks and independent GCC/GPUCC bus branches ------------------------------------------ */
 
 bool
 adreno8_step_clocks(void)
@@ -534,10 +554,12 @@ adreno8_step_clocks(void)
 		printf("adreno8: %u: CX is off: step 3\n", adreno8_step);
 		return false;
 	}
-	adreno8_announce("in the global clock controller: the GPU's memory bus tap on (gcc 0x71150; its halt report is unreliable: tolerated); the register-bus clock of the GPU controller is the hypervisor's protected one: nothing to write");
+	adreno8_announce("vote for GCC DDRSS_GPU_AXI (0x71150; halt timeout is tolerated) and GCC GPU_GEMNOC_GFX (0x71010); preserve the loader's CFG_AHB configuration");
 	if (!adreno8_clock_on(&adreno8_gcc, "ddrss_gpu_axi", GCC_DDRSS_GPU_AXI, false)) {
 		return false;
 	}
+	if (!adreno8_gemnoc_on())
+		return false;
 
 	adreno8_announce("in the GPU's clock controller: the GMU's clock source to the crystal (parent 0; adreno8_gmuclk=1 would ask PLL0_OUT_EVEN, parent 2, whose PLL offsets are unverified: see the header)");
 	if (!adreno8_clock_source("gmu_clk_src", GPUCC_GMU_RCGR, adreno8_gmu_from_pll ? (2u << 8) | 1u : 0)) {
@@ -549,7 +571,7 @@ adreno8_step_clocks(void)
 			adreno8_get(&adreno8_gpucc, "pll0 area, read only", 4 * i);
 		}
 	}
-	adreno8_announce("in the GPU's clock controller: the clocks of the GMU and of the way in on; the hub's source is left as the loader set it (its parents are unverified); the ones whose halt report lies are tolerated");
+	adreno8_announce("enable GPUCC GMU, AHB and MEMNOC_GFX (0x90f4) branches; MEMNOC_GFX is independent of the two GCC branches; keep the loader's HUB source and tolerate optional branch halt timeouts");
 	if (!adreno8_clock_on(&adreno8_gpucc, "cxo", GPUCC_CX_CBCR, true) ||
 	    !adreno8_clock_on(&adreno8_gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, true) ||
 	    !adreno8_clock_on(&adreno8_gpucc, "ahb", GPUCC_AHB_CBCR, false) ||

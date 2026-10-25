@@ -17,8 +17,18 @@ power_function = driver[start:end]
 start = driver.index("adreno8_scm_gpu_init(")
 end = driver.index("\n}\n", start) + 2
 scm_function = driver[start:end]
+start = driver.index("adreno8_gemnoc_on(")
+end = driver.index("\n}\n", start) + 2
+gemnoc_function = driver[start:end]
+start = driver.index("adreno8_step_clocks(")
+end = driver.index("\n}\n", start) + 2
+clocks_function = driver[start:end]
+common = (ROOT / "xnu/files/bsd/dev/adreno8.c").read_text()
+start = common.index("adreno8_set(")
+end = common.index("\n}\n", start) + 2
+set_function = common[start:end]
 structure = re.search(r"struct adreno8_bcm_db \{.*?\n};", header, re.S).group()
-constants = "\n".join(line for line in header.splitlines() if line.startswith(("#define RCG_SOURCE_MASK ", "#define RCG_UPDATE ", "#define GPUCC_CX_GDSCR ", "#define GPUCC_CX_HW_CTRL ", "#define GDSC_")))
+constants = "\n".join(line for line in header.splitlines() if line.startswith(("#define RCG_SOURCE_MASK ", "#define RCG_UPDATE ", "#define GPUCC_", "#define GCC_", "#define CBCR_", "#define GDSC_")))
 constants += "\n" + re.search(r"#define BCM_TCS_CMD[^\n]*\n[^\n]*", header).group()
 source = r'''
 #include <assert.h>
@@ -26,10 +36,12 @@ source = r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+''' + constants + r'''
 struct adreno8_block { unsigned base; };
-static struct adreno8_block adreno8_gpucc;
-static unsigned adreno8_step, writes;
-static uint32_t regs[0x10000 / 4];
+static struct adreno8_block adreno8_gpucc, adreno8_gcc = {0x10000};
+static unsigned adreno8_step, writes, branches, gemnoc_sleeps, gemnoc_ready_after;
+static uint32_t regs[0x90000 / 4], adreno8_gmu_from_pll;
+static bool reject_gemnoc;
 static bool accept = true;
 static int scm_status[2], scm_calls;
 static uint64_t scm_answer;
@@ -48,21 +60,29 @@ static const void *adreno8_speeds;
 static bool adreno8_gpucc_answers(void) { return true; }
 static bool adreno8_cx_is_on(void) { return powered; }
 static void adreno8_announce(const char *s) {}
-static void adreno8_sleep_us(unsigned us) {}
+static void adreno8_sleep_us(unsigned us) {
+    if (us == 1 && ++gemnoc_sleeps == gemnoc_ready_after)
+        regs[(adreno8_gcc.base + GCC_GPU_GEMNOC_GFX) / 4] &= ~CBCR_OFF;
+}
 static uint64_t mach_absolute_time(void) { return 0; }
 static void absolutetime_to_nanoseconds(uint64_t t, uint64_t *ns) { *ns = 0; }
-static uint32_t adreno8_get(struct adreno8_block *b, const char *n, uint32_t off) { return regs[off / 4]; }
+static uint32_t adreno8_get(struct adreno8_block *b, const char *n, uint32_t off) { return regs[(b->base + off) / 4]; }
 static uint32_t adreno8_rd(unsigned off) { return regs[off / 4]; }
 static void adreno8_put(struct adreno8_block *b, const char *n, uint32_t off, uint32_t value) {
-    regs[off / 4] = value; writes++;
+    regs[(b->base + off) / 4] = value; writes++;
+    if (b == &adreno8_gcc && off == GCC_GPU_GEMNOC_GFX && reject_gemnoc)
+        regs[(b->base + off) / 4] &= ~CBCR_ENABLE;
     if (off == 0) assert(value == 3); /* ROOT_EN is preserved; UPDATE is bit 0. */
 }
 static bool adreno8_wait_for(struct adreno8_block *b, unsigned off, unsigned mask, unsigned value, unsigned ms) {
-    assert(off == 0 && mask == 1 && value == 0);
-    if (accept) regs[0] &= ~1u;
+    assert((off == 0 || off == GPUCC_GMU_RCGR) && mask == 1 && value == 0);
+    if (accept) regs[off / 4] &= ~1u;
     return accept;
 }
-''' + constants + "\n" + structure + "\nbool\n" + function + "\nbool\n" + power_function + "\nbool\n" + scm_function + r'''
+static bool adreno8_clock_on(struct adreno8_block *b, const char *name, uint32_t cbcr, bool must) {
+    branches++; return true;
+}
+''' + structure + "\nuint32_t\n" + set_function + "\nstatic bool\n" + gemnoc_function + "\nbool\n" + function + "\nbool\n" + power_function + "\nbool\n" + scm_function + "\nbool\n" + clocks_function + r'''
 int main(void) {
     scm_answer = 1; assert(adreno8_scm_gpu_init() && scm_calls == 2);
     scm_calls = 0; scm_answer = 0; assert(adreno8_scm_gpu_init() && scm_calls == 1);
@@ -99,6 +119,37 @@ int main(void) {
     regs[GPUCC_CX_GDSCR / 4] = 0x8222f800;
     assert(adreno8_step_cx_power());
     assert(writes == 0 && !adreno8_cx_changed);
+    assert(GCC_GPU_GEMNOC_GFX == 0x71010);
+    assert(CBCR_HWCG == 2 && CBCR_OFF == 0x80000000u);
+    assert(CBCR_NOC_STATUS == 0x70000000u && CBCR_NOC_ON == 0x20000000u);
+    uint32_t *gemnoc = &regs[(adreno8_gcc.base + GCC_GPU_GEMNOC_GFX) / 4];
+    const uint32_t shared = (1u << 22) | (1u << 9);
+    *gemnoc = shared | CBCR_OFF | CBCR_HWCG;
+    assert(adreno8_gemnoc_on() && writes == 1 && gemnoc_sleeps == 0);
+    assert(*gemnoc == (shared | CBCR_OFF | CBCR_HWCG | CBCR_ENABLE));
+    assert(adreno8_gemnoc_on() && writes == 1); /* Inherited enable stays unchanged. */
+    reject_gemnoc = true; *gemnoc &= ~CBCR_ENABLE;
+    assert(!adreno8_gemnoc_on() && writes == 2 && gemnoc_sleeps == 0);
+    reject_gemnoc = false; *gemnoc = shared;
+    assert(adreno8_gemnoc_on() && *gemnoc == (shared | CBCR_ENABLE));
+    *gemnoc = shared | CBCR_OFF | CBCR_NOC_ON;
+    assert(adreno8_gemnoc_on() && gemnoc_sleeps == 0);
+    *gemnoc = shared | CBCR_OFF;
+    gemnoc_ready_after = 3;
+    assert(adreno8_gemnoc_on() && gemnoc_sleeps == 3);
+    *gemnoc = shared | CBCR_OFF | (1u << 28);
+    gemnoc_sleeps = gemnoc_ready_after = 0;
+    assert(!adreno8_gemnoc_on() && gemnoc_sleeps == 200);
+    *gemnoc = UINT32_MAX; writes = 0; gemnoc_sleeps = 0;
+    assert(!adreno8_gemnoc_on() && writes == 0 && gemnoc_sleeps == 0);
+    powered = true; accept = true; branches = 0; reject_gemnoc = true;
+    *gemnoc = CBCR_HWCG | CBCR_OFF;
+    regs[GPUCC_GMU_RCGR / 4 + 1] = 0x100501;
+    assert(!adreno8_step_clocks() && branches == 1);
+    assert(regs[GPUCC_GMU_RCGR / 4 + 1] == 0x100501);
+    reject_gemnoc = false; branches = 0;
+    regs[GPUCC_GMU_RCGR / 4 + 1] = 0x100000;
+    assert(adreno8_step_clocks() && branches > 1 && (*gemnoc & CBCR_ENABLE));
 }
 '''
 with tempfile.TemporaryDirectory(prefix="adreno8-config-") as directory:
@@ -107,4 +158,4 @@ with tempfile.TemporaryDirectory(prefix="adreno8-config-") as directory:
     src.write_text(source)
     subprocess.run(["cc", "-std=c11", str(src), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
-print("BCM layout, RCG update, preserved bits, power failure and inherited power: PASS")
+print("BCM layout, RCG update, power, GEMNOC vote/HWCG/NOC/timeout and startup order: PASS")

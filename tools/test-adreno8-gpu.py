@@ -413,6 +413,7 @@ int main(int argc, char **argv)
     }
     reset(); prepare(); raw_nop_asked = 3;
     assert(!adreno8_gpu_cp_init() && !raw_calls && !gx_reads && !gx_writes);
+    assert(!oob_requested && !oob_acked);
     reset(); prepare(); smmu_after_raw = true;
     assert(!adreno8_gpu_cp_init() && gpu_state == GPU_FAILED);
     reset(); prepare(); idle_ok = false;

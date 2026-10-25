@@ -403,7 +403,7 @@ adreno8_gpu_cp_init(void)
 	    !gpu_ucode_base(GEN8_CP_AQE_INSTR_BASE_LO_0, aqe))
 		return false;
 	/* The vendor first sends CP_INIT. This diagnostic stops after one NOP,
-	 * or five NOPs with the same message length as CP_INIT; CP stays uninitialized. */
+	 * or five NOPs with the same message length as CP_INIT; CP_READY is never set. */
 	if (raw_nop) {
 		uint32_t count = raw_nop == 1 ? 2 : 10;
 		for (uint32_t i = 0; i < count; i += 2) {

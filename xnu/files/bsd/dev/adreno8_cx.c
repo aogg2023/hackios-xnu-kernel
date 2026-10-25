@@ -1,5 +1,6 @@
 /* SM8750 GPU power, clocks, CMD DB and SCM initialization. */
 #include "adreno8_private.h"
+#include "adreno8_rpmh_private.h"
 
 #define printf adreno8_say
 
@@ -341,7 +342,7 @@ adreno8_step_outside(void)
 	if (adreno8_cmd_db == NULL) {
 		printf("adreno8: %u: no list to read messages from: steps 13 on will fail\n", adreno8_step);
 	}
-	return adreno8_rsc_read();
+	return adreno8_rsc_read() && adreno8_rpmh_arc_read();
 }
 
 /* ---- step 2: the GPU's clock controller, as left ------------------------------------------------------- */

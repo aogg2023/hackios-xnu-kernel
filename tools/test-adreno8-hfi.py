@@ -24,6 +24,8 @@ static struct block adreno8_gmu;
 static vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd;
 static vm_offset_t adreno8_hfi_view_resp, adreno8_hfi_view_debug;
 static unsigned adreno8_step, scenario, sleeps, failures, response_reads, barriers, diagnostic_calls;
+static unsigned memory_failures, feature_logs;
+static char feature_log[160];
 static uint64_t clock_ns;
 static uint32_t sent_header;
 #define GMU_HOST2GMU_SET 0
@@ -31,7 +33,16 @@ static uint32_t sent_header;
 #define GMU_GMU2HOST_CLR 8
 #define GMU_FW_INIT_RESULT 12
 #define GMU_FW_FAILED 0xe00
-static int adreno8_say(const char *format, ...) { return 0; }
+static int adreno8_say(const char *format, ...) {
+    if (strstr(format, "HFI 11 ACK:")) {
+        va_list args;
+        va_start(args, format);
+        vsnprintf(feature_log, sizeof(feature_log), format, args);
+        va_end(args);
+        feature_logs++;
+    }
+    return 0;
+}
 static void adreno8_announce(const char *format, ...) {
     (void)format; diagnostic_calls++; clock_ns += 2000000000ULL;
 }
@@ -45,6 +56,10 @@ static void append(unsigned queue, const uint32_t *msg, unsigned words) {
 static void ack(unsigned queue, uint32_t echo, unsigned words, uint32_t status) {
     uint32_t msg[3] = {(1u << 16) | (words << 8), echo, status};
     append(queue, msg, words);
+}
+static void feature_ack(unsigned queue, uint32_t echo, uint32_t data, uint32_t error) {
+    const uint32_t msg[4] = {(1u << 16) | (4u << 8), echo, data, error};
+    append(queue, msg, 4);
 }
 static void emit_debug(void) {
     const uint32_t msg[4] = {(4u << 8) | 101, 1, 2, 3};
@@ -78,6 +93,16 @@ static void adreno8_wr(vm_offset_t address, uint32_t value) {
     case 10: ack(1, sent_header | (1u << 19), 3, 0); break;
     case 11: ack(2, sent_header, 3, 0); break;
     case 12: regs[3] = GMU_FW_FAILED; break;
+    case 13: feature_ack(1, sent_header, 0, 0); break;
+    case 14: feature_ack(1, sent_header, 0, 6); break;
+    case 15: feature_ack(1, sent_header, 0, 8); break;
+    case 16: feature_ack(1, sent_header, 1, 0); break;
+    case 17: feature_ack(1, sent_header, UINT32_MAX, 0); break;
+    case 18: feature_ack(1, sent_header ^ (1u << 20), 0, 6); break;
+    case 19: feature_ack(2, sent_header, 0, 8); break;
+    case 20: feature_ack(1, sent_header | (1u << 19), 0, 0); break;
+    case 21: feature_ack(1, sent_header, 0, 0x1234); break;
+    case 22: ack(1, sent_header ^ (1u << 20), 3, 0); break;
     }
 }
 static void adreno8_settle(void) { barriers++; }
@@ -88,11 +113,13 @@ static void adreno8_sleep_us(uint32_t us) {
     if (scenario == 6) emit_debug();
     if ((scenario == 2 || scenario == 3 || scenario == 9 || scenario == 11) && sleeps == 1)
         ack(1, sent_header, 3, 0);
+    if ((scenario == 18 || scenario == 19 || scenario == 22) && sleeps == 1)
+        feature_ack(1, sent_header, 0, 0);
 }
 #define SECURE_MODE_TRANSLATION_B 4u
 static uint32_t adreno8_gpu8_secure_mode;
 static bool adreno8_gpu_faulted(void) { return false; }
-void adreno8_hwsched_memory_failed(void) {}
+void adreno8_hwsched_memory_failed(void) { memory_failures++; }
 static void adreno8_gmu_post_mortem(void) { failures++; }
 static bool adreno8_hwsched_request(const uint32_t *request, uint32_t words, uint32_t *reply, uint32_t *reply_words) { return false; }
 ''' + FUNCTIONS + r'''
@@ -106,6 +133,7 @@ static void reset(unsigned test) {
     adreno8_hfi_view_resp = (uintptr_t)response;
     adreno8_hfi_view_debug = (uintptr_t)debug;
     scenario = test; sleeps = failures = response_reads = barriers = diagnostic_calls = 0;
+    memory_failures = feature_logs = 0; feature_log[0] = 0;
     clock_ns = 0;
 }
 int main(void) {
@@ -165,7 +193,38 @@ int main(void) {
     assert(clock_ns == 4000000000ULL && diagnostic_calls == 2 && sleeps == 0);
     reset(0); assert(!adreno8_hfi_send(131, msg, 2, "RAW timeout after pauses"));
     assert(clock_ns == 5000000000ULL && diagnostic_calls == 2 && sleeps == 10000);
-    puts("HFI layout, wrap, space, lengths, ACK identity, async errors and bounded waits: PASS");
+    const uint32_t feature[3] = {1, 1, 0};
+    for (unsigned i = 14; i <= 17; i++) {
+        reset(i); assert(!adreno8_hfi_send(11, feature, 3, "FEATURE_CTRL v5 rejected"));
+        assert(feature_logs == 1 && memory_failures == 1 && failures == 1 && sleeps == 0);
+        if (i == 14) assert(strstr(feature_log, "data 0 error 0x6"));
+        if (i == 15) assert(strstr(feature_log, "data 0 error 0x8"));
+        if (i == 16) assert(strstr(feature_log, "data 0x1 error 0"));
+    }
+    reset(13); assert(adreno8_hfi_send(11, feature, 3, "FEATURE_CTRL v5"));
+    assert(response_reads == 4 && feature_logs == 1 && !memory_failures && !failures);
+    assert(strstr(feature_log, "data 0 error 0"));
+    reset(1); assert(!adreno8_hfi_send(11, feature, 3, "short FEATURE_CTRL v5"));
+    assert(response_reads == 3 && !feature_logs && memory_failures == 1 && failures == 1);
+    for (unsigned i = 18; i <= 20; i++) {
+        reset(i); assert(adreno8_hfi_send(11, feature, 3, "FEATURE_CTRL ACK identity"));
+        assert(feature_logs == 1 && !memory_failures && !failures && sleeps == (i == 20 ? 0 : 1));
+    }
+    reset(21); assert(!adreno8_hfi_send(11, feature, 3, "unknown FEATURE_CTRL error"));
+    assert(memory_failures == 1 && failures == 1);
+    reset(22); assert(adreno8_hfi_send(11, feature, 3, "unrelated short ACK"));
+    assert(feature_logs == 1 && sleeps == 1 && !memory_failures && !failures);
+    const unsigned ordinary[] = {3, 14, 15};
+    for (unsigned i = 0; i < sizeof(ordinary) / sizeof(*ordinary); i++) {
+        reset(1); assert(adreno8_hfi_send(ordinary[i], NULL, 0, "ordinary three-word ACK"));
+        reset(4); assert(!adreno8_hfi_send(ordinary[i], NULL, 0, "ordinary nonzero status"));
+    }
+    const unsigned asynchronous[] = {10, 128, 129, 131, 134};
+    for (unsigned i = 0; i < sizeof(asynchronous) / sizeof(*asynchronous); i++) {
+        reset(4); assert(adreno8_hfi_send(asynchronous[i], msg, 2, "async positive data"));
+        reset(17); assert(!adreno8_hfi_send(asynchronous[i], msg, 2, "async failure"));
+    }
+    puts("HFI layout, wrap, lengths, FEATURE_CTRL v5, ACK identity, async errors and bounded waits: PASS");
 }
 '''
 STAGE_FUNCTIONS = DRIVER[DRIVER.index("bool\nadreno8_step_queues("):DRIVER.index("/* ---- step 16:")]
@@ -339,6 +398,24 @@ int main(void) {
 '''
 
 checks = [("queues", SOURCE, False), ("power tables", STAGE_SOURCE, False)]
+feature_mutations = [
+    ("missing FEATURE_CTRL error", "if (resp[3] != 0) return false;", "if (false) return false;"),
+    ("limited FEATURE_CTRL errors", "if (resp[3] != 0) return false;", "if (resp[3] == 6 || resp[3] == 8) return false;"),
+    ("wrong FEATURE_CTRL error field", "if (resp[3] != 0) return false;", "if (resp[2] != 0) return false;"),
+    ("short FEATURE_CTRL ACK accepted", "if (words < 4)", "if (words < 3)"),
+    ("positive FEATURE_CTRL data accepted", "hwsched ? resp[2] == 0xffffffffu : resp[2] != 0", "hwsched ? resp[2] == 0xffffffffu : (id != 11 && resp[2] != 0)"),
+    ("FEATURE_CTRL contract for ordinary ACK", "if (id == 11)", "if (true)"),
+]
+for label, before, after in feature_mutations:
+    assert SOURCE.count(before) == 1, label
+    checks.append((label, SOURCE.replace(before, after, 1), True))
+feature_start = SOURCE.index("\t\t\t\t/* FEATURE_CTRL uses")
+feature_end = SOURCE.index("\t\t\t\t/* These HWSCHED", feature_start)
+feature_block = SOURCE[feature_start:feature_end]
+without_feature = SOURCE[:feature_start] + SOURCE[feature_end:]
+identity_start = without_feature.index("\t\t\t\t/* Gen8 echoes")
+checks.append(("FEATURE_CTRL checked before ACK identity",
+    without_feature[:identity_start] + feature_block + without_feature[identity_start:], True))
 vote_mutations = [
     ("missing dependency high nibble", "0xffffc000u", "0x0fffc000u"),
     ("wrong MX dependency field", "(j << 8) | 0xff", "(j << 6) | 0xff"),
@@ -366,3 +443,4 @@ for label, source, rejected in checks:
             assert result.returncode == 0, result.stdout + result.stderr
             print(result.stdout, end="")
 print("HFI power encoding mutations rejected:", len(vote_mutations))
+print("HFI FEATURE_CTRL v5 mutations rejected:", len(feature_mutations) + 1)

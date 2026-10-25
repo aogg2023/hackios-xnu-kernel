@@ -63,8 +63,9 @@ static void append(unsigned queue, const uint32_t *msg, unsigned words) {
     h[11] = (h[11] + ((words + 3) & ~3u)) % 1024;
 }
 static void ack(uint32_t echoed, uint32_t status) {
-    uint32_t msg[] = {header(echoed & 0xff, 3, 1, 77), echoed, status};
-    append(1, msg, 3);
+    unsigned words = (echoed & 0xff) == 11 ? 4 : 3;
+    uint32_t msg[] = {header(echoed & 0xff, words, 1, 77), echoed, status, 0};
+    append(1, msg, words);
 }
 static void make_mem(uint32_t *out, unsigned version) {
     uint32_t msg[] = {header(20, version ? 11 : 10, 0, 99), version,

@@ -158,6 +158,15 @@ adreno8_hfi_pump(uint32_t request, bool *ack, unsigned *notices)
 						printf("adreno8: %u: unrelated HFI ACK %#x; waiting for %#x\n", adreno8_step, resp[1], request);
 					continue;
 				}
+				/* FEATURE_CTRL uses the v5 data/error ACK; startup requires both to be zero. */
+				if (id == 11) {
+					if (words < 4) {
+						printf("adreno8: %u: short FEATURE_CTRL ACK (%d words)\n", adreno8_step, words);
+						return false;
+					}
+					printf("adreno8: %u: HFI 11 ACK: data %#x error %#x\n", adreno8_step, resp[2], resp[3]);
+					if (resp[3] != 0) return false;
+				}
 				/* These HWSCHED messages share gen8_hfi_send_cmd_async's status contract. */
 				bool hwsched = id == 10 || id == 128 || id == 129 || id == 131 || id == 134;
 				if (hwsched ? resp[2] == 0xffffffffu : resp[2] != 0) {

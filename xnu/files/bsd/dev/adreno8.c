@@ -35,6 +35,8 @@
  * adreno8_fine=1      also pause before individual accesses in that step
  * adreno8_raw_nop=N   stop before CP_INIT: 1=two RAW NOP words, 2=ten RAW NOP words,
  *                  3=setup-only health checks without RAW publication
+ * adreno8_empty_powerup=1  stage-17 CP_INIT with a zeroed powerup page; stop after idle;
+ *                  requires keep=1 return=0, no only/skip/raw_nop; default uses the generated list
  * adreno8_watch=S     inspect GMU status for S seconds after step 11 or later (default 20)
  * adreno8_keep=1      retain resources; stage 15 requires a cold reset before memory reuse
  * adreno8_secure_preflight=N  stage-14 secure memory mode. Mode 0 and unknown values
@@ -349,7 +351,7 @@ adreno8_init(void)
 		adreno8_step_service
 	};
 	const unsigned count = sizeof(each) / sizeof(each[0]);
-	uint32_t asked = 0, only = 0, one = 0, completed = 0;
+	uint32_t asked = 0, only = 0, one = 0, completed = 0, empty_powerup = 0, raw_nop = 0;
 
 	if (!PE_parse_boot_argn("adreno8", &asked, sizeof(asked)) || asked == 0) {
 		return;
@@ -379,6 +381,13 @@ adreno8_init(void)
 	one = 0;
 	adreno8_gpu_stall = PE_parse_boot_argn("adreno8_gpu_stall", &one, sizeof(one)) && one == 1;
 	PE_parse_boot_argn("adreno8_skip", &adreno8_skip_steps, sizeof(adreno8_skip_steps));
+	PE_parse_boot_argn("adreno8_empty_powerup", &empty_powerup, sizeof(empty_powerup));
+	PE_parse_boot_argn("adreno8_raw_nop", &raw_nop, sizeof(raw_nop));
+	if (empty_powerup && (empty_powerup != 1 || asked != 17 || only != 0 ||
+	    adreno8_skip_steps != 0 || !adreno8_gpu8_keep || adreno8_gpu8_return || raw_nop != 0)) {
+		printf("adreno8: empty_powerup=1 requires adreno8=17, keep=1 return=0 without only, skip or raw_nop; no steps attempted\n");
+		return;
+	}
 	if (adreno8_gmu_from_pll == 2 && ((asked != 5 && asked != 17) || only != 0 ||
 	    adreno8_skip_steps != 0 || !adreno8_gpu8_keep || adreno8_gpu8_return)) {
 		printf("adreno8: gmuclk=2 requires adreno8=5 or 17, keep=1 return=0 without only or skip; no steps attempted\n");

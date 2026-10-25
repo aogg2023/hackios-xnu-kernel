@@ -392,12 +392,16 @@ gpu_ucode_base(uint32_t reg, const struct adreno8_memory *memory)
 bool
 adreno8_gpu_cp_init(void)
 {
-	uint32_t words[10], raw_nop = 0;
+	uint32_t words[10], raw_nop = 0, empty_powerup = 0;
 	if (gpu_state != GPU_PREPARED)
 		return gpu_fail("CP initialization order");
 	PE_parse_boot_argn("adreno8_raw_nop", &raw_nop, sizeof(raw_nop));
+	PE_parse_boot_argn("adreno8_empty_powerup", &empty_powerup, sizeof(empty_powerup));
 	if (raw_nop > 3)
 		return gpu_fail("unknown RAW NOP diagnostic");
+	if (empty_powerup && (empty_powerup != 1 || adreno8_step != 17 || adreno8_newest_step != 17 ||
+	    !adreno8_gpu8_keep || adreno8_gpu8_return || adreno8_skip_steps != 0 || raw_nop != 0))
+		return gpu_fail("empty powerup diagnostic prerequisites");
 	if (!gpu_oob_get() || !gpu_register_config() ||
 	    !gpu_ucode_base(GEN8_CP_SQE_INSTR_BASE_LO, sqe) ||
 	    !gpu_ucode_base(GEN8_CP_AQE_INSTR_BASE_LO_0, aqe))
@@ -425,9 +429,19 @@ adreno8_gpu_cp_init(void)
 		printf("adreno8: RAW NOP diagnostic acknowledged and idle (%u PM4 dwords)\n", count);
 		return gpu_fail("RAW NOP diagnostic stop");
 	}
+	/* Mainline cold boot sends CP_INIT before patching its zeroed powerup page.
+	 * This diagnostic tests that input with HWSCHED; firmware acceptance needs a device run. */
+	if (empty_powerup) {
+		memset((void *)powerup->memory, 0, powerup->size);
+		if (!adreno8_memory_publish(powerup, 0, powerup->size))
+			return gpu_fail("empty powerup publication");
+		printf("adreno8: empty powerup page published: IOVA=%#x bytes=%u\n", powerup->gpu_address, powerup->size);
+	}
 	uint32_t count = adreno8_pm4_cp_init(words, A8_COUNT(words), powerup->gpu_address);
 	if (!gpu_raw(words, count, "CP initialization"))
 		return false;
+	if (empty_powerup)
+		return gpu_fail("empty powerup diagnostic acknowledged and idle; stop");
 	gpu_state = GPU_CP_READY;
 	printf("adreno8: GPU CP initialization acknowledged and idle; zap authentication is next\n");
 	return true;

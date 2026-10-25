@@ -143,12 +143,17 @@ struct adreno8_gpu_space;
 ''' + block_declarations + f"enum {{ GPU_MAPPING_SIZE = {gpu_size} }};\n" + r'''
 bool adreno8_reset_required;
 uint32_t adreno8_pause_ms, adreno8_step, adreno8_newest_step;
-static uint32_t raw_nop_asked;
+uint32_t adreno8_skip_steps;
+bool adreno8_gpu8_keep, adreno8_gpu8_return;
+static uint32_t raw_nop_asked, empty_powerup_asked;
 bool PE_parse_boot_argn(const char *name, void *value, int size)
 {
-    assert(!strcmp(name, "adreno8_raw_nop") && size == sizeof(raw_nop_asked));
-    if (raw_nop_asked) memcpy(value, &raw_nop_asked, size);
-    return raw_nop_asked != 0;
+    assert(size == sizeof(uint32_t));
+    uint32_t asked;
+    if (!strcmp(name, "adreno8_raw_nop")) asked = raw_nop_asked;
+    else { assert(!strcmp(name, "adreno8_empty_powerup")); asked = empty_powerup_asked; }
+    if (asked) memcpy(value, &asked, size);
+    return asked != 0;
 }
 int adreno8_say(const char *fmt, ...) { (void)fmt; return 0; }
 uint32_t adreno8_rd(vm_offset_t);
@@ -169,6 +174,8 @@ static uint32_t diagnostic_offset;
 static uint32_t max_gx_offset;
 static enum { MMIO_NONE, MMIO_BARRIER, MMIO_READ, MMIO_WRITE } last_mmio;
 static unsigned barriers, gmu_reads, gmu_writes;
+static unsigned normal_powerup_publications, empty_powerup_publications;
+static bool empty_publish_ok = true;
 static bool smmu_ok = true, hfi_ok = true, oob_ok = true, clock_ok = true;
 static bool raw_ok = true, idle_ok = true, memory_on, smmu_after_raw, corrupt_scratch, acquire_ok = true;
 static struct adreno8_memory allocations[4];
@@ -247,11 +254,12 @@ struct adreno8_memory *adreno8_gpu_alloc(const char *name, uint32_t size, uint32
     assert(!memory_on && allocation_count < 4 && align == 4096);
     unsigned i = allocation_count++;
     struct adreno8_memory *m = &allocations[i];
-    m->name = name; m->size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    m->memory = (vm_offset_t)aligned_alloc(PAGE_SIZE, m->size);
-    assert(m->memory); memset((void *)m->memory, 0, m->size);
+    uint32_t allocated = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    m->name = name; m->size = size;
+    m->memory = (vm_offset_t)aligned_alloc(PAGE_SIZE, allocated);
+    assert(m->memory); memset((void *)m->memory, 0, allocated);
     m->gpu_address = 0xc0000000 + i * 0x200000;
-    device_memory[i] = calloc(1, m->size); assert(device_memory[i]);
+    device_memory[i] = calloc(1, allocated); assert(device_memory[i]);
     allocation_prot[i] = prot;
     return m;
 }
@@ -259,6 +267,20 @@ struct adreno8_memory *adreno8_gpu_alloc(const char *name, uint32_t size, uint32
 bool adreno8_memory_publish(const struct adreno8_memory *m, uint32_t offset, uint32_t size)
 {
     assert(offset <= m->size && size <= m->size - offset);
+    if (m == powerup) {
+        uint32_t *p = (uint32_t *)m->memory;
+        if (p[3]) normal_powerup_publications++;
+        else {
+            assert(empty_powerup_asked == 1 && normal_powerup_publications == 1);
+            assert(offset == 0 && size == 4096 && m->size == 4096);
+            assert(oob_requested && oob_acked && adreno8_reset_required && !raw_calls);
+            assert(gpu_regs[0][GEN8_CP_SQE_INSTR_BASE_LO] == sqe->gpu_address);
+            assert(gpu_regs[0][GEN8_CP_AQE_INSTR_BASE_LO_0] == aqe->gpu_address);
+            for (unsigned i = 0; i < size; i++) assert(!((uint8_t *)m->memory)[i]);
+            empty_powerup_publications++;
+            if (!empty_publish_ok) return false;
+        }
+    }
     memcpy(device_memory[m - allocations] + offset, (void *)(m->memory + offset), size);
     publish_count++; return true;
 }
@@ -291,21 +313,26 @@ bool adreno8_hwsched_raw(const uint32_t *pm4_words, uint32_t words, const char *
         assert(p[0] == 0 && p[1] == 0 && p[2] == 0);
         assert(gpu_regs[0][KGSL_TPL1_REG] == KGSL_TPL1_VALUE);
         assert(ref_a8_powerup_ifpc[11] == KGSL_TPL1_REG);
-        assert(p[26] == KGSL_TPL1_REG && p[27] == KGSL_TPL1_VALUE);
-        unsigned dynamic = 0;
-        for (unsigned pipe = 1; pipe <= 7; pipe++)
-            for (unsigned i = 0; i < A8_COUNT(ref_a8_powerup_ext); i++)
-                dynamic += !!(ref_a8_powerup_ext[i].pipes & (1u << pipe));
-        assert(p[3] == (A8_COUNT(ref_a8_powerup_ifpc) | A8_COUNT(ref_a8_powerup) << 8 | dynamic << 16));
-        unsigned at = 4;
-        for (unsigned i = 0; i < A8_COUNT(ref_a8_powerup_ifpc); i++, at += 2) assert(p[at] == ref_a8_powerup_ifpc[i]);
-        for (unsigned i = 0; i < A8_COUNT(ref_a8_powerup); i++, at += 2) assert(p[at] == ref_a8_powerup[i]);
-        for (unsigned pipe = 1; pipe <= 7; pipe++)
-            for (unsigned i = 0; i < A8_COUNT(ref_a8_powerup_ext); i++) {
-                if (!(ref_a8_powerup_ext[i].pipes & (1u << pipe))) continue;
-                assert(p[at] == pipe << 12 && p[at + 1] == ref_a8_powerup_ext[i].reg);
-                assert(p[at + 2] == gpu_regs[pipe][p[at + 1]]); at += 3;
-            }
+        if (empty_powerup_asked) {
+            assert(normal_powerup_publications == 1 && empty_powerup_publications == 1);
+            for (unsigned i = 0; i < 4096; i++) assert(!device_memory[2][i]);
+        } else {
+            assert(p[26] == KGSL_TPL1_REG && p[27] == KGSL_TPL1_VALUE);
+            unsigned dynamic = 0;
+            for (unsigned pipe = 1; pipe <= 7; pipe++)
+                for (unsigned i = 0; i < A8_COUNT(ref_a8_powerup_ext); i++)
+                    dynamic += !!(ref_a8_powerup_ext[i].pipes & (1u << pipe));
+            assert(p[3] == (A8_COUNT(ref_a8_powerup_ifpc) | A8_COUNT(ref_a8_powerup) << 8 | dynamic << 16));
+            unsigned at = 4;
+            for (unsigned i = 0; i < A8_COUNT(ref_a8_powerup_ifpc); i++, at += 2) assert(p[at] == ref_a8_powerup_ifpc[i]);
+            for (unsigned i = 0; i < A8_COUNT(ref_a8_powerup); i++, at += 2) assert(p[at] == ref_a8_powerup[i]);
+            for (unsigned pipe = 1; pipe <= 7; pipe++)
+                for (unsigned i = 0; i < A8_COUNT(ref_a8_powerup_ext); i++) {
+                    if (!(ref_a8_powerup_ext[i].pipes & (1u << pipe))) continue;
+                    assert(p[at] == pipe << 12 && p[at + 1] == ref_a8_powerup_ext[i].reg);
+                    assert(p[at + 2] == gpu_regs[pipe][p[at + 1]]); at += 3;
+                }
+        }
         assert(gpu_regs[0][GEN8_CP_SQE_INSTR_BASE_LO] == sqe->gpu_address);
         assert(gpu_regs[0][GEN8_CP_AQE_INSTR_BASE_LO_0] == aqe->gpu_address);
     } else if (raw_calls == 2) {
@@ -331,7 +358,9 @@ static void reset(void)
     gx_reads = gx_writes = raw_calls = allocation_count = publish_count = current_pipe = 0;
     max_gx_offset = 0; adreno8_gpu.size = GPU_MAPPING_SIZE;
     adreno8_pause_ms = adreno8_step = adreno8_newest_step = 0;
-    raw_nop_asked = 0;
+    raw_nop_asked = empty_powerup_asked = adreno8_skip_steps = 0;
+    adreno8_gpu8_keep = true; adreno8_gpu8_return = false;
+    normal_powerup_publications = empty_powerup_publications = 0; empty_publish_ok = true;
     setup_waits = 0;
     diagnostic_reads = diagnostic_writes = diagnostic_offset = 0;
     last_mmio = MMIO_NONE; barriers = gmu_reads = gmu_writes = 0;
@@ -350,6 +379,38 @@ static void prepare(void)
     }
     assert(allocation_prot[2] == 11 && allocation_prot[3] == 11);
     memory_on = true;
+}
+
+static void prepare_empty(void)
+{
+    reset(); prepare(); empty_powerup_asked = 1;
+    adreno8_step = adreno8_newest_step = 17;
+    memset((void *)scratch->memory, 0x5a, scratch->size);
+    memset(device_memory[3], 0x5a, scratch->size);
+    /* Bytes outside the 4 KiB device buffer belong to its XNU allocation padding. */
+    for (unsigned i = powerup->size; i < PAGE_SIZE; i++) {
+        ((uint8_t *)powerup->memory)[i] = 0xa5; device_memory[2][i] = 0xa5;
+    }
+}
+
+static void empty_retained(void)
+{
+    assert(gpu_state == GPU_FAILED && allocation_count == 4 && memory_on);
+    assert(oob_requested && oob_acked && adreno8_reset_required);
+    assert(gmu_regs[GMU_HOST2GMU_SET / 4] == 1u << 30);
+    assert(!adreno8_gpu_cp_ready() && !adreno8_gpu_secure_exit() && !adreno8_gpu_scratch_test());
+    assert(raw_calls <= 1 && powerup->gpu_address == 0xc0400000);
+    for (unsigned i = 0; i < 2; i++) {
+        assert(!memcmp(device_memory[i], files[i] + 4, file_sizes[i] - 4));
+        assert(!memcmp((void *)allocations[i].memory, files[i] + 4, file_sizes[i] - 4));
+    }
+    for (unsigned i = 0; i < scratch->size; i++)
+        assert(device_memory[3][i] == 0x5a && ((uint8_t *)scratch->memory)[i] == 0x5a);
+    for (unsigned i = powerup->size; i < PAGE_SIZE; i++)
+        assert(device_memory[2][i] == 0xa5 && ((uint8_t *)powerup->memory)[i] == 0xa5);
+    unsigned reads = gx_reads + gmu_reads, writes = gx_writes + gmu_writes;
+    assert(!adreno8_gpu_cp_init());
+    assert(reads == gx_reads + gmu_reads && writes == gx_writes + gmu_writes);
 }
 
 int main(int argc, char **argv)
@@ -472,6 +533,33 @@ int main(int argc, char **argv)
     reset(); prepare(); raw_nop_asked = 4;
     assert(!adreno8_gpu_cp_init() && !raw_calls && !gx_reads && !gx_writes);
     assert(!oob_requested && !oob_acked);
+    prepare_empty(); assert(!adreno8_gpu_cp_init() && raw_calls == 1);
+    assert(empty_powerup_publications == 1); empty_retained();
+    prepare_empty(); empty_publish_ok = false;
+    assert(!adreno8_gpu_cp_init() && !raw_calls && empty_powerup_publications == 1); empty_retained();
+    assert(((uint32_t *)device_memory[2])[3] != 0);
+    prepare_empty(); raw_ok = false;
+    assert(!adreno8_gpu_cp_init() && raw_calls == 1); empty_retained();
+    prepare_empty(); idle_ok = false;
+    assert(!adreno8_gpu_cp_init() && raw_calls == 1); empty_retained();
+    prepare_empty(); smmu_after_raw = true;
+    assert(!adreno8_gpu_cp_init() && raw_calls == 1); empty_retained();
+    for (unsigned bad = 0; bad < 11; bad++) {
+        prepare_empty();
+        switch (bad) {
+        case 0: empty_powerup_asked = 2; break;
+        case 1: empty_powerup_asked = UINT32_MAX; break;
+        case 2: adreno8_step = 16; break;
+        case 3: adreno8_newest_step = 18; break;
+        case 4: adreno8_gpu8_keep = false; break;
+        case 5: adreno8_gpu8_return = true; break;
+        case 6: adreno8_skip_steps = 1; break;
+        default: raw_nop_asked = bad - 6; break;
+        }
+        assert(!adreno8_gpu_cp_init() && gpu_state == GPU_FAILED);
+        assert(!raw_calls && !gx_reads && !gx_writes && !gmu_reads && !gmu_writes);
+        assert(!oob_requested && !adreno8_reset_required && !normal_powerup_publications && !empty_powerup_publications);
+    }
     reset(); prepare(); smmu_after_raw = true;
     assert(!adreno8_gpu_cp_init() && gpu_state == GPU_FAILED);
     reset(); prepare(); idle_ok = false;
@@ -527,6 +615,33 @@ with tempfile.TemporaryDirectory(prefix="adreno8-gpu-test-") as temp:
     ):
         assert production.count(before) == 1, name
         checks.append((name, production.replace(before, after), None))
+    empty_variants = [
+        ("empty-not-cleared", "memset((void *)powerup->memory, 0, powerup->size);", ""),
+        ("empty-partial-clear", "memset((void *)powerup->memory, 0, powerup->size);",
+         "memset((void *)powerup->memory, 0, 64);"),
+        ("empty-wrong-buffer", "memset((void *)powerup->memory, 0, powerup->size);",
+         "memset((void *)scratch->memory, 0, scratch->size);"),
+        ("empty-not-published", "if (!adreno8_memory_publish(powerup, 0, powerup->size))", "if (false)"),
+        ("empty-partial-publish", "if (!adreno8_memory_publish(powerup, 0, powerup->size))",
+         "if (!adreno8_memory_publish(powerup, 0, 64))"),
+        ("empty-publish-failure-ignored", "if (!adreno8_memory_publish(powerup, 0, powerup->size))",
+         "if ((void)adreno8_memory_publish(powerup, 0, powerup->size), false)"),
+        ("empty-wrong-IOVA", "adreno8_pm4_cp_init(words, A8_COUNT(words), powerup->gpu_address)",
+         "adreno8_pm4_cp_init(words, A8_COUNT(words), scratch->gpu_address)"),
+        ("empty-omitted-original-config", "!gpu_oob_get() || !gpu_register_config() ||",
+         "!gpu_oob_get() || (!empty_powerup && !gpu_register_config()) ||"),
+        ("empty-promoted-ready", '\tif (empty_powerup)\n\t\treturn gpu_fail("empty powerup diagnostic acknowledged and idle; stop");', ""),
+        ("empty-value-guard", "empty_powerup != 1 || ", ""),
+        ("empty-step-guard", "adreno8_step != 17 || ", ""),
+        ("empty-limit-guard", "adreno8_newest_step != 17 ||", ""),
+        ("empty-keep-guard", "!adreno8_gpu8_keep || ", ""),
+        ("empty-return-guard", "adreno8_gpu8_return || ", ""),
+        ("empty-skip-guard", "adreno8_skip_steps != 0 || ", ""),
+        ("empty-NOP-guard", "|| raw_nop != 0", ""),
+    ]
+    for name, before, after in empty_variants:
+        assert production.count(before) == 1, name
+        checks.append((name, production.replace(before, after, 1), None))
     for name, mutated, mutated_header in checks:
         assert mutated != production or (mutated_header is not None and mutated_header != private), name
         variant = Path(temp) / name
@@ -544,3 +659,4 @@ with tempfile.TemporaryDirectory(prefix="adreno8-gpu-test-") as temp:
             assert result.returncode != 0 and "assert" in result.stderr.lower(), (name, page, result.stderr)
     print(f"GPU MMIO barrier mutations rejected: {len(variants)} variants x 2 page sizes")
     print("GPU TPL1 catalog/startup/powerup mutations rejected: 3 variants x 2 page sizes")
+    print(f"GPU empty powerup mutations rejected: {len(empty_variants)} variants x 2 page sizes")

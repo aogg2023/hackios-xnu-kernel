@@ -316,6 +316,7 @@ INIT_STUB = r'''
 #include <string.h>
 static uint32_t requested, selected, omitted, clock_mode;
 static uint32_t keep_arg=1, return_arg;
+static uint32_t empty_powerup_arg, raw_nop_arg;
 static uint32_t adreno8_pause_ms, adreno8_watch_seconds, adreno8_speed_asked;
 static uint32_t adreno8_gmu_from_pll, adreno8_gpu8_secure_mode, adreno8_fine;
 static uint32_t adreno8_skip_steps, adreno8_newest_step, adreno8_step;
@@ -340,6 +341,8 @@ static bool PE_parse_boot_argn(const char *key, void *out, unsigned size) {
     else if(!strcmp(key,"adreno8_gmuclk")) value=clock_mode;
     else if(!strcmp(key,"adreno8_keep")) value=keep_arg;
     else if(!strcmp(key,"adreno8_return")) value=return_arg;
+    else if(!strcmp(key,"adreno8_empty_powerup")) value=empty_powerup_arg;
+    else if(!strcmp(key,"adreno8_raw_nop")) value=raw_nop_arg;
     else if(!strcmp(key,"adreno8_watch")) value=0;
     else return false;
     memcpy(out,&value,sizeof(value)); return true;
@@ -368,7 +371,7 @@ static void check(uint32_t mode, uint32_t asked, uint32_t only, uint32_t skip, u
     for(unsigned bit=0;bit<23;bit++) count+=(expected>>bit)&1;
     assert(visited==expected && calls==count && holds==count);
     assert(stopped==(mode<=1 && asked && !keep_arg && last_stage>=3));
-    assert(returned==(mode<=1 && asked && return_arg));
+    assert(returned==(mode<=1 && expected && return_arg));
     checks++;
 }
 int main(void) {
@@ -403,6 +406,28 @@ int main(void) {
             check(mode,17,0,0,0x1ffff);
         }
         keep_arg=1; return_arg=0;
+    }
+    for(unsigned mode=0;mode<=2;mode++) {
+        empty_powerup_arg=1;
+        check(mode,17,0,0,0x1ffff);
+        const uint32_t bad_targets[]={0,5,16,18,23,UINT32_MAX};
+        for(unsigned i=0;i<sizeof(bad_targets)/sizeof(*bad_targets);i++)
+            check(mode,bad_targets[i],0,0,0);
+        check(mode,17,17,0,0);
+        check(mode,17,0,1u<<5,0);
+        empty_powerup_arg=2; check(mode,17,0,0,0);
+        empty_powerup_arg=UINT32_MAX; check(mode,17,0,0,0);
+        empty_powerup_arg=1;
+        for(unsigned raw=1;raw<=4;raw++) {
+            raw_nop_arg=raw; check(mode,17,0,0,0);
+        }
+        raw_nop_arg=0;
+        for(unsigned keep=0;keep<2;keep++) for(unsigned back=0;back<2;back++) {
+            keep_arg=keep; return_arg=back;
+            check(mode,17,0,0,keep && !back ? 0x1ffff : 0);
+        }
+        keep_arg=1; return_arg=0; empty_powerup_arg=0;
+        raw_nop_arg=1; check(mode,17,0,0,0x1ffff); raw_nop_arg=0;
     }
     printf("Sun init admission: %u production cases PASS\n",checks);
     return 0;
@@ -500,12 +525,30 @@ def main():
             ("keep", " || !adreno8_gpu8_keep", ""),
             ("return", " || adreno8_gpu8_return", ""),
         ]
+        clock_guard = re.search(r"\tif \(adreno8_gmu_from_pll == 2.*?\n\t}", init, re.S)[0]
         for label, before, after in admission_mutations:
-            assert init.count(before) == 1, label
-            changed = init.replace(before, after, 1)
+            assert clock_guard.count(before) == 1, label
+            changed = init.replace(clock_guard, clock_guard.replace(before, after, 1), 1)
             run("init-admission-" + label, INIT_STUB + phases + changed,
                 success=False, cases=INIT_CASES)
         print("Sun init admission mutations rejected:", len(admission_mutations))
+
+        empty_guard = re.search(r"\tif \(empty_powerup.*?\n\t}", init, re.S)[0]
+        empty_mutations = [
+            ("value", "empty_powerup != 1 || ", ""),
+            ("asked", "asked != 17 || ", ""),
+            ("only", "only != 0 ||", ""),
+            ("skip", "adreno8_skip_steps != 0 || ", ""),
+            ("keep", "!adreno8_gpu8_keep || ", ""),
+            ("return", "adreno8_gpu8_return || ", ""),
+            ("raw", "raw_nop != 0", "false"),
+        ]
+        for label, before, after in empty_mutations:
+            assert empty_guard.count(before) == 1, label
+            changed = init.replace(empty_guard, empty_guard.replace(before, after, 1), 1)
+            run("init-empty-powerup-" + label, INIT_STUB + phases + changed,
+                success=False, cases=INIT_CASES)
+        print("Empty powerup init admission mutations rejected:", len(empty_mutations))
 
 
 if __name__ == "__main__":

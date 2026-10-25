@@ -87,6 +87,8 @@ def build_c(src, bid_expect):
                          ("@START@", _base.macro_value(src, "START_SECONDS")), ("@SILENCE@", _base.macro_value(src, "SILENCE_SECONDS")),
                          ("@SELFTEST@", _base.macro_value(src, "CHECKPOINT_SELFTEST")), ("@MAGIC2@", _base.macro_value(src, "KERNEL_LIVE_MAGIC2")),
                          ("@LIVE@", _base.struct_copy(src, "kernel_live")), ("@EXC@", exc), ("@USB@", usb),
+                         ("@DESCSET@", re.search(r"typedef struct \{[^}]*\} usb_device_descriptor_set;",
+                                                 _base.read(EFIH), re.S).group(0)),
                          ("@PSCI@", _base._harness2.PSCI_STUB)):
         prelude = prelude.replace(token, value)
     return (prelude + "\n" + "\n".join(blocks) + "\n" + BID_SCENARIOS + "\n").replace("@BID@", bid_expect)

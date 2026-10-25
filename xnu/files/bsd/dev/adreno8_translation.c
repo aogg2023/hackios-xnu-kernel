@@ -1,4 +1,4 @@
-/* Validate the complete secure mapping before MP_ASSIGN changes page ownership. */
+/* Validate complete object mappings before secure handover or CP startup. */
 #include "adreno8_smmu_private.h"
 
 #define printf adreno8_say
@@ -25,13 +25,14 @@ adreno8_translation_table(const struct adreno8_gpu_space *space, uint64_t descri
 /* The root and both intermediate descriptors are checked for each 4 KiB leaf.
  * Data pages can be physically discontiguous even within one allocation. */
 bool
-adreno8_secure_translation_walk(struct adreno8_gpu_space *space, uint32_t iova,
+adreno8_translation_walk(struct adreno8_gpu_space *space, uint32_t iova,
     vm_offset_t memory, uint32_t size, uint32_t prot)
 {
 	uint64_t attributes = 3ULL | 2ULL << 8 | 1ULL << 10 | 1ULL << 11;
 	const struct adreno8_space_table *root;
 
-	if (space == NULL || space->context != SECURE_CONTEXT || space->is_on ||
+	if (space == NULL || !((space->context == SECURE_CONTEXT && !space->is_on) ||
+	    (space == &adreno8_gpu_space && space->context == 0 && space->is_on)) ||
 	    space->table_count == 0 || space->table_count > sizeof(space->tables) / sizeof(space->tables[0]) ||
 	    !(prot & ADRENO8_MEM_READ) || (prot & ~15u) || memory == 0 || size == 0 ||
 	    ((iova | memory | size) & SMMU_GRANULE_MASK) ||
@@ -62,13 +63,13 @@ adreno8_secure_translation_walk(struct adreno8_gpu_space *space, uint32_t iova,
 		}
 		if (leaf == NULL || phys == 0 || phys >= SMMU_PHYS_LIMIT ||
 		    (phys & SMMU_GRANULE_MASK) || pte != (phys | attributes)) {
-			printf("adreno8: secure translation walk failed at IOVA %#x: descriptor %#llx,"
+			printf("adreno8: translation walk failed at IOVA %#x: descriptor %#llx,"
 			    " PTE %#llx, expected PA %#llx attributes %#llx\n",
 			    address, descriptor, pte, phys, attributes);
 			return false;
 		}
 	}
-	printf("adreno8: secure translation walk verified %u bytes (%u leaves) from IOVA %#x"
+	printf("adreno8: translation walk verified %u bytes (%u leaves) from IOVA %#x"
 	    " through root PA %#llx\n", size, size / SMMU_GRANULE, iova, root->phys);
 	return true;
 }
@@ -77,7 +78,7 @@ adreno8_secure_translation_walk(struct adreno8_gpu_space *space, uint32_t iova,
  * Mode 3 (3a): point secure context 3 at the tables just handed over and switch it on,
  * leaving stream 2's route at fault so no transaction reaches it. The proofs a
  * write-restricted path can give are all here: every buffer page resolves through the
- * root table before the handover (see adreno8_secure_translation_walk), every
+ * root table before the handover (see adreno8_translation_walk), every
  * write reads back, the TLB invalidate completes, and FSR is clear. This SMMU reports
  * IDR0.ATOSNS=1, so ATS1PR/ATSR cannot add a hardware translation proof; only the
  * firmware's own traffic in 3b can.

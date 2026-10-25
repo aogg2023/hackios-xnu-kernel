@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify complete secure mappings, rejected CB writes and register-only faults."""
+"""Verify object mappings, secure handover checks and register-only faults."""
 from pathlib import Path
 import runpy
 import subprocess
@@ -23,6 +23,16 @@ stub = stub.replace("    regs[offset / 4] = value;",
     "        regs[(0x23000 + SMMU_CB_FSR) / 4] |= fsr_after_enable;\n"
     "    if (offset == SMMU_S2CR(SECURE_MATCH) && value == 0x303)\n"
     "        regs[(0x23000 + SMMU_CB_SCTLR) / 4] ^= sctlr_after_route_xor;")
+stub = stub.replace("static uint64_t next_pa = 0x80000000;",
+    "static uint64_t next_pa = 0x80000000;\nstatic vm_offset_t ordinary_data;\nstatic bool forbid_mmio;")
+stub = stub.replace("            if (!pa_flat) {", "            if (a.va == ordinary_data)\n"
+    "                return a.pa + delta / 4096 * 0x3000 + delta % 4096 +\n"
+    "                    ((shift_va && va >= shift_va && va < shift_va + 4096) ? shift_delta : 0);\n"
+    "            if (!pa_flat) {")
+for signature in ("static uint32_t adreno8_rd(vm_offset_t address) {",
+                  "static void adreno8_put(struct adreno8_block *b, const char *name, uint32_t offset, uint32_t value) {"):
+    assert signature in stub
+    stub = stub.replace(signature, signature + "\n    assert(!forbid_mmio);", 1)
 tests = r'''
 #include <sys/mman.h>
 static const uint32_t mapping_size = 0x138000;
@@ -43,10 +53,68 @@ static void prepare(void) {
     regs[(0x23000 + SMMU_CB_SCTLR) / 4] = 0x96cc51a;
 }
 static bool check_mapping(void) {
-    return adreno8_secure_translation_walk(&adreno8_secure_space, mapping_iova,
+    return adreno8_translation_walk(&adreno8_secure_space, mapping_iova,
         mapping_memory, mapping_size, mapping_prot);
 }
+static bool check_ordinary(void) {
+    return adreno8_translation_walk(&adreno8_gpu_space, 0x101f0000,
+        mapping_memory, mapping_size, 5);
+}
+static void check_ordinary_mapping(void) {
+    prepare(); ordinary_data=mapping_memory;
+    memset(&adreno8_gpu_space, 0, sizeof(adreno8_gpu_space));
+    adreno8_gpu_space.name="gpu";
+    assert(adreno8_space_new_table(&adreno8_gpu_space, 0, 0));
+    assert(adreno8_space_map_region(&adreno8_gpu_space, 0x101f0000, mapping_memory, mapping_size, 5));
+    adreno8_gpu_space.is_on=true;
+    assert(mprotect((void *)mapping_memory, mapping_size, PROT_NONE)==0);
+    forbid_mmio=true;
+    assert(check_ordinary());
+    /* Independent RO+EXEC reference: NC, outer-shareable, AF, nG, AP=RO/unprivileged. */
+    for (uint32_t at=0;at<mapping_size;at+=4096) {
+        uint64_t pa=kvtophys(mapping_memory+at);
+        uint64_t *pte=adreno8_space_entry(&adreno8_gpu_space, 0x101f0000+at);
+        assert(*pte==(pa|0xec3ULL));
+        if (at) assert(pa!=kvtophys(mapping_memory)+at);
+    }
+    const uint32_t offsets[]={0,4096,0x10000,mapping_size-4096};
+    const uint64_t bits[]={1,4,0x20,0x40,0x80,0x100,0x400,0x800,1ULL<<53,1ULL<<54,1ULL<<55,0x1000};
+    for (unsigned i=0;i<sizeof(offsets)/sizeof(*offsets);i++) {
+        uint64_t *pte=adreno8_space_entry(&adreno8_gpu_space,0x101f0000+offsets[i]), saved=*pte;
+        for (unsigned j=0;j<sizeof(bits)/sizeof(*bits);j++) {
+            *pte=saved^bits[j]; assert(!check_ordinary());
+        }
+        *pte=saved;
+    }
+    for (unsigned i=0;i<adreno8_gpu_space.table_count;i++) {
+        struct adreno8_space_table *t=&adreno8_gpu_space.tables[i];
+        uint64_t saved=t->phys; t->phys^=0x1000;
+        assert(!check_ordinary()); t->phys=saved;
+        shift_va=t->table; shift_delta=0x1000;
+        assert(!check_ordinary()); shift_va=shift_delta=0;
+        if (t->level==2) continue;
+        uint64_t *entries=(uint64_t *)t->table;
+        for (unsigned j=0;j<512;j++) if (entries[j]) {
+            saved=entries[j]; entries[j]=saved|1ULL<<63;
+            assert(!check_ordinary()); entries[j]=saved;
+        }
+    }
+    shift_va=mapping_memory+4096; shift_delta=0x1000;
+    assert(!check_ordinary()); shift_va=shift_delta=0;
+    adreno8_gpu_space.is_on=false; assert(!check_ordinary());
+    adreno8_gpu_space.is_on=true; adreno8_gpu_space.context=1; assert(!check_ordinary());
+    adreno8_gpu_space.context=0;
+    struct adreno8_gpu_space other=adreno8_gpu_space;
+    assert(!adreno8_translation_walk(&other,0x101f0000,mapping_memory,mapping_size,5));
+    assert(!adreno8_translation_walk(NULL,0x101f0000,mapping_memory,mapping_size,5));
+    assert(check_ordinary());
+    forbid_mmio=false;
+    assert(mprotect((void *)mapping_memory,mapping_size,PROT_READ|PROT_WRITE)==0);
+    ordinary_data=0;
+    puts("ordinary mapping: global CB0/on guard, independent 4K PAs/full 0xec3, tables and inaccessible data: PASS");
+}
 int main(void) {
+    check_ordinary_mapping();
     prepare();
     assert(ADRENO8_SECURE_IOVA_START == 0xf0000000u && ADRENO8_SECURE_IOVA_END == 0xfffff000u);
     uint32_t end_page = 0;
@@ -102,9 +170,9 @@ int main(void) {
     assert(!check_mapping());
     shift_va = shift_delta = 0;
     assert(check_mapping());
-    assert(!adreno8_secure_translation_walk(&adreno8_secure_space, mapping_iova,
+    assert(!adreno8_translation_walk(&adreno8_secure_space, mapping_iova,
         mapping_memory, mapping_size - 1, mapping_prot));
-    assert(!adreno8_secure_translation_walk(&adreno8_secure_space, mapping_iova,
+    assert(!adreno8_translation_walk(&adreno8_secure_space, mapping_iova,
         mapping_memory, mapping_size, ADRENO8_MEM_READ));
     puts("complete secure mapping: parent descriptors, every leaf, physical pages and permissions: PASS");
 
@@ -229,6 +297,7 @@ int main(void) {
     assert(mprotect((void *)mapping_memory, mapping_size, PROT_NONE) == 0);
     for (unsigned i = 0; i < adreno8_secure_space.table_count; i++)
         assert(mprotect((void *)adreno8_secure_space.tables[i].table, PAGE_SIZE, PROT_NONE) == 0);
+    assert(!check_mapping());
     assert(!adreno8_space_faulted(&adreno8_secure_space));
     regs[(0x23000 + SMMU_CB_FSR) / 4] = 2;
     regs[(0x23000 + SMMU_CB_FAR_LO) / 4] = mapping_iova;
@@ -286,6 +355,11 @@ if __name__ == "__main__":
                 "pte != (phys | attributes)", "(pte & PTE_ADDRESS) != phys"),
             "ignore_leaf_physical_address": smmu + walker.replace(
                 "pte != (phys | attributes)", "(pte & ~PTE_ADDRESS) != attributes"),
+            "ordinary_wrong_space": smmu + walker.replace("space == &adreno8_gpu_space && ", ""),
+            "ordinary_wrong_context": smmu + walker.replace("space->context == 0 && ", ""),
+            "ordinary_off": smmu + walker.replace("space->context == 0 && space->is_on", "space->context == 0"),
+            "secure_on": smmu + walker.replace("space->context == SECURE_CONTEXT && !space->is_on", "space->context == SECURE_CONTEXT"),
+            "ignore_table_physical_address": smmu + walker.replace("kvtophys(table->table) == table->phys", "true"),
             "omit_enabled_state": (smmu + walker).replace("space->is_on = true;", ""),
             "read_secure_leaf_on_fault": (smmu + walker).replace(
                 "if (space == &adreno8_secure_space) {", "if (false) {"),
@@ -293,10 +367,11 @@ if __name__ == "__main__":
         for name, mutated in variants.items():
             assert mutated != fixture["driver"], name
             (target / "adreno8_smmu.c").write_text(mutated)
-            binary = target / f"mutant-{name}"
-            subprocess.run(["cc", "-std=c11", "-DPAGE_SIZE=16384",
-                            "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
-                            str(target / "check.c"), "-o", str(binary)], check=True)
-            result = subprocess.run([str(binary)], capture_output=True, text=True)
-            assert result.returncode != 0, f"mutation survived: {name}"
-        print(f"Secure mapping/fault mutations rejected: {len(variants)}")
+            for page_size in (4096, 16384):
+                binary = target / f"mutant-{name}-{page_size}"
+                subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}",
+                                "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                                str(target / "check.c"), "-o", str(binary)], check=True)
+                result = subprocess.run([str(binary)], capture_output=True, text=True)
+                assert result.returncode != 0, f"mutation survived: {name}, PAGE_SIZE={page_size}"
+        print(f"Object mapping/fault mutations rejected: {len(variants)} x 2 page sizes")

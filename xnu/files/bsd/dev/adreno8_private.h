@@ -396,7 +396,7 @@ adreno8_space_off(struct adreno8_gpu_space *space, uint32_t match);
 bool
 adreno8_space_faulted(struct adreno8_gpu_space *space);
 bool
-adreno8_secure_translation_walk(struct adreno8_gpu_space *space, uint32_t iova, vm_offset_t memory,
+adreno8_translation_walk(struct adreno8_gpu_space *space, uint32_t iova, vm_offset_t memory,
     uint32_t size, uint32_t prot);
 bool
 adreno8_secure_translation_3a(struct adreno8_gpu_space *space);

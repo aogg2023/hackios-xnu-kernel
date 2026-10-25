@@ -558,6 +558,12 @@ adreno8_gpu_cp_init(void)
 	    !adreno8_gpu8_keep || adreno8_gpu8_return || adreno8_skip_steps != 0 ||
 	    (raw_nop != 0 && raw_nop != 2 && raw_nop != 3) || empty_powerup))
 		return gpu_fail("direct ring diagnostic prerequisites");
+	if (adreno8_direct_ring &&
+	    (!adreno8_translation_walk(&adreno8_gpu_space, sqe->gpu_address, sqe->memory, sqe->size,
+	        ADRENO8_MEM_READ | ADRENO8_MEM_EXEC) ||
+	    !adreno8_translation_walk(&adreno8_gpu_space, aqe->gpu_address, aqe->memory, aqe->size,
+	        ADRENO8_MEM_READ | ADRENO8_MEM_EXEC)))
+		return gpu_fail("microcode object mapping");
 	if (!gpu_oob_get() || !gpu_register_config() ||
 	    !gpu_ucode_base(GEN8_CP_SQE_INSTR_BASE_LO, sqe) ||
 	    !gpu_ucode_base(GEN8_CP_AQE_INSTR_BASE_LO_0, aqe))

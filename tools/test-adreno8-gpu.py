@@ -139,7 +139,8 @@ source = r'''
 typedef uintptr_t vm_offset_t;
 typedef unsigned int uint;
 struct adreno8_block { const char *name; uint32_t phys, size; vm_offset_t base; };
-struct adreno8_gpu_space;
+struct adreno8_gpu_space { unsigned unused; };
+struct adreno8_gpu_space adreno8_gpu_space;
 ''' + block_declarations + f"enum {{ GPU_MAPPING_SIZE = {gpu_size} }};\n" + r'''
 bool adreno8_reset_required;
 uint32_t adreno8_pause_ms, adreno8_step, adreno8_newest_step;
@@ -147,6 +148,7 @@ uint32_t adreno8_skip_steps;
 bool adreno8_gpu8_keep, adreno8_gpu8_return;
 bool adreno8_direct_ring;
 bool adreno8_ordinary_ready(void);
+bool adreno8_translation_walk(struct adreno8_gpu_space *, uint32_t, vm_offset_t, uint32_t, uint32_t);
 static unsigned ring_completed, ring_setup_completed;
 static uint32_t raw_nop_asked, empty_powerup_asked;
 bool PE_parse_boot_argn(const char *name, void *value, int size)
@@ -177,6 +179,7 @@ const uint8_t *redwood_image_file(const char *, const char *, uint64_t *, int *)
 ''' + constants + '\n#include "adreno8_gpu.c"\n#undef printf\n' + reference + r'''
 static uint32_t gpu_regs[8][0x10000], gmu_regs[0x1a000], current_pipe;
 static unsigned gx_reads, gx_writes, raw_calls, allocation_count, publish_count;
+static unsigned walk_calls, walk_fail_at;
 static unsigned diagnostic_reads, diagnostic_writes;
 static uint32_t diagnostic_offset;
 static uint32_t max_gx_offset;
@@ -199,6 +202,17 @@ static unsigned ring_sqe_writes, ring_setup_fault_at, ring_setup_fault;
 static unsigned ring_halt_reads;
 static unsigned ring_halt_clears, ring_halt_drop, ring_halt_observe_fault;
 static const uint32_t halt_regs[]={0x3c45,0x3c46,0x00a,0x00b};
+
+bool adreno8_translation_walk(struct adreno8_gpu_space *space, uint32_t iova,
+    vm_offset_t memory, uint32_t size, uint32_t prot)
+{
+    assert(adreno8_direct_ring && space==&adreno8_gpu_space && prot==5);
+    assert(!oob_requested && !gx_reads && !gx_writes && !gmu_reads && !gmu_writes);
+    unsigned i=walk_calls++;
+    assert(i<2 && iova==allocations[i].gpu_address && memory==allocations[i].memory);
+    assert(size==allocations[i].size);
+    return walk_calls!=walk_fail_at;
+}
 
 static void ring_setup_wait(void)
 {
@@ -254,6 +268,7 @@ void adreno8_wr(vm_offset_t address, uint32_t value)
         uint32_t reg = (address - adreno8_gmu.base) / 4;
         gmu_regs[reg] = value;
         if (reg == GMU_HOST2GMU_SET / 4 && value == 1u << 30 && oob_ok) {
+            assert(!adreno8_direct_ring || walk_calls==2);
             gmu_regs[GMU_GMU2HOST_INFO / 4] |= 1u << 31;
             gmu_regs[GMU_PWR_CLK_STATUS / 4] = 0;
         }
@@ -476,6 +491,7 @@ static void reset(void)
     ring_sqe_writes=ring_setup_fault_at=ring_setup_fault=ring_setup_completed=0;
     ring_halt_reads=ring_halt_clears=ring_halt_drop=ring_halt_observe_fault=0;
     setup_waits = 0;
+    walk_calls=walk_fail_at=0;
     diagnostic_reads = diagnostic_writes = diagnostic_offset = 0;
     last_mmio = MMIO_NONE; barriers = gmu_reads = gmu_writes = 0;
     smmu_ok = hfi_ok = oob_ok = clock_ok = raw_ok = idle_ok = acquire_ok = true;
@@ -622,6 +638,7 @@ static void check_direct_ring(void)
         case 7: adreno8_skip_steps=1; break;
         }
         assert(!adreno8_gpu_cp_init() && !oob_requested && !gx_writes && !gmu_writes);
+        if(bad) assert(!walk_calls);
     }
     reset(); adreno8_direct_ring=true; ring_alloc_ok=false;
     assert(!adreno8_gpu_prepare() && allocation_count==4 && gpu_state==GPU_FAILED && !gx_writes && !gmu_writes);
@@ -810,6 +827,13 @@ int main(int argc, char **argv)
     acquire_ok = false; assert(!adreno8_gpu_scratch_test() && gpu_state == GPU_FAILED);
     check_direct_ring();
     check_ring_setup_only();
+    for (unsigned failed=1;failed<=2;failed++) {
+        prepare_ring(); walk_fail_at=failed;
+        assert(!adreno8_gpu_cp_init() && gpu_state==GPU_FAILED && walk_calls==failed);
+        assert(!oob_requested && !gx_reads && !gx_writes && !gmu_reads && !gmu_writes);
+        assert(allocation_count==5 && !adreno8_gpu_cp_ready());
+        assert(!adreno8_gpu_cp_init() && walk_calls==failed);
+    }
     reset(); free(files[0]); free(files[1]);
     puts("gen8.0.0 vendor aperture/tables, bounded ordered MMIO, PM4, firmware and startup failures passed");
     return 0;

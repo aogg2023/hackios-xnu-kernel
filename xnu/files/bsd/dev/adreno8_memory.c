@@ -148,7 +148,7 @@ adreno8_memory_alloc_xfer(const char *name, uint32_t size, uint32_t alignment,
 	}
 	/* Mode 3/4: prove the IOVA resolves through our own tables while the pages are
 	 * still the kernel's; after the handover the CPU must not read them again. */
-	if (translate && !adreno8_secure_translation_walk(&adreno8_secure_space, buffer->gpu_address,
+	if (translate && !adreno8_translation_walk(&adreno8_secure_space, buffer->gpu_address,
 	    buffer->memory, size, gpu_prot)) {
 		printf("adreno8: secure translation 3a stopped before the handover; no page transferred\n");
 		adreno8_secure_xfer_abort();

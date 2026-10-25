@@ -69,6 +69,7 @@ static vm_offset_t arb_core, arb_cnfg, arb_obsrvr;
 static int level;
 static uint32_t amplitude = 0x60;
 static bool configured, playing, broken, leaving;
+static bool written;                            /* something was written: the way out disables the module, configured or not */
 
 /* every line to the loader's log as well (and to the console when that may be written) */
 static int say(const char *format, ...) __printflike(1, 2);
@@ -390,12 +391,21 @@ static bool
 configure(void)
 {
 	uint32_t tlra = LRA_PERIOD_US / 5;
-	uint8_t two[2], eight[8];
+	uint8_t two[2], eight[8], clear = HAP_FAULT_CLR_ALL, fault = 0;
 
+	written = true;
 	if (!module_enable(true)) {
 		return false;
 	}
-	if (!hap_put(HAP_DRIVER, HAP_CFG_FAULT_CLR, HAP_FAULT_CLR_ALL, true)) {
+	/* FAULT_CLR is a command whose bits clear themselves (it reads 0): the fault status tells instead */
+	if (spmi_write16(HAP_DRIVER, HAP_CFG_FAULT_CLR, &clear, 1) != NULL || !hap_read(HAP_DRIVER, HAP_CFG_FAULT_STATUS, &fault, 1)) {
+		say("haptic: clearing the faults did not go through\n");
+		broken = true;
+		return false;
+	}
+	if (fault != 0) {
+		say("haptic: the fault status is %#04x after clearing\n", fault);
+		broken = true;
 		return false;
 	}
 	if (!hap_put(HAP_DRIVER, HAP_CFG_VMAX, VMAX_MV / 50, false)) {     /* 1300 mV as this phone's device tree says */
@@ -689,7 +699,7 @@ haptic_thread(__unused void *parameter, __unused wait_result_t result)
 		serve();
 	}
 done:
-	if (configured) {
+	if (written) {
 		static const uint8_t stop_play = HAP_SRC_DIRECT, module_off = 0;
 
 		(void)spmi_write16(HAP_DRIVER, HAP_CFG_SPMI_PLAY, &stop_play, 1);
@@ -723,7 +733,7 @@ annibale_haptic_init(void)
 void
 annibale_haptic_quiesce(void)
 {
-	if (configured) {
+	if (written) {
 		static const uint8_t stop_play = HAP_SRC_DIRECT, module_off = 0;
 
 		leaving = true;

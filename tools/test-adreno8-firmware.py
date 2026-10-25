@@ -66,8 +66,10 @@ static uint32_t adreno8_rd(vm_offset_t address) {
 }
 static void adreno8_wr(vm_offset_t address, uint32_t value) {
     *(uint32_t *)address = value; writes++;
-    if (emulate_start && address == adreno8_gmu.base + GMU_CM3_SYSRESET && value == 0)
-        registers[GMU_FW_INIT_RESULT / 4] = GMU_FW_STARTED;
+    if (address == adreno8_gmu.base + GMU_CM3_SYSRESET && value == 0) {
+        assert(registers[GMU_GENERAL_10 / 4] == ((8u << 24) | (1u << 8)));
+        if (emulate_start) registers[GMU_FW_INIT_RESULT / 4] = GMU_FW_STARTED;
+    }
 }
 static void adreno8_put(struct adreno8_block *block, const char *name, uint32_t offset, uint32_t value) {
     adreno8_wr(block->base + offset, value);
@@ -155,7 +157,7 @@ int main(int argc, char **argv) {
     assert(!adreno8_step_gmu_start() && !adreno8_gmu_runs && writes == before);
     scm_ok = true;
     assert(adreno8_step_gmu_start() && adreno8_gmu_runs);
-    assert(registers[GMU_GENERAL_10 / 4] == 0x08000000 && registers[GMU_RPMH_POWER_STATE / 4] == 0xf);
+    assert(registers[GMU_GENERAL_10 / 4] == 0x08000100 && registers[GMU_RPMH_POWER_STATE / 4] == 0xf);
     assert(registers[GMU_AHB_FENCE_RANGE_0 / 4] == (1u << 31 | 0x32u << 18 | 0x8a0));
     assert(gpu_registers[GPU_GBIF_HALT / 4] == 8);
     assert(registers[GMU_MRC_GBIF_QOS / 4] == 0x33);

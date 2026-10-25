@@ -566,7 +566,9 @@ adreno8_step_gmu_start(void)
 	adreno8_put(&adreno8_gmu, "GMU GBIF QoS", GMU_MRC_GBIF_QOS, 0x33);
 	adreno8_put(&adreno8_gpu, "clear GBIF halt", GPU_GBIF_HALT, 1u << 3);
 	adreno8_put(&adreno8_gmu, "clear log write index", GMU_GENERAL_9, 0);
-	adreno8_put(&adreno8_gmu, "gen8.0.0 firmware revision", GMU_GENERAL_10, 0x08000000);
+	/* annibale's live DT identifies gen8_0_1 (chip ID 0x44050001).
+	 * Vendor ADRENO_GMU_REV encodes major/minor/patch in bits 31:8. */
+	adreno8_put(&adreno8_gmu, "gen8.0.1 firmware revision", GMU_GENERAL_10, 0x08000100);
 	adreno8_put(&adreno8_gmu, "log address and page count", GMU_GENERAL_8,
 	    (adreno8_gmu_log.address & ~0xfff) | ((adreno8_gmu_log.size / 4096 - 1) & 0xff));
 	adreno8_put(&adreno8_gmu, "sys bus config", GMU_SYS_BUS_CONFIG, 1);

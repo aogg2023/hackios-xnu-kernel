@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Compare gen8.0.0 tables with pinned vendor data and exercise production GPU startup."""
+"""Compare gen8 tables with pinned sources and the annibale KGSL module; exercise GPU startup."""
 import argparse
 import hashlib
 from pathlib import Path
 import re
+import struct
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DEV = ROOT / "xnu/files/bsd/dev"
 PIN = "d50b305f7da9e14715a25120a4ac7b1a4b8b97c3"
+KGSL_SHA256 = "14aea73aa60814273a51f8e145e3b491471600466ddf6f42b7c45e1716b2bfd7"
 HASHES = {
     "adreno_gen8.c": "3379f615fd4f350cf22ef60920891df3b7f479044947f3a714e26d22c8e2b56e",
     "adreno-gpulist.h": "7faff3fd1afc101dd1db984a9ca632ce884e8406fa856d4f60632e281077f3f6",
@@ -17,10 +19,51 @@ HASHES = {
     "adreno_pm4types.h": "f66d80cd679aa0e0dd032f230bf960a964dfda282944bcb32c6643d1ebe5d731",
     "sun-gpu.dtsi": "b91bf41b0f6e8f75ea39601a3949debfbbc3b83cb7b52c11142bb6625840bade",
 }
+
+def kgsl_tpl1(path):
+    data = path.read_bytes()
+    assert hashlib.sha256(data).hexdigest() == KGSL_SHA256, "unexpected KGSL module"
+    assert data[:7] == b"\x7fELF\x02\x01\x01" and struct.unpack_from("<HH", data, 16) == (1, 183)
+    shoff = struct.unpack_from("<Q", data, 40)[0]
+    shentsize, shnum = struct.unpack_from("<HH", data, 58)
+    assert shentsize == 64
+    sections = [struct.unpack_from("<IIQQQQIIQQ", data, shoff + i * shentsize) for i in range(shnum)]
+    symtab_index, symtab = next((i, s) for i, s in enumerate(sections) if s[1] == 2)
+    assert symtab[9] == 24
+    strings = sections[symtab[6]]
+    names = data[strings[4]:strings[4] + strings[5]]
+    entries = [struct.unpack_from("<IBBHQQ", data, at)
+               for at in range(symtab[4], symtab[4] + symtab[5], 24)]
+    symbols = {names[s[0]:names.index(b"\0", s[0])].decode(): s for s in entries}
+    _, _, _, table_section, table_value, table_size = symbols["gen8_0_0_nonctxt_regs"]
+    assert table_size == 41 * 12
+    # Both catalog entries select this table through their +0xa8 ABS64 relocation.
+    for core in ("adreno_gpu_core_gen8_0_0", "adreno_gpu_core_gen8_0_1"):
+        _, _, _, core_section, core_value, core_size = symbols[core]
+        assert core_size == 256
+        targets = []
+        for section in sections:
+            if section[1] != 4 or section[7] != core_section:
+                continue
+            assert section[6] == symtab_index and section[9] == 24
+            for at in range(section[4], section[4] + section[5], 24):
+                offset, info, addend = struct.unpack_from("<QQq", data, at)
+                if offset == core_value + 0xa8:
+                    symbol = entries[info >> 32]
+                    targets.append((info & 0xffffffff, symbol[3], symbol[4] + addend))
+        assert targets == [(257, table_section, table_value)], core
+    offset = sections[table_section][4] + table_value + 25 * 12
+    row = struct.unpack_from("<III", data, offset)
+    assert offset == 0x4f29c and row == (0xb600, 0x10000000, 1), "KGSL TPL1 catalog entry"
+    print(f"KGSL catalog TPL1: register {row[0]:#x}, value {row[1]:#x}, pipes {row[2]:#x}")
+    return row
+
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--vendor-dir", required=True, type=Path, help=f"graphics-kernel sources and sun-gpu.dtsi at {PIN}")
+parser.add_argument("--kgsl-module", required=True, type=Path, help=f"annibale msm_kgsl.ko with SHA-256 {KGSL_SHA256}")
 parser.add_argument("--firmware-dir", type=Path, default=ROOT.parent / "hackios-xnu-userland/firmware-gen8")
 args = parser.parse_args()
+tpl1_reg, tpl1_value, _ = kgsl_tpl1(args.kgsl_module)
 vendor = {}
 for name, expected in HASHES.items():
     data = (args.vendor_dir / name).read_bytes()
@@ -51,6 +94,7 @@ for name, base in (("gpu", 0x10000000), ("gmu", 0x20000000)):
 registers = dict(re.findall(r"^#define\s+(GEN8_\w+)\s+(0x[0-9a-fA-F]+|[0-9]+)\s*(?:/\*.*)?$", vendor["gen8_reg.h"], re.M))
 reference = "#define BIT(n) (1u << (n))\n"
 reference += "enum { PIPE_NONE, PIPE_BR, PIPE_BV, PIPE_LPAC, PIPE_AQE0, PIPE_AQE1, PIPE_DDE_BR, PIPE_DDE_BV };\n"
+reference += f"enum {{ KGSL_TPL1_REG = {tpl1_reg}, KGSL_TPL1_VALUE = {tpl1_value} }};\n"
 gen = vendor["adreno_gen8.c"]
 reference += gen[gen.index("/* CP Interrupt bits */"):gen.index("/* IFPC & Preemption static")]
 tables = [
@@ -67,6 +111,11 @@ for file, old, new, ctype in tables:
     body = re.search(r"\b" + old + r"\[\]\s*=\s*\{(.*?)\n\};", vendor[file], re.S)[1]
     body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
     body = re.sub(r"\s*\{\s*0\s*\},?\s*$", "", body)
+    if old == "gen8_0_0_nonctxt_regs":
+        original = "{ GEN8_TPL1_DBG_ECO_CNTL, 0x10100000, BIT(PIPE_NONE) }"
+        assert body.count(original) == 1
+        # This one catalog value follows the verified annibale module.
+        body = body.replace(original, f"{{ GEN8_TPL1_DBG_ECO_CNTL, {tpl1_value:#x}, BIT(PIPE_NONE) }}")
     # Resolve against the independently supplied vendor header, never the production constants.
     body = re.sub(r"\bGEN8_[A-Z0-9_]+", lambda m: registers[m[0]], body)
     reference += f"static const {ctype} ref_{new}[] = {{{body}\n}};\n"
@@ -240,6 +289,9 @@ bool adreno8_hwsched_raw(const uint32_t *pm4_words, uint32_t words, const char *
         assert(pm4_words[7] == powerup->gpu_address && pm4_words[8] == 0);
         uint32_t *p = (uint32_t *)device_memory[2];
         assert(p[0] == 0 && p[1] == 0 && p[2] == 0);
+        assert(gpu_regs[0][KGSL_TPL1_REG] == KGSL_TPL1_VALUE);
+        assert(ref_a8_powerup_ifpc[11] == KGSL_TPL1_REG);
+        assert(p[26] == KGSL_TPL1_REG && p[27] == KGSL_TPL1_VALUE);
         unsigned dynamic = 0;
         for (unsigned pipe = 1; pipe <= 7; pipe++)
             for (unsigned i = 0; i < A8_COUNT(ref_a8_powerup_ext); i++)
@@ -461,11 +513,27 @@ with tempfile.TemporaryDirectory(prefix="adreno8-gpu-test-") as temp:
             moved = without.replace("\tadreno8_wr(adreno8_gmu.base + offset, value);",
                 "\tadreno8_wr(adreno8_gmu.base + offset, value);\n\tadreno8_settle();", 1)
         variants[function + "_barrier_wrong_side"] = production[:start] + moved + production[end:]
-    for name, mutated in variants.items():
-        assert mutated != production, name
+    checks = [(name, mutated, None) for name, mutated in variants.items()]
+    private = (DEV / "adreno8_gpu_private.h").read_text()
+    tpl1_entry = "{ GEN8_TPL1_DBG_ECO_CNTL, 0x10000000, A8_BIT(A8_PIPE_NONE) }"
+    assert private.count(tpl1_entry) == 1
+    checks.append(("tpl1_bit20_restored", production,
+                   private.replace(tpl1_entry, tpl1_entry.replace("0x10000000", "0x10100000"))))
+    for name, before, after in (
+        ("tpl1_startup_bit20", "gpu_write(a8_noncontext[i].reg, a8_noncontext[i].value);",
+         "gpu_write(a8_noncontext[i].reg, a8_noncontext[i].value | (a8_noncontext[i].reg == 0xb600 ? 1u << 20 : 0));"),
+        ("tpl1_powerup_bit20", "words[at++] = gpu_read(a8_powerup_ifpc[i]);",
+         "words[at++] = gpu_read(a8_powerup_ifpc[i]) | (a8_powerup_ifpc[i] == 0xb600 ? 1u << 20 : 0);"),
+    ):
+        assert production.count(before) == 1, name
+        checks.append((name, production.replace(before, after), None))
+    for name, mutated, mutated_header in checks:
+        assert mutated != production or (mutated_header is not None and mutated_header != private), name
         variant = Path(temp) / name
         variant.mkdir()
         (variant / "adreno8_gpu.c").write_text(mutated)
+        if mutated_header is not None:
+            (variant / "adreno8_gpu_private.h").write_text(mutated_header)
         (variant / "gpu.c").write_text(source)
         for page in (4096, 16384):
             binary = variant / f"gpu-{page}"
@@ -475,3 +543,4 @@ with tempfile.TemporaryDirectory(prefix="adreno8-gpu-test-") as temp:
                                      str(args.firmware_dir / "gen80000_aqe.fw")], capture_output=True, text=True)
             assert result.returncode != 0 and "assert" in result.stderr.lower(), (name, page, result.stderr)
     print(f"GPU MMIO barrier mutations rejected: {len(variants)} variants x 2 page sizes")
+    print("GPU TPL1 catalog/startup/powerup mutations rejected: 3 variants x 2 page sizes")

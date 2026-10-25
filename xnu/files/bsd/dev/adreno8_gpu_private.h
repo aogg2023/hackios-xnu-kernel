@@ -5,8 +5,12 @@
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  *
  * gen8_0_0 register definitions and tables from gen8_reg.h, adreno-gpulist.h
- * and adreno_gen8.c, copied without changing catalog values. Source:
+ * and adreno_gen8.c. Source:
  * https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750/tree/d50b305f7da9e14715a25120a4ac7b1a4b8b97c3/vendor/qcom/opensource/graphics-kernel
+ * TPL1_DBG_ECO_CNTL follows annibale msm_kgsl.ko, SHA-256
+ * 14aea73aa60814273a51f8e145e3b491471600466ddf6f42b7c45e1716b2bfd7:
+ * gen8_0_1 catalog +0xa8 selects gen8_0_0_nonctxt_regs[25],
+ * { register 0xb600, value 0x10000000, pipes 1 } (file offset 0x4f29c).
  * PM4 construction follows adreno_pm4types.h and gen8_cp_init_cmds.
  */
 #ifndef _DEV_ADRENO8_GPU_PRIVATE_H
@@ -166,7 +170,7 @@ static const struct a8_reg_value a8_noncontext[] = {
 	{ GEN8_SP_CHICKEN_BITS_2, A8_BIT(22) | A8_BIT(23), A8_BIT(A8_PIPE_NONE) },
 	{ GEN8_SP_CHICKEN_BITS_3, 0x00300000, A8_BIT(A8_PIPE_NONE) },
 	{ GEN8_SP_HLSQ_TIMEOUT_THRESHOLD_DP, 0x00000080,  A8_BIT(A8_PIPE_NONE) },
-	{ GEN8_TPL1_DBG_ECO_CNTL, 0x10100000, A8_BIT(A8_PIPE_NONE) },
+	{ GEN8_TPL1_DBG_ECO_CNTL, 0x10000000, A8_BIT(A8_PIPE_NONE) },
 	{ GEN8_TPL1_DBG_ECO_CNTL1, 0x00000724, A8_BIT(A8_PIPE_NONE) },
 	{ GEN8_UCHE_MODE_CNTL, 0x00080000, A8_BIT(A8_PIPE_NONE) },
 	{ GEN8_UCHE_CCHE_MODE_CNTL, 0x00001000, A8_BIT(A8_PIPE_NONE) },

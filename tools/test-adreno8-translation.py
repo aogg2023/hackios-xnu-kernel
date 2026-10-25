@@ -15,6 +15,12 @@ stub = fixture["stub"].replace(
 # macOS arm64 protects memory in 16 KiB pages, including the 4 KiB XNU case.
 stub = stub.replace("aligned_alloc(PAGE_SIZE, size)",
                     "aligned_alloc(16384, (size + 16383) & ~(size_t)16383)")
+stub = stub.replace("static uint32_t reject_offset = ~0u, reject_value;",
+                    "static uint32_t reject_offset = ~0u, reject_value, fsr_after_enable;")
+stub = stub.replace("    regs[offset / 4] = value;",
+    "    regs[offset / 4] = value;\n"
+    "    if (offset == 0x23000 + SMMU_CB_SCTLR && value == SCTLR_ON)\n"
+    "        regs[(0x23000 + SMMU_CB_FSR) / 4] |= fsr_after_enable;")
 tests = r'''
 #include <sys/mman.h>
 static const uint32_t mapping_size = 0x138000;
@@ -128,6 +134,34 @@ int main(void) {
     assert(regs[(0x23000 + SMMU_CB_SCTLR) / 4] == 0);
     puts("secure context writes: each failed readback stops, TLB timeout stops before enable: PASS");
 
+    /* SMMUv2 FSR.Format [10:9] is read-only. Format 0b10 selects AArch64;
+     * it remains set after W1C and must not prevent either validation step. */
+    prepare();
+    regs[(0x23000 + SMMU_CB_FSR) / 4] = 0x400;
+    assert(adreno8_secure_translation_3a(&adreno8_secure_space));
+    assert(regs[(0x23000 + SMMU_CB_FSR) / 4] == 0x400);
+    assert(!adreno8_space_faulted(&adreno8_secure_space));
+    for (unsigned bit = 0; bit < 32; bit++) {
+        uint32_t fault = 1u << bit;
+        if (!(fault & FSR_ALL)) continue;
+        prepare();
+        regs[(0x23000 + SMMU_CB_FSR) / 4] = 0x400 | fault;
+        reject_offset = 0x23000 + SMMU_CB_FSR;
+        reject_value = FSR_ALL;
+        assert(!adreno8_secure_translation_3a(&adreno8_secure_space));
+        assert(!adreno8_secure_space.is_on);
+        assert(write_log[write_log_count - 1].offset == reject_offset);
+        assert(adreno8_space_faulted(&adreno8_secure_space));
+        prepare();
+        regs[(0x23000 + SMMU_CB_FSR) / 4] = 0x400;
+        fsr_after_enable = fault;
+        assert(!adreno8_secure_translation_3a(&adreno8_secure_space));
+        assert(adreno8_secure_space.is_on);
+        assert(adreno8_space_faulted(&adreno8_secure_space));
+        fsr_after_enable = 0;
+    }
+    puts("secure FSR: AArch64 format accepted; every fault bit stops before/after enable: PASS");
+
     prepare();
     assert(check_mapping());
     assert(adreno8_secure_translation_3a(&adreno8_secure_space));
@@ -176,6 +210,10 @@ if __name__ == "__main__":
         walker = (ROOT / "xnu/files/bsd/dev/adreno8_translation.c").read_text()
         smmu = fixture["driver"][:-len(walker)]
         variants = {
+            "reject_format_as_fault": (smmu + walker).replace(
+                "if ((read & FSR_ALL) != 0) {", "if (read != 0) {", 1),
+            "ignore_pre_enable_fault": (smmu + walker).replace(
+                "if ((read & FSR_ALL) != 0) {", "if (false) {", 1),
             "first_leaf_only": smmu + walker.replace("at < size;", "at < SMMU_GRANULE;"),
             "ignore_table_descriptor": smmu + walker.replace(
                 "descriptor == (table->phys | PTE_TABLE)", "true"),

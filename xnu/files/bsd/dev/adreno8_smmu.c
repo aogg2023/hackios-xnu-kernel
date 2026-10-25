@@ -931,7 +931,8 @@ adreno8_secure_translation_3a(struct adreno8_gpu_space *space)
 	read = adreno8_get(&adreno8_smmu, "cb fsr", cb + SMMU_CB_FSR);
 	printf("adreno8: %u: 3a cb fsr (%#x) write %#010x read %#010x\n", adreno8_step,
 	    adreno8_smmu.phys + cb + SMMU_CB_FSR, FSR_ALL, read);
-	if (read != 0) {
+	/* FSR.Format [10:9] is read-only; 0x400 identifies AArch64 translation. */
+	if ((read & FSR_ALL) != 0) {
 		return adreno8_3a_stop("cb fsr", FSR_ALL, read);
 	}
 	adreno8_settle();

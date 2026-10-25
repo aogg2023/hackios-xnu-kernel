@@ -455,6 +455,39 @@ gpu_global_fault_sample(const char *phase)
 	return first == 0 && last == 0;
 }
 
+/* Read-only state after an unconsumed CP_INIT, following gen8_spin_idle_debug and
+ * Linux a8xx_fault_detect_irq. SQE_STAT indices are recorded raw; mainline only
+ * names index 1 (faulting opcode). */
+static void
+gpu_direct_ring_timeout_dump(void)
+{
+	static const uint32_t global[] = { GEN8_RBBM_STATUS1, GEN8_RBBM_GFX_STATUS,
+		GEN8_RBBM_GFX_BR_STATUS, GEN8_RBBM_GFX_BV_STATUS, GEN8_RBBM_MISC_STATUS,
+		GEN8_CP_CP2GMU_STATUS, GEN8_CP_RL_ERROR_DETAILS_0, GEN8_CP_RL_ERROR_DETAILS_1,
+		GEN8_CP_SQE_INSTR_BASE_LO, GEN8_CP_RB_BASE_LO_GC, GEN8_CP_RB_CNTL_GC };
+	static const uint32_t piped[] = { GEN8_CP_HW_FAULT_STATUS_PIPE, GEN8_CP_INTERRUPT_STATUS_PIPE,
+		GEN8_CP_PIPE_STATUS_PIPE, GEN8_CP_SQE_STATUS_PIPE, GEN8_CP_PROTECT_STATUS_PIPE,
+		GEN8_CP_SQE_ICACHE_CNTL_PIPE };
+
+	for (unsigned i = 0; i < A8_COUNT(global); i++)
+		printf("adreno8: CP_INIT timeout reg %#x = %#x\n", global[i], gpu_read(global[i]));
+	if (adreno8_memory_acquire(scratch, 0, 16))
+		printf("adreno8: CP_INIT timeout shadow BR=%#x BV=%#x\n",
+		    *(volatile uint32_t *)scratch->memory, *(volatile uint32_t *)(scratch->memory + 8));
+	for (uint32_t pipe = A8_PIPE_BR; pipe <= A8_PIPE_BV; pipe++) {
+		if (!gpu_aperture(pipe))
+			return;
+		for (unsigned i = 0; i < A8_COUNT(piped); i++)
+			printf("adreno8: CP_INIT timeout pipe %u reg %#x = %#x\n", pipe, piped[i], gpu_read(piped[i]));
+		for (uint32_t index = 0; index < 16; index++) {
+			gpu_write(GEN8_CP_SQE_STAT_ADDR_PIPE, index);
+			printf("adreno8: CP_INIT timeout pipe %u SQE_STAT[%u] = %#x\n",
+			    pipe, index, gpu_read(GEN8_CP_SQE_STAT_DATA_PIPE));
+		}
+	}
+	(void)gpu_aperture(0);
+}
+
 /* Linux a8xx_hw_init/a8xx_cp_init at efbda69d92e6 use a zeroed powerup page,
  * BR/BV RPTR shadows and a 32 KiB ring before enabling SQE. The setup probes
  * stop before CP_INIT and retain allocations and OOB until cold reset. */
@@ -559,6 +592,7 @@ gpu_direct_ring_init(uint32_t raw_mode)
 	(void)gpu_global_fault_sample("completion timeout");
 	printf("adreno8: direct ring CP_INIT timeout: WPTR=%#x RBBM_STATUS=%#x\n",
 	    gpu_read(GEN8_CP_RB_WPTR_GC), gpu_read(GEN8_RBBM_STATUS));
+	gpu_direct_ring_timeout_dump();
 	return gpu_fail("direct ring CP_INIT completion timeout");
 }
 

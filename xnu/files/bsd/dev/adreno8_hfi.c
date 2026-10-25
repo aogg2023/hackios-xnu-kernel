@@ -478,22 +478,22 @@ adreno8_step_tables(void)
 /* ---- step 15: minimum DCVS request --------------------------------------------------------------- */
 
 /* HWSCHED sets default votes after START and before GPU MMU/OOB.
- * gen8_0_0 maps 125 MHz to DDR index 2. This probe does not access GX registers. */
+ * All six live K90 DT bins map 160 MHz to DDR index 2. This probe does not access GX registers. */
 bool
 adreno8_step_gx_power(void)
 {
-	uint32_t msg[3] = {1, 1, 2}; /* Blocking ACK, 125 MHz, DDR index 2; AB=0. */
+	uint32_t msg[3] = {1, 1, 2}; /* Blocking ACK, 160 MHz, DDR index 2; AB=0. */
 	uint32_t power;
 
 	if (!adreno8_cx_ready() || !adreno8_gmu_talks || !adreno8_hwsched_ready()) {
 		return false;
 	}
 	if (!adreno8_gpu8_keep || adreno8_gpu8_return || adreno8_gx_count != 2 ||
-	    adreno8_gx_hz[1] != 125000000 || adreno8_speed_asked > 1) {
-		printf("adreno8: %u: DCVS probe requires keep=1, return=0 and the 125 MHz table; finish with host cold reset\n", adreno8_step);
+	    adreno8_gx_hz[1] != 160000000 || adreno8_speed_asked > 1) {
+		printf("adreno8: %u: DCVS probe requires keep=1, return=0 and the 160 MHz table; finish with host cold reset\n", adreno8_step);
 		return false;
 	}
-	adreno8_announce("request 125 MHz and bandwidth index 2; retain resources until host cold reset");
+	adreno8_announce("request 160 MHz and bandwidth index 2; retain resources until host cold reset");
 	/* A missing ACK cannot prove that the firmware left its power votes unchanged. */
 	adreno8_reset_required = true;
 	if (!adreno8_hfi_send(30, msg, 3, "minimum DCVS vote")) {

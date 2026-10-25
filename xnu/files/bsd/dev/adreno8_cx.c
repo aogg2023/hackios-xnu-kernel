@@ -109,10 +109,10 @@ static struct adreno8_block adreno8_qfprom = { "qfprom", 0x221c8000, 0x1000 };
 
 /*
  * KGSL selects qcom,sku-codes from socinfo feature_code/pcode, separately from speed_bin.
- * Until socinfo is available, expose only the 125 MHz / 0x32 point shared by both K90 DT tables.
+ * Until socinfo is available, expose only the 160 MHz / 0x32 point shared by all six live K90 DT bins.
  */
 static const struct adreno8_gpu_level adreno8_boot_speeds[] = {
-	{ 125000000, 0x32 },
+	{ 160000000, 0x32 },
 };
 
 uint32_t adreno8_speed_bin;
@@ -269,7 +269,7 @@ adreno8_step_outside(void)
 	adreno8_speed_bin = bin &= 0x1ff;
 	adreno8_speeds = adreno8_boot_speeds;
 	adreno8_speeds_count = sizeof(adreno8_boot_speeds) / sizeof(adreno8_boot_speeds[0]);
-	printf("adreno8: %u: speed bin %u; SKU unavailable, limiting GX to the common 125 MHz point\n", adreno8_step, bin);
+	printf("adreno8: %u: speed bin %u; SKU unavailable, limiting GX to the common 160 MHz point\n", adreno8_step, bin);
 	adreno8_gx_count = 1;
 	adreno8_gx_hz[0] = 0;
 	adreno8_gx_level[0] = 0;                        /* the idling speed the message tables start with (Linux prepends the 0 Hz operating point) */

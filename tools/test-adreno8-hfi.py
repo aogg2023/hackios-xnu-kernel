@@ -175,6 +175,7 @@ bcm_macro_end = private.index("\n#define", bcm_macro_start)
 BCM_MACRO = private[bcm_macro_start:bcm_macro_end]
 BW_DEFINE = re.search(r"^#define BW_COUNT\s+\d+", private, re.M).group()
 cx = (ROOT / "xnu/files/bsd/dev/adreno8_cx.c").read_text()
+BOOT_DATA = re.search(r"static const struct adreno8_gpu_level adreno8_boot_speeds\[\] = \{.*?\n};", cx, re.S).group()
 BW_DATA = re.search(r"const uint32_t adreno8_bw_kb\[BW_COUNT\] = \{.*?\n};", cx, re.S).group().replace("const uint32_t", "static uint32_t")
 BCM_DATA = re.search(r"const struct adreno8_bcm adreno8_bcms\[\] = \{.*?\n};", cx, re.S).group().replace("const struct", "static const struct")
 STAGE_SOURCE = r'''
@@ -189,13 +190,15 @@ typedef uintptr_t vm_offset_t;
 struct block { vm_offset_t base; };
 struct adreno8_bcm_db { uint32_t unit; uint16_t width; uint8_t vcd, reserved; };
 struct adreno8_bcm { const char *name; uint32_t buswidth; bool fixed; uint32_t perfmode, perfmode_bw; };
+struct adreno8_gpu_level { uint32_t hz, level; };
+''' + BOOT_DATA + r'''
 static struct block adreno8_gmu;
 static uint32_t adreno8_step, adreno8_gx_count = 2;
 static uint32_t adreno8_speed_asked;
 static bool adreno8_gpu8_keep, adreno8_gpu8_return, adreno8_reset_required;
 static bool adreno8_hfi_tables_sent, hwsched_ready = true;
 static bool adreno8_hwsched_ready(void) { return hwsched_ready; }
-static uint32_t adreno8_gx_hz[17] = {0, 125000000}, adreno8_gx_level[17] = {0, 128};
+static uint32_t adreno8_gx_hz[17], adreno8_gx_level[17];
 static uint32_t adreno8_gx_votes[17], adreno8_gx_dep_votes[17], adreno8_cx_votes[3];
 static const uint32_t adreno8_gmu_hz[3] = {0, 200000000, 500000000};
 static const uint32_t adreno8_gmu_level[3] = {0, 64, 128};
@@ -249,6 +252,10 @@ static bool adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t word
 }
 ''' + BCM_MACRO + "\n" + STAGE_FUNCTIONS + r'''
 int main(void) {
+    assert(sizeof(adreno8_boot_speeds) / sizeof(adreno8_boot_speeds[0]) == 1);
+    assert(adreno8_boot_speeds[0].hz == 160000000 && adreno8_boot_speeds[0].level == 50);
+    adreno8_gx_hz[1] = adreno8_boot_speeds[0].hz;
+    adreno8_gx_level[1] = adreno8_boot_speeds[0].level;
     assert(adreno8_step_queues() && adreno8_gmu_talks && mask_written == UINT32_MAX);
     adreno8_gmu_talks = false; version = 0x20060000;
     assert(!adreno8_step_queues() && !adreno8_gmu_talks);
@@ -262,7 +269,7 @@ int main(void) {
     assert(ids[0] == 15 && lengths[0] == 18);
     assert(sent[0][0] == 0 && sent[0][1] == 1 && sent[0][2] == 2 && sent[0][3] == 3);
     assert(sent[0][4] == 100 && sent[0][5] == 200 && sent[0][6] == 0);
-    assert(sent[0][7] == 228 && sent[0][8] == 328 && sent[0][9] == 125000);
+    assert(sent[0][7] == 150 && sent[0][8] == 250 && sent[0][9] == 160000);
     assert(sent[0][10] == 3 && sent[0][11] == 2 && sent[0][16] == 228 && sent[0][17] == 500000);
     assert(ids[1] == 3 && lengths[1] == 159);
     assert(sent[1][0] == BW_COUNT && sent[1][1] == 1 && sent[1][2] == 3 && sent[1][3] == 1 && sent[1][4] == 5);
@@ -296,9 +303,9 @@ int main(void) {
     assert(!adreno8_step_gx_power() && send_count == 0);
     adreno8_gpu8_return = false; adreno8_speed_asked = 2;
     assert(!adreno8_step_gx_power() && send_count == 0);
-    adreno8_speed_asked = 1; adreno8_gx_hz[1] = 200000000;
+    adreno8_speed_asked = 1; adreno8_gx_hz[1] = 125000000;
     assert(!adreno8_step_gx_power() && send_count == 0);
-    adreno8_gx_hz[1] = 125000000;
+    adreno8_gx_hz[1] = adreno8_boot_speeds[0].hz;
     hwsched_ready = false; assert(!adreno8_step_gx_power() && send_count == 0);
     hwsched_ready = true;
     assert(adreno8_step_gx_power() && send_count == 1 && adreno8_reset_required);

@@ -78,7 +78,7 @@ static uint8_t timer_original;                  /* channel 0's safety timer as f
 #define ARB_CNFG_PHYS           0x0c42d000UL
 #define ARB_CNFG_SIZE           0x004000UL
 #define ARB_CHNLS_PHYS          0x0c500000UL
-#define ARB_CHNLS_SIZE          0x00010000UL
+#define ARB_CHNLS_SIZE          0x00400000UL            /* all of the device tree's "chnls": 0x1000 a channel; flash is 617 */
 #define ARB_OBSRV_PHYS          0x0c440000UL
 #define ARB_OBSRV_SIZE          0x0080000UL
 
@@ -233,6 +233,9 @@ spmi_write16(uint16_t addr, uint8_t value)
 	}
 	if (!flash.ours) {
 		return "the arbiter lets another system write the module";
+	}
+	if (0x1000UL * ((uint64_t)flash.apid + 1) > ARB_CHNLS_SIZE) {
+		return "the module's channel is outside the mapped window";
 	}
 	nanoseconds_to_absolutetime(TRANSACT_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
 	channel = arb_chnls + 0x1000UL * flash.apid;

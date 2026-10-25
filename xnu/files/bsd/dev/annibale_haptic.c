@@ -220,6 +220,9 @@ spmi_write16(uint16_t ppid, uint16_t addr, const uint8_t *bytes, uint32_t count)
 	if (problem != NULL) {
 		return problem;
 	}
+	if (0x1000UL * ((uint64_t)apid + 1) > ARB_CHNLS_SIZE) {
+		return "the peripheral's channel is outside the mapped window";
+	}
 	nanoseconds_to_absolutetime(TRANSACT_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
 	channel = arb_chnls + 0x1000UL * (uint32_t)apid;
 	uint32_t w0 = 0, w1 = 0;

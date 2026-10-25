@@ -39,6 +39,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include <IOKit/IOBufferMemoryDescriptor.h>
 
 #include "MiniIOSurface.h"
+#include "MiniFramebufferScale.h"
 
 extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
 
@@ -564,18 +565,6 @@ IOMobileFramebuffer::defaultSurface(void)
 }
 
 /*
- * Two pixels mixed: `w` of 256 of the second. Two of the four channels at a time, in one word.
- */
-static inline uint32_t
-blend(uint32_t a, uint32_t b, uint32_t w)
-{
-	uint32_t rb = ((a & 0xff00ff) * (256 - w) + (b & 0xff00ff) * w) >> 8 & 0xff00ff;
-	uint32_t ga = ((a >> 8 & 0xff00ff) * (256 - w) + (b >> 8 & 0xff00ff) * w) & 0xff00ff00;
-
-	return rb | ga;
-}
-
-/*
  * Where the middle of the `i`th of `out` pixels falls among `in` of them, in 256ths of a pixel,
  * kept within the first and the last.
  */
@@ -632,13 +621,7 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 				const uint32_t * lower = (const uint32_t *) (pixels + (size_t) (sy + row + 1) * stride) + sx;
 				uint32_t first = fColumn[cx0], last = fColumn[cx1 - 1] + 1 < (uint32_t) sw ? fColumn[cx1 - 1] + 1 : fColumn[cx1 - 1];
 
-				uint32_t * __restrict mixed = blendRow;
-
-				for (uint32_t c = first; c <= last; c++) {
-					uint32_t a = upper[c], b = lower[c];
-
-					mixed[c] = a == b ? a : blend(a, b, weight);           /* (most of a screen is the same as next to it) */
-				}
+				mixRows(upper, lower, blendRow, first, last, weight);
 				from = blendRow;
 			}
 		} else {
@@ -659,15 +642,7 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 			}
 		}
 		if (filter) {
-			const uint32_t * __restrict column = fColumn + cx0;
-			const uint16_t * __restrict weights = fColumnWeight + cx0;
-			uint32_t * __restrict out = to + cx0;
-
-			for (uint32_t i = 0, n = (uint32_t) (cx1 - cx0); i < n; i++) {
-				uint32_t c = column[i], w = weights[i], a = from[c];
-
-				out[i] = w == 0 || a == from[c + 1] ? a : blend(a, from[c + 1], w);
-			}
+			scaleRow(from, to + cx0, fColumn + cx0, fColumnWeight + cx0, (uint32_t) (cx1 - cx0), (uint32_t) sw);
 		} else {
 			for (int32_t x = cx0; x < cx1; x++) {
 				to[x] = from[fColumn[x]];

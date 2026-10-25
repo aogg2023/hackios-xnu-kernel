@@ -86,10 +86,14 @@ adreno8_bo_reserve(uint64_t size)
 	return address;
 }
 
+/* The pages entered since the last commit, which cleans just their entries out of the cache. */
+static uint64_t bo_mapped_low = UINT64_MAX, bo_mapped_high;
+
+/* One page of a buffer: the GPU's health is checked at its reservation and at its commit. */
 bool
 adreno8_bo_map(uint64_t address, uint64_t phys, bool read_only)
 {
-	if (!adreno8_bo_ready()) return false;
+	if (bo_state != BO_ENABLED) return false;
 	uint64_t *entry = bo_range(address, SMMU_GRANULE) ?
 	    adreno8_space_entry(&adreno8_gpu_space, (uint32_t)address) : NULL;
 	if (!entry || *entry != ADRENO8_PTE_EXTERNAL || !phys ||
@@ -97,14 +101,20 @@ adreno8_bo_map(uint64_t address, uint64_t phys, bool read_only)
 		return bo_fail("physical page");
 	uint32_t prot = ADRENO8_MEM_READ | ADRENO8_MEM_EXEC | (read_only ? 0 : ADRENO8_MEM_WRITE);
 	*entry = phys | adreno8_space_attributes(prot) | ADRENO8_PTE_EXTERNAL;
+	if (address < bo_mapped_low) bo_mapped_low = address;
+	if (address + SMMU_GRANULE > bo_mapped_high) bo_mapped_high = address + SMMU_GRANULE;
 	return true;
 }
 
 bool
 adreno8_bo_commit(void)
 {
+	uint64_t low = bo_mapped_low, high = bo_mapped_high;
 	if (!adreno8_bo_ready()) return false;
-	return adreno8_space_publish(&adreno8_gpu_space) || bo_fail("map TLB synchronization");
+	bo_mapped_low = UINT64_MAX;
+	bo_mapped_high = 0;
+	return adreno8_space_publish_range(&adreno8_gpu_space, low < high ? low : 0, low < high ? high - low : 0) ||
+	    bo_fail("map TLB synchronization");
 }
 
 static bool
@@ -155,7 +165,7 @@ adreno8_bo_unmap(uint64_t address, uint64_t size)
 	unmap_note(began, mach_absolute_time());
 	for (uint64_t at = 0; at < size; at += SMMU_GRANULE)
 		*adreno8_space_entry(&adreno8_gpu_space, (uint32_t)(address + at)) = ADRENO8_PTE_EXTERNAL;
-	return adreno8_space_publish(&adreno8_gpu_space) || bo_fail("unmap TLB synchronization");
+	return adreno8_space_publish_range(&adreno8_gpu_space, address, size) || bo_fail("unmap TLB synchronization");
 }
 
 bool

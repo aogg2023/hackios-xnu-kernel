@@ -56,6 +56,19 @@ static void fresh(void) {
     startup_pte = *adreno8_space_entry(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START);
     assert(adreno8_space_on(&adreno8_gpu_space, 0, 0));
 }
+/* Bytes cleaned since event `from`, each event less than a table; whether one held `value` at `entry`. */
+static uint64_t cleaned_since(unsigned from, const uint64_t *entry, uint64_t value, bool *seen) {
+    uint64_t bytes = 0;
+    vm_offset_t at = (vm_offset_t)entry;
+    *seen = false;
+    for (unsigned i = from; i < clean_count; i++) {
+        assert(cleaned[i].size < 4096);
+        bytes += cleaned[i].size;
+        if (cleaned[i].start <= at && at + 8 <= cleaned[i].start + cleaned[i].snap_len &&
+            !memcmp(cleaned[i].snap + (at - cleaned[i].start), &value, 8)) *seen = true;
+    }
+    return bytes;
+}
 static void stays_closed(uint64_t address, uint64_t size) {
     unsigned old_writes = writes, old_allocations = allocation_count;
     assert(!adreno8_bo_ready() && closed && adreno8_reset_required);
@@ -112,8 +125,10 @@ int main(int argc, char **argv) {
         assert(!result && *adreno8_space_entry(&adreno8_gpu_space, ADRENO8_GPU_IOVA_START) == startup_pte);
         stays_closed(address, size); release_all(); return 0;
     }
+    /* (mode 23 enters the pages in the other order: the commit's range takes both either way) */
+    if (mode == 23) assert(adreno8_bo_map(address + 4096, 0x60000000, true));
     assert(adreno8_bo_map(address, 0x50000000, false));
-    assert(adreno8_bo_map(address + 4096, 0x60000000, true));
+    if (mode != 23) assert(adreno8_bo_map(address + 4096, 0x60000000, true));
     assert((*first & ~PTE_ADDRESS) == (ADRENO8_PTE_EXTERNAL | adreno8_space_attributes(7)));
     assert((*adreno8_space_entry(&adreno8_gpu_space, address + 4096) & ~PTE_ADDRESS) ==
         (ADRENO8_PTE_EXTERNAL | adreno8_space_attributes(5)));
@@ -127,7 +142,11 @@ int main(int argc, char **argv) {
         assert(!adreno8_bo_commit() && *first == mapped && adreno8_gpu_space.is_on);
         stays_closed(address, size); release_all(); return 0;
     }
+    unsigned before_commit = clean_count;
+    bool seen;
     assert(adreno8_bo_commit());
+    /* the commit cleans the two entries entered, not the tables */
+    assert(cleaned_since(before_commit, first, mapped, &seen) == 2 * sizeof(uint64_t) && seen);
     assert(adreno8_space_check(&adreno8_gpu_space, 0, 0));
     if (mode == 16) {
         assert(!adreno8_bo_release(address, size) && *first == mapped);
@@ -173,6 +192,9 @@ int main(int argc, char **argv) {
     old_writes = writes; unsigned old_clean = clean_count;
     assert(adreno8_bo_unmap(address, size) && eop_waits == 7 && idle_calls == 2);
     assert(*first == ADRENO8_PTE_EXTERNAL && writes > old_writes && clean_count > old_clean);
+    /* (mode 7 crosses into a second leaf; its first event is too long for the fixture's snapshot) */
+    assert(cleaned_since(old_clean, first, ADRENO8_PTE_EXTERNAL, &seen) == size / 4096 * sizeof(uint64_t) &&
+        (seen || mode == 7));
     pending_entry = NULL;
     assert(adreno8_bo_release(address, size) && *first == 0);
     assert(adreno8_bo_reserve(4096) == address);
@@ -214,11 +236,11 @@ def main():
                 capture_output=True, text=True)
             if compiled.returncode:
                 raise RuntimeError(compiled.stderr)
-            for mode in range(23):
+            for mode in range(24):
                 result = subprocess.run([str(binary), str(mode)], capture_output=True, text=True)
                 if result.returncode:
                     raise RuntimeError(f"PAGE_SIZE={page_size}, mode={mode}:\n" + result.stdout + result.stderr)
-            print(f"External BO: 23 ownership/lifecycle scenarios, PAGE_SIZE={page_size}: PASS")
+            print(f"External BO: 24 ownership/lifecycle scenarios, PAGE_SIZE={page_size}: PASS")
 
 
 if __name__ == "__main__":

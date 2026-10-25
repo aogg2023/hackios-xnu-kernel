@@ -216,8 +216,9 @@ bool
 adreno8_clock_boot(void)
 {
 	if (!adreno8_gmu_from_pll) return true;
-	if (adreno8_gmu_from_pll == 2 && (adreno8_step != 5 || adreno8_newest_step != 5))
-		return clock_fail("stage-5 diagnostic admission");
+	if (adreno8_gmu_from_pll == 2 && (adreno8_step != 5 ||
+	    (adreno8_newest_step != 5 && adreno8_newest_step != 17)))
+		return clock_fail("short clock diagnostic admission");
 	if (clock_state == CLOCK_FAILED) return false;
 	if (clock_state != CLOCK_COLD)
 		return clock_verify(clock_state == CLOCK_BOOT ? 1300000000 : 1000000000) || clock_fail("repeat verification");
@@ -255,7 +256,9 @@ bool
 adreno8_clock_started(void)
 {
 	if (!adreno8_gmu_from_pll) return true;
-	if (adreno8_gmu_from_pll != 1) return clock_fail("stage-5-only clock diagnostic cannot enter START");
+	if (adreno8_gmu_from_pll != 1 && !(adreno8_gmu_from_pll == 2 &&
+	    adreno8_newest_step == 17 && adreno8_step == 14))
+		return clock_fail("short clock diagnostic START admission");
 	if (clock_state == CLOCK_RUNNING) return clock_verify(1000000000) || clock_fail("running verification");
 	if (clock_state != CLOCK_BOOT) return clock_fail("START order");
 	if (!pll_rate(0x34, 0x1555, 1000000000) || !clock_verify(1000000000))

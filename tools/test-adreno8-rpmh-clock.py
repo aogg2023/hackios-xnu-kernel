@@ -310,6 +310,12 @@ static void setup(void) {
     case 10: adreno8_newest_step=6; break;
     case 12: arc_state=ARC_CLOSED; break;
     case 13: adreno8_gmu_from_pll=3; break;
+    case 14: adreno8_newest_step=17; break;
+    case 15: adreno8_newest_step=16; break;
+    case 16: adreno8_newest_step=18; break;
+    case 17: adreno8_newest_step=0; break;
+    case 18: adreno8_newest_step=UINT32_MAX; break;
+    case 19: adreno8_newest_step=14; break;
     case 35: regs[0]=0x30700; break;
     case 36: regs[1]|=1u<<24; break;
     case 37: regs[0xd28/4]=0; break;
@@ -332,8 +338,8 @@ int main(int argc,char **argv) {
     assert(argc>=2); scenario=atoi(argv[1]); if(argc>2)fail_at=atoi(argv[2]); setup();
     bool result=adreno8_rpmh_clock_prepare();
     if(fail_at) assert(!result && writes==fail_at && adreno8_reset_required);
-    else assert(result==(scenario<=2 || scenario==61));
-    if(scenario>=3 && scenario<=13) assert(!reads && !writes && !lookups);
+    else assert(result==(scenario<=2 || scenario==14 || scenario==61));
+    if((scenario>=3 && scenario<=13) || (scenario>=15 && scenario<=19)) assert(!reads && !writes && !lookups);
     if((scenario>=20 && scenario<=45) || scenario==63) assert(!writes && !triggers);
     if(result) {
         assert(lookups==2 && triggers==2 && voltage_writes==2 && writes==34);
@@ -408,13 +414,15 @@ def main():
         for name, old, new, case in mutations:
             assert production.count(old) == 1, name
             run(production.replace(old, new, 1), target, [case], True)
-        highest_cases = [(n,) for n in (*range(14), *range(20,46), *range(50,64))]
+        highest_cases = [(n,) for n in (*range(46), *range(50,64))]
         highest_cases += [(0,n) for n in range(1,35) if n not in (10,15,27,32)]
         run(production, target, highest_cases, model=HIGHEST_MODEL)
         highest_mutations = [
-            ("highest_stage", "adreno8_step != 5 || adreno8_newest_step != 5 || read_used", "adreno8_newest_step != 5 || read_used", (9,)),
-            ("highest_newest", "adreno8_step != 5 || adreno8_newest_step != 5 || read_used", "adreno8_step != 5 || read_used", (10,)),
-            ("highest_prior_read", "adreno8_newest_step != 5 || read_used", "adreno8_newest_step != 5 || (read_used && false)", (11,)),
+            ("highest_stage", "adreno8_step != 5 ||", "", (9,)),
+            ("highest_newest", "(adreno8_newest_step != 5 && adreno8_newest_step != 17) ||", "", (10,)),
+            ("highest_reject_17", "(adreno8_newest_step != 5 && adreno8_newest_step != 17)", "adreno8_newest_step != 5", (14,)),
+            ("highest_newest_range", "(adreno8_newest_step != 5 && adreno8_newest_step != 17)", "(adreno8_newest_step < 5 || adreno8_newest_step > 17)", (15,)),
+            ("highest_prior_read", "|| read_used", "|| (read_used && false)", (11,)),
             ("highest_map", "memcmp(votes[i].levels, expected, count * sizeof(expected[0])) != 0", "false", (24,)),
             ("highest_padding", "level != (j < count ? expected[j] : 0)", "false && level != (j < count ? expected[j] : 0)", (27,)),
             ("highest_length", "length > 32 ||", "", (29,)),
@@ -429,7 +437,7 @@ def main():
         unreadable_irq = unreadable_irq.replace('irq == 0xffffffffu || !(irq & ARC_TCS_BIT)', '!(irq & ARC_TCS_BIT)', 1)
         assert unreadable_irq != production
         run(unreadable_irq, target, [(60,)], True)
-    print(f"ARC highest stage 5: {len(highest_cases)} production scenarios PASS; {len(highest_mutations)} mutations rejected")
+    print(f"ARC highest stage 5, targets 5/17: {len(highest_cases)} production scenarios PASS; {len(highest_mutations)} mutations rejected")
     print(f"ARC ACTIVE CX/MX: {len(cases)} production scenarios PASS; {len(mutations) + 1} mutations rejected")
 
 

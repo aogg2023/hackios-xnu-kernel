@@ -7,7 +7,8 @@ extern struct adreno8_block adreno8_gcc;
 
 /* Before GMU firmware release: confirm resource votes, then GMU 650 / HUB 200 MHz.
  * After the START ACK: lower only the GPU PLL0 output to GMU 500 MHz.
- * gmuclk=2 limits boot to stage 5 and always rejects the START entry.
+ * gmuclk=2 accepts complete runs through stage 5 or 17. Only a stage-17 run
+ * may lower the clock after its START ACK in stage 14.
  * Both return true without accesses for the default crystal-clock experiment.
  * Any failure closes this path and requires a cold reset; votes and clocks stay owned. */
 bool adreno8_clock_boot(void);

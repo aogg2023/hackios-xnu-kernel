@@ -204,18 +204,35 @@ int main(void) {
     assert(adreno8_clock_started() && writes==done_writes);
     gpu[5]++; assert(!adreno8_clock_started()); closed();
 
-    for(unsigned bad=0;bad<2;bad++) {
+    const unsigned limits[] = {0,4,5,6,14,16,17,18,23,UINT32_MAX};
+    const unsigned phases[] = {0,4,5,6,13,14,15,17};
+    for(unsigned i=0;i<sizeof(limits)/sizeof(*limits);i++)
+    for(unsigned j=0;j<sizeof(phases)/sizeof(*phases);j++) {
         reset(NORMAL); adreno8_gmu_from_pll=2;
-        if(bad) adreno8_step=14; else adreno8_newest_step=17;
-        assert(!adreno8_clock_boot() && !reads && !writes && !resource_calls);
-        closed();
+        adreno8_step=phases[j]; adreno8_newest_step=limits[i];
+        bool admitted=phases[j]==5 && (limits[i]==5 || limits[i]==17);
+        assert(adreno8_clock_boot()==admitted);
+        if(!admitted) { assert(!reads && !writes && !resource_calls); closed(); }
+        reset(NORMAL); adreno8_gmu_from_pll=2; adreno8_newest_step=17;
+        assert(adreno8_clock_boot());
+        adreno8_step=phases[j]; adreno8_newest_step=limits[i];
+        unsigned diagnostic_writes=writes, diagnostic_reads=reads;
+        admitted=phases[j]==14 && limits[i]==17;
+        assert(adreno8_clock_started()==admitted);
+        if(admitted) {
+            assert(clock_state==CLOCK_RUNNING && gpu[4]==0x44440034);
+            diagnostic_writes=writes;
+            assert(adreno8_clock_started() && writes==diagnostic_writes);
+        } else {
+            assert(writes==diagnostic_writes && reads==diagnostic_reads); closed();
+        }
     }
-    reset(NORMAL); adreno8_gmu_from_pll=2;
-    assert(adreno8_clock_boot());
-    unsigned diagnostic_writes=writes, diagnostic_reads=reads;
-    assert(!adreno8_clock_started());
-    assert(writes==diagnostic_writes && reads==diagnostic_reads);
-    closed();
+    reset(NORMAL); adreno8_gmu_from_pll=3; adreno8_step=14; adreno8_newest_step=17;
+    clock_state=CLOCK_BOOT;
+    assert(!adreno8_clock_started() && !reads && !writes); closed();
+    reset(NORMAL); adreno8_gmu_from_pll=2; adreno8_newest_step=17;
+    assert(adreno8_clock_boot()); adreno8_step=14; mode=LATCH_FAIL;
+    assert(!adreno8_clock_started()); closed();
     for(unsigned fault=RESOURCE_FAIL;fault<=HUB_UPDATE_FAIL;fault++) {
         reset(fault); assert(!adreno8_clock_boot());
         if(fault==RESOURCE_FAIL) assert(!writes && !reads);
@@ -298,6 +315,7 @@ INIT_STUB = r'''
 #include <stdio.h>
 #include <string.h>
 static uint32_t requested, selected, omitted, clock_mode;
+static uint32_t keep_arg=1, return_arg;
 static uint32_t adreno8_pause_ms, adreno8_watch_seconds, adreno8_speed_asked;
 static uint32_t adreno8_gmu_from_pll, adreno8_gpu8_secure_mode, adreno8_fine;
 static uint32_t adreno8_skip_steps, adreno8_newest_step, adreno8_step;
@@ -320,7 +338,8 @@ static bool PE_parse_boot_argn(const char *key, void *out, unsigned size) {
     else if(!strcmp(key,"adreno8_only")) value=selected;
     else if(!strcmp(key,"adreno8_skip")) value=omitted;
     else if(!strcmp(key,"adreno8_gmuclk")) value=clock_mode;
-    else if(!strcmp(key,"adreno8_keep")) value=1;
+    else if(!strcmp(key,"adreno8_keep")) value=keep_arg;
+    else if(!strcmp(key,"adreno8_return")) value=return_arg;
     else if(!strcmp(key,"adreno8_watch")) value=0;
     else return false;
     memcpy(out,&value,sizeof(value)); return true;
@@ -347,17 +366,28 @@ static void check(uint32_t mode, uint32_t asked, uint32_t only, uint32_t skip, u
     adreno8_init();
     unsigned count=0;
     for(unsigned bit=0;bit<23;bit++) count+=(expected>>bit)&1;
-    assert(visited==expected && calls==count && holds==count && !stopped && !returned);
+    assert(visited==expected && calls==count && holds==count);
+    assert(stopped==(mode<=1 && asked && !keep_arg && last_stage>=3));
+    assert(returned==(mode<=1 && asked && return_arg));
     checks++;
 }
 int main(void) {
     check(2,5,0,0,0x1f);
+    check(2,17,0,0,0x1ffff);
     const uint32_t rejected[][3]={
         {5,14,0}, {5,5,0}, {5,0,1u<<4}, {14,0,0}, {14,5,0},
-        {23,0,0}, {UINT32_MAX,0,0}, {4,0,0}, {0,0,0}, {5,0,1u<<31}
+        {23,0,0}, {UINT32_MAX,0,0}, {4,0,0}, {0,0,0}, {5,0,1u<<31},
+        {17,5,0}, {17,17,0}, {17,0,1u<<13}, {17,0,1u<<31},
+        {16,0,0}, {18,0,0}
     };
     for(unsigned i=0;i<sizeof(rejected)/sizeof(*rejected);i++)
         check(2,rejected[i][0],rejected[i][1],rejected[i][2],0);
+    for(unsigned keep=0;keep<2;keep++) for(unsigned back=0;back<2;back++) {
+        keep_arg=keep; return_arg=back;
+        check(2,5,0,0,keep && !back ? 0x1f : 0);
+        check(2,17,0,0,keep && !back ? 0x1ffff : 0);
+    }
+    keep_arg=1; return_arg=0;
     for(unsigned mode=0;mode<=1;mode++) {
         check(mode,5,0,0,0x1f);
         check(mode,14,0,0,0x3fff);
@@ -367,6 +397,12 @@ int main(void) {
         check(mode,UINT32_MAX,0,0,0x7fffff);
         check(mode,5,0,1u<<31,0x1f);
         check(mode,0,0,0,0);
+        for(unsigned keep=0;keep<2;keep++) for(unsigned back=0;back<2;back++) {
+            keep_arg=keep; return_arg=back;
+            check(mode,5,0,0,0x1f);
+            check(mode,17,0,0,0x1ffff);
+        }
+        keep_arg=1; return_arg=0;
     }
     printf("Sun init admission: %u production cases PASS\n",checks);
     return 0;
@@ -433,8 +469,11 @@ def main():
             ("no-inherited-GMU-parent-check", 'if (gmu_parent != 0 && gmu_parent != 2 && gmu_parent != 5 && gmu_parent != 6)', 'if (false)'),
             ("no-inherited-HUB-range-check", 'if (hub_parent != 0 && (hub_source & 0x371f) != 0x505)',
              '(void)hub_parent; if (false)'),
-            ("diagnostic-wrong-stage", 'if (adreno8_gmu_from_pll == 2 && (adreno8_step != 5 || adreno8_newest_step != 5))', 'if (false)'),
-            ("diagnostic-enters-START", 'if (adreno8_gmu_from_pll != 1) return clock_fail("stage-5-only clock diagnostic cannot enter START");', ''),
+            ("diagnostic-wrong-stage", 'adreno8_step != 5 ||', ''),
+            ("diagnostic-wrong-limit", '(adreno8_newest_step != 5 && adreno8_newest_step != 17)', 'false'),
+            ("diagnostic-START-wrong-limit", 'adreno8_newest_step == 17 && ', ''),
+            ("diagnostic-START-wrong-phase", ' && adreno8_step == 14', ''),
+            ("diagnostic-START-unknown-mode", '!(adreno8_gmu_from_pll == 2 &&', '!(true &&'),
             ("parent-gate-before-source-check", '!pll_configure() || !hub_parent()', '!hub_parent() || !pll_configure()'),
             ("full-L-readback", '0x00ffffffu, 0x00440034u', '0xffffffffu, 0x44440034u'),
             ("omitted-process-calibration-write", '{PLL_L, 0x44440034}', '{PLL_L, 0x00440034}'),
@@ -455,9 +494,11 @@ def main():
                            for i, name in enumerate(names, 1))
         run("init-admission", INIT_STUB + phases + init, cases=INIT_CASES)
         admission_mutations = [
-            ("asked", "asked != 5 || ", ""),
-            ("only", "only != 0 || ", ""),
+            ("asked", "(asked != 5 && asked != 17) || ", ""),
+            ("only", "only != 0 ||", ""),
             ("skip", "adreno8_skip_steps != 0", "false"),
+            ("keep", " || !adreno8_gpu8_keep", ""),
+            ("return", " || adreno8_gpu8_return", ""),
         ]
         for label, before, after in admission_mutations:
             assert init.count(before) == 1, label

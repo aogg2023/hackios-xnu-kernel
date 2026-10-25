@@ -210,7 +210,8 @@ adreno8_rpmh_clock_prepare(void)
 	if (adreno8_gmu_from_pll > 2 || arc_state == ARC_CLOSED) return false;
 	bool highest = adreno8_gmu_from_pll == 2, read_used = arc_state != ARC_COLD;
 	arc_state = ARC_CLOSED;
-	if (highest && (adreno8_step != 5 || adreno8_newest_step != 5 || read_used)) return false;
+	if (highest && (adreno8_step != 5 ||
+	    (adreno8_newest_step != 5 && adreno8_newest_step != 17) || read_used)) return false;
 	for (unsigned i = 0; i < 3; i++) {
 		if (!PE_parse_boot_argn(arguments[i], &zero, sizeof(zero)) || zero != 0) {
 			printf("adreno8: ARC clock votes require explicit %s=0\n", arguments[i]);

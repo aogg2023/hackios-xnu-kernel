@@ -152,7 +152,11 @@ context_wait(uint32_t timestamp)
 bool
 adreno8_context_wait_idle(const char *what)
 {
-	if (!context_tested || !context_health()) return false;
+	if (!context_tested) {
+		printf("adreno8: context %s requires the standard context test first\n", what);
+		return false;
+	}
+	if (!context_health()) return false;
 	if ((context_last && !context_wait(context_last)) || !adreno8_gpu_wait_idle(what))
 		return context_fail("external buffer idle");
 	return true;

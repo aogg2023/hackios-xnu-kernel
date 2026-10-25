@@ -720,5 +720,9 @@ adreno8_gpu_commands_ready(void)
 bool
 adreno8_gpu_wait_idle(const char *what)
 {
-	return gpu_state == GPU_TESTED && gpu_wait_idle(what);
+	if (gpu_state != GPU_TESTED) {
+		printf("adreno8: GPU %s idle wait refused in state %u\n", what, gpu_state);
+		return false;
+	}
+	return gpu_wait_idle(what);
 }

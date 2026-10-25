@@ -10,12 +10,18 @@ extern bool RedwoodGPUStart(void);
 bool
 adreno8_step_service(void)
 {
-	if (!redwood_platform_is_annibale() || !adreno8_gpu8_keep || adreno8_gpu8_return)
+	if (!redwood_platform_is_annibale() || !adreno8_gpu8_keep || adreno8_gpu8_return) {
+		adreno8_say("adreno8: RedwoodGPU requires the annibale platform, keep=1 and return=0\n");
 		return false;
-	if (!adreno8_bo_enable()) return false;
+	}
+	if (!adreno8_bo_enable()) {
+		adreno8_say("adreno8: RedwoodGPU external BO enable was refused\n");
+		return false;
+	}
 	gpu_va = 0; /* The shared address space has no per-client placement or BO-count query. */
 	PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
 	if (!RedwoodGPUStart()) {
+		adreno8_say("adreno8: RedwoodGPU service registration failed\n");
 		adreno8_bo_stop();
 		return false;
 	}

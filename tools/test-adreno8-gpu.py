@@ -108,7 +108,8 @@ uint32_t adreno8_get(struct adreno8_block *, const char *, uint32_t);
 void adreno8_put(struct adreno8_block *, const char *, uint32_t, uint32_t);
 void adreno8_settle(void);
 void adreno8_hold(bool single_access) { (void)single_access; }
-void adreno8_sleep_us(uint32_t us) { (void)us; }
+static unsigned setup_waits;
+void adreno8_sleep_us(uint32_t us) { if (us == 100000) setup_waits++; }
 const uint8_t *redwood_image_file(const char *, const char *, uint64_t *, int *);
 #define _DEV_ADRENO8_PRIVATE_H
 ''' + constants + '\n#include "adreno8_gpu.c"\n#undef printf\n' + reference + r'''
@@ -279,6 +280,7 @@ static void reset(void)
     max_gx_offset = 0; adreno8_gpu.size = GPU_MAPPING_SIZE;
     adreno8_pause_ms = adreno8_step = adreno8_newest_step = 0;
     raw_nop_asked = 0;
+    setup_waits = 0;
     diagnostic_reads = diagnostic_writes = diagnostic_offset = 0;
     last_mmio = MMIO_NONE; barriers = gmu_reads = gmu_writes = 0;
     smmu_ok = hfi_ok = oob_ok = clock_ok = raw_ok = idle_ok = acquire_ok = true;
@@ -412,6 +414,10 @@ int main(int argc, char **argv)
         assert(!adreno8_gpu_cp_init() && raw_calls == 1 && gpu_state == GPU_FAILED);
     }
     reset(); prepare(); raw_nop_asked = 3;
+    assert(!adreno8_gpu_cp_init() && !raw_calls && gpu_state == GPU_FAILED);
+    assert(setup_waits == 100 && allocation_count == 4 && oob_requested && oob_acked);
+    assert(!adreno8_gpu_cp_ready() && !adreno8_gpu_secure_exit() && !adreno8_gpu_scratch_test());
+    reset(); prepare(); raw_nop_asked = 4;
     assert(!adreno8_gpu_cp_init() && !raw_calls && !gx_reads && !gx_writes);
     assert(!oob_requested && !oob_acked);
     reset(); prepare(); smmu_after_raw = true;

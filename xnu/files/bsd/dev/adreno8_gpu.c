@@ -396,12 +396,22 @@ adreno8_gpu_cp_init(void)
 	if (gpu_state != GPU_PREPARED)
 		return gpu_fail("CP initialization order");
 	PE_parse_boot_argn("adreno8_raw_nop", &raw_nop, sizeof(raw_nop));
-	if (raw_nop > 2)
+	if (raw_nop > 3)
 		return gpu_fail("unknown RAW NOP diagnostic");
 	if (!gpu_oob_get() || !gpu_register_config() ||
 	    !gpu_ucode_base(GEN8_CP_SQE_INSTR_BASE_LO, sqe) ||
 	    !gpu_ucode_base(GEN8_CP_AQE_INSTR_BASE_LO_0, aqe))
 		return false;
+	/* Separate delayed failure after setup from failure after publishing RAW. */
+	if (raw_nop == 3) {
+		for (unsigned i = 0; i < 100; i++) {
+			if (!gpu_status_ok())
+				return false;
+			adreno8_sleep_us(100000);
+		}
+		printf("adreno8: CP setup-only diagnostic remained accessible for 10 seconds; no RAW published\n");
+		return gpu_fail("CP setup-only diagnostic stop");
+	}
 	/* The vendor first sends CP_INIT. This diagnostic stops after one NOP,
 	 * or five NOPs with the same message length as CP_INIT; CP_READY is never set. */
 	if (raw_nop) {

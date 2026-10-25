@@ -49,7 +49,7 @@
  *                  read-only, the values enter no decision, off unless asked
  * adreno8_gpu_stall=1  diagnostic only: stall faults in GPU contexts 0 and 3; poll fault
  *                  registers with context fault interrupts disabled; GMU context 2 is unchanged
- * adreno8_arc_read=1  stage-1 diagnostic: one Apps DRV2 cx.lvl read; requires explicit
+ * adreno8_arc_read=1  stage-1 diagnostic: Apps DRV2 cx.lvl then mx.lvl reads; requires explicit
  *                  touchscreen=0 and a host cold reset after any register write
  * adreno8_speed=N     GX operating point; only 1 (160 MHz) is exposed before SKU selection
  * adreno8_gmuclk=1    select the GPU PLL clock parent; default uses the crystal

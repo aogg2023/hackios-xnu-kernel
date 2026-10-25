@@ -48,28 +48,16 @@ arc_write(const char *name, uint32_t offset, uint32_t value)
 	return false;
 }
 
-bool
-adreno8_rpmh_arc_read(void)
+static bool
+arc_resource_read(const char *resource)
 {
 	uint16_t levels[RPMH_LEVELS];
 	unsigned count = 0;
-	uint32_t asked = 0, touch = 0, address, id, solver, config, control, irq_before, irq, response;
+	uint32_t address, id, solver, config, control, irq_before, irq, response;
 
-	PE_parse_boot_argn("adreno8_arc_read", &asked, sizeof(asked));
-	if (asked == 0)
-		return true;
-	if (asked != 1 || arc_attempted) {
-		printf("adreno8: ARC read requires value 1 and permits one attempt per kernel\n");
-		return false;
-	}
-	arc_attempted = true;
-	if (!PE_parse_boot_argn("touchscreen", &touch, sizeof(touch)) || touch != 0) {
-		printf("adreno8: ARC read requires explicit touchscreen=0 to exclude the other DRV2 writer\n");
-		return false;
-	}
-	address = adreno8_rpmh_lookup("cx.lvl", levels, &count, NULL, NULL);
+	address = adreno8_rpmh_lookup(resource, levels, &count, NULL, NULL);
 	if ((address >> 16) != 3 || (address & 3) != 0 || count == 0 || count > RPMH_LEVELS) {
-		printf("adreno8: ARC read has no valid cx.lvl address and level table\n");
+		printf("adreno8: ARC read has no valid %s address and level table\n", resource);
 		return false;
 	}
 	id = arc_read("id", 0);
@@ -95,7 +83,7 @@ adreno8_rpmh_arc_read(void)
 	if (!arc_write("TCS2 clear trigger", ARC_CONTROL, control & ~ARC_AMC_TRIGGER) ||
 	    !arc_write("TCS2 clear enable", ARC_CONTROL, 0) ||
 	    !arc_write("TCS2 read message", ARC_MSGID, 0x108) ||
-	    !arc_write("TCS2 cx.lvl address", ARC_ADDRESS, address) ||
+	    !arc_write("TCS2 ARC address", ARC_ADDRESS, address) ||
 	    !arc_write("TCS2 command enable", ARC_ENABLE, 1))
 		return false;
 	irq = arc_read("irq enable before request", ARC_IRQ_ENABLE);
@@ -121,8 +109,8 @@ adreno8_rpmh_arc_read(void)
 		printf("adreno8: ARC read completion unconfirmed; retain TCS2 and IRQ state until reset\n");
 		return false;
 	}
-	response = arc_read("TCS2 cx.lvl response", ARC_RESPONSE);
-	printf("adreno8: ARC cx.lvl response=%#x, levels=%u\n", response, count);
+	response = arc_read("TCS2 ARC response", ARC_RESPONSE);
+	printf("adreno8: ARC %s response=%#x, levels=%u\n", resource, response, count);
 	if (response >= count) {
 		printf("adreno8: ARC read response is outside the CMD DB table; retain TCS2 until reset\n");
 		return false;
@@ -142,7 +130,28 @@ adreno8_rpmh_arc_read(void)
 	irq = arc_read("irq enable before restore", ARC_IRQ_ENABLE);
 	if (!arc_write("irq restore TCS2 bit", ARC_IRQ_ENABLE, irq & ~(ARC_TCS_BIT & ~irq_before)))
 		return false;
-	printf("adreno8: ARC cx.lvl inherited selector %u, level %u; one read completed, host cold reset required\n",
-	    response, levels[response]);
+	printf("adreno8: ARC %s inherited selector %u, level %u; read completed, host cold reset required\n",
+	    resource, response, levels[response]);
 	return true;
+}
+
+bool
+adreno8_rpmh_arc_read(void)
+{
+	uint32_t asked = 0, touch = 0;
+
+	PE_parse_boot_argn("adreno8_arc_read", &asked, sizeof(asked));
+	if (asked == 0)
+		return true;
+	if (asked != 1 || arc_attempted) {
+		printf("adreno8: ARC read requires value 1 and permits one attempt per kernel\n");
+		return false;
+	}
+	arc_attempted = true;
+	if (!PE_parse_boot_argn("touchscreen", &touch, sizeof(touch)) || touch != 0) {
+		printf("adreno8: ARC read requires explicit touchscreen=0 to exclude the other DRV2 writer\n");
+		return false;
+	}
+	/* Reuse TCS2 only after the preceding read has completed and restored it. */
+	return arc_resource_read("cx.lvl") && arc_resource_read("mx.lvl");
 }

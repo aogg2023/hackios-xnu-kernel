@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute the production ARC CX probe with tracked MMIO and retained failures."""
+"""Execute production sequential CX/MX ARC reads with tracked MMIO and retained failures."""
 from pathlib import Path
 import argparse
 import subprocess
@@ -35,9 +35,10 @@ HARNESS = r'''
 #include "adreno8_rpmh.c"
 #undef printf
 static uint32_t regs[0x10000 / 4], before[0x10000 / 4];
-static unsigned scenario, fail_at, reads, writes, polls, sleeps, responses, triggers, lookups;
+static unsigned scenario, fail_at, reads, writes, polls, transaction_polls, sleeps, responses, triggers, lookups;
 static bool flag_present = true, touch_present = true, triggered, done;
 static uint32_t flag = 1, touch, cx_address = 0x30000, level_count = 11, response_value = 3;
+static uint32_t mx_address = 0x30004, mx_level_count = 9, mx_response_value = 5;
 static uint32_t initial_control = ARC_AMC_ENABLE, initial_irq = 1;
 static bool PE_parse_boot_argn(const char *name, void *out, unsigned size) {
     assert(size == sizeof(uint32_t));
@@ -53,19 +54,33 @@ static void adreno8_settle(void) {}
 static void adreno8_sleep_us(uint32_t us) { assert(us == 100); sleeps++; }
 static uint32_t adreno8_rpmh_lookup(const char *name, uint16_t *levels, unsigned *count,
                                   const uint8_t **data, unsigned *length) {
-    assert(!strcmp(name, "cx.lvl") && !data && !length);
-    lookups++; *count = level_count;
-    for (unsigned i = 0; i < level_count && i < RPMH_LEVELS; i++) levels[i] = i * 16;
-    return cx_address;
+    assert(!data && !length && lookups < 2);
+    assert(!strcmp(name, lookups ? "mx.lvl" : "cx.lvl"));
+    if (lookups) {
+        assert(writes == 14 && triggers == 1 && responses == 1 && done);
+        assert(regs[ARC_CONTROL / 4] == initial_control && !regs[ARC_ENABLE / 4]);
+        assert(!(regs[ARC_IRQ_STATUS / 4] & ARC_TCS_BIT));
+        assert(regs[ARC_IRQ_ENABLE / 4] == (initial_irq | (scenario == 28 ? 1u << 5 : 0)));
+        if (scenario == 50) regs[0xfc8 / 4] = 0;
+        if (scenario == 51) regs[ARC_IRQ_STATUS / 4] |= ARC_TCS_BIT;
+        if (scenario == 52) regs[0] = 0x30700;
+    }
+    lookups++;
+    *count = lookups == 1 ? level_count : mx_level_count;
+    for (unsigned i = 0; i < *count && i < RPMH_LEVELS; i++) levels[i] = i * 16;
+    return lookups == 1 ? cx_address : mx_address;
 }
 static uint32_t adreno8_get(struct adreno8_block *b, const char *name, uint32_t off) {
     assert(b->phys == 0x16520000 && b->size == 0x10000 && off < b->size && !(off & 3));
     b->base = 0x100000; reads++;
-    if (scenario == 27 && !strcmp(name, "irq enable before request"))
+    if ((scenario == 27 || (scenario == 47 && lookups == 2)) &&
+        !strcmp(name, "irq enable before request"))
         regs[ARC_IRQ_ENABLE / 4] |= 1u << 5;
-    if (scenario == 28 && !strcmp(name, "irq enable before restore"))
+    if ((scenario == 28 || (scenario == 54 && lookups == 2)) &&
+        !strcmp(name, "irq enable before restore"))
         regs[ARC_IRQ_ENABLE / 4] |= 1u << 5;
-    if (scenario == 30 && !strcmp(name, "TCS2 control after completion"))
+    if ((scenario == 30 || (scenario == 49 && lookups == 2)) &&
+        !strcmp(name, "TCS2 control after completion"))
         regs[ARC_CONTROL / 4] |= 2;
     if (off == ARC_RESPONSE) { assert(done); responses++; }
     return regs[off / 4];
@@ -77,19 +92,20 @@ static void adreno8_put(struct adreno8_block *b, const char *name, uint32_t off,
            off == ARC_ADDRESS || off == ARC_IRQ_ENABLE || off == ARC_IRQ_CLEAR);
     writes++;
     if (off == ARC_MSGID) assert(value == 0x108);
-    if (off == ARC_ADDRESS) assert(value == cx_address && (value >> 16) == 3);
+    if (off == ARC_ADDRESS) assert(value == (lookups == 1 ? cx_address : mx_address) && (value >> 16) == 3);
     if (fail_at == writes) { regs[off / 4] = value ^ 1; return; }
     if (off == ARC_IRQ_CLEAR) {
         assert(done && value == ARC_TCS_BIT);
-        if (scenario != 29) regs[ARC_IRQ_STATUS / 4] &= ~value;
+        if (scenario != 29 && !(scenario == 48 && lookups == 2)) regs[ARC_IRQ_STATUS / 4] &= ~value;
         return;
     }
     if (off == ARC_CONTROL && value == (ARC_AMC_ENABLE | ARC_AMC_TRIGGER)) {
-        assert(!triggered && regs[ARC_CONTROL / 4] == ARC_AMC_ENABLE);
-        assert(regs[ARC_MSGID / 4] == 0x108 && regs[ARC_ADDRESS / 4] == cx_address);
+        assert((!triggered || done) && regs[ARC_CONTROL / 4] == ARC_AMC_ENABLE);
+        assert(regs[ARC_MSGID / 4] == 0x108 &&
+            regs[ARC_ADDRESS / 4] == (lookups == 1 ? cx_address : mx_address));
         assert(regs[ARC_ENABLE / 4] == 1 && regs[ARC_WAIT / 4] == 0);
         assert(regs[ARC_IRQ_ENABLE / 4] & ARC_TCS_BIT);
-        triggered = true; triggers++;
+        triggered = true; done = false; transaction_polls = 0; triggers++;
     } else if (triggered && !done) {
         assert(!"cleanup before confirmed completion");
     }
@@ -97,13 +113,14 @@ static void adreno8_put(struct adreno8_block *b, const char *name, uint32_t off,
 }
 static uint32_t adreno8_rd(vm_offset_t address) {
     assert(address == 0x100000 + ARC_IRQ_STATUS && triggered);
-    reads++; polls++;
-    if (polls == 3 && scenario != 23) {
+    reads++; polls++; transaction_polls++;
+    if (transaction_polls == 3 && scenario != 23 && !(scenario == 43 && lookups == 2)) {
         done = true;
         regs[ARC_IRQ_STATUS / 4] |= ARC_TCS_BIT | 2;
-        regs[ARC_COMMAND_STATUS / 4] = scenario == 24 ? 1u << 8 : ARC_COMMAND_DONE;
-        regs[ARC_STATUS / 4] = scenario == 25 ? 0 : 1;
-        regs[ARC_RESPONSE / 4] = response_value;
+        regs[ARC_COMMAND_STATUS / 4] = scenario == 24 || (scenario == 44 && lookups == 2) ?
+            1u << 8 : ARC_COMMAND_DONE;
+        regs[ARC_STATUS / 4] = scenario == 25 || (scenario == 45 && lookups == 2) ? 0 : 1;
+        regs[ARC_RESPONSE / 4] = lookups == 1 ? response_value : mx_response_value;
     }
     return regs[ARC_IRQ_STATUS / 4];
 }
@@ -142,6 +159,14 @@ static void prepare(void) {
     case 35: regs[0xd28 / 4] = 0; break;
     case 36: regs[0xfc8 / 4] = 0; break;
     case 37: regs[ARC_IRQ_ENABLE / 4] = UINT32_MAX; break;
+    case 38: mx_address = 0; break;
+    case 39: mx_address = 0x40000; break;
+    case 40: mx_address = 0x30005; break;
+    case 41: mx_level_count = 0; break;
+    case 42: mx_level_count = 65; break;
+    case 46: mx_response_value = mx_level_count; break;
+    case 53: cx_address = 0x30001; break;
+    case 55: mx_response_value = 0; break;
     }
     memcpy(before, regs, sizeof(regs));
 }
@@ -150,22 +175,33 @@ int main(int argc, char **argv) {
     if (argc == 3) fail_at = strtoul(argv[2], NULL, 0);
     prepare();
     bool result = adreno8_rpmh_arc_read();
-    bool success = scenario == 20 || scenario == 21 || scenario == 22 || scenario == 28 || scenario == 33;
+    bool success = scenario == 20 || scenario == 21 || scenario == 22 || scenario == 28 ||
+        scenario == 33 || scenario == 54 || scenario == 55;
     if (fail_at) assert(!result && writes == fail_at && adreno8_reset_required);
     else if (scenario <= 1) assert(result && !writes && !reads && !lookups);
     else if (success) {
-        assert(result && writes == 14 && triggers == 1 && responses == 1 && adreno8_reset_required);
+        assert(result && writes == 28 && triggers == 2 && responses == 2 && lookups == 2 && adreno8_reset_required);
         assert(regs[ARC_CONTROL / 4] == initial_control && !regs[ARC_ENABLE / 4] && !regs[ARC_WAIT / 4]);
-        assert(regs[ARC_IRQ_ENABLE / 4] == (initial_irq | (scenario == 28 ? 1u << 5 : 0)));
+        assert(regs[ARC_IRQ_ENABLE / 4] == (initial_irq | (scenario == 28 || scenario == 54 ? 1u << 5 : 0)));
         assert(regs[ARC_IRQ_STATUS / 4] == 2);
     } else {
         assert(!result);
-        if (scenario <= 19 || scenario >= 34) assert(!writes && !adreno8_reset_required);
+        if (scenario <= 19 || (scenario >= 34 && scenario <= 37) || scenario == 53)
+            assert(!writes && !adreno8_reset_required);
+        else if ((scenario >= 38 && scenario <= 42) || (scenario >= 50 && scenario <= 52))
+            assert(writes == 14 && triggers == 1 && responses == 1 && lookups == 2 && adreno8_reset_required);
+        else if (scenario == 47) assert(writes == 19 && triggers == 1 && responses == 1 && adreno8_reset_required);
+        else if (scenario == 48) assert(writes == 26 && triggers == 2 && responses == 2 && adreno8_reset_required);
+        else if (scenario >= 43 && scenario <= 49)
+            assert(writes == 22 && triggers == 2 && lookups == 2 && adreno8_reset_required);
         else if (scenario == 27) assert(writes == 5 && !triggers && adreno8_reset_required);
         else if (scenario == 29) assert(writes == 12 && triggers == 1 && adreno8_reset_required);
         else assert(writes == 8 && triggers == 1 && adreno8_reset_required);
         if (scenario == 23) assert(polls == 100000 && sleeps == 100000 && !responses);
         if (scenario == 24 || scenario == 25) assert(!responses);
+        if (scenario == 43) assert(polls == 100003 && sleeps == 100002 && responses == 1);
+        if (scenario == 44 || scenario == 45) assert(responses == 1);
+        if (scenario >= 20 && scenario <= 30 && !success) assert(lookups == 1);
     }
     assert(regs[0x127c / 4] == 0xdeadbeef);
     assert(regs[0xd2c / 4] == before[0xd2c / 4] && regs[0x1270 / 4] == before[0x1270 / 4]);
@@ -197,8 +233,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mutations", action="store_true")
     args = parser.parse_args()
-    scenarios = [(s,) for s in range(38) if s not in (31, 32)]
-    scenarios += [(20, n) for n in range(1, 15) if n != 8 and n != 12]
+    scenarios = [(s,) for s in range(56) if s not in (31, 32)]
+    scenarios += [(20, n) for n in range(1, 29) if n not in (8, 12, 22, 26)]
     with tempfile.TemporaryDirectory(prefix="adreno8-arc-read-") as directory:
         directory = Path(directory)
         run(PRODUCTION, directory, scenarios)
@@ -211,8 +247,8 @@ def main():
                 ("touch_implicit_zero", '!PE_parse_boot_argn("touchscreen", &touch, sizeof(touch)) || touch != 0',
                  'PE_parse_boot_argn("touchscreen", &touch, sizeof(touch)) && touch != 0', (4,)),
                 ("unknown_parameter", "asked != 1 || arc_attempted", "asked == 0 || arc_attempted", (2,)),
-                ("response_from_data", 'arc_read("TCS2 cx.lvl response", ARC_RESPONSE)',
-                 'arc_read("TCS2 cx.lvl response", 0x127c)', (20,)),
+                ("response_from_data", 'arc_read("TCS2 ARC response", ARC_RESPONSE)',
+                 'arc_read("TCS2 ARC response", 0x127c)', (20,)),
                 ("timeout_cleanup", 'printf("adreno8: ARC read completion unconfirmed;',
                  'arc_write("premature clear", ARC_ENABLE, 0); printf("adreno8: ARC read completion unconfirmed;', (23,)),
                 ("irq_snapshot_restore", "irq & ~(ARC_TCS_BIT & ~irq_before)", "irq_before", (28,)),
@@ -226,12 +262,15 @@ def main():
                 ("restore_trigger", '"TCS2 restore initial control", ARC_CONTROL, control)',
                  '"TCS2 restore initial control", ARC_CONTROL, control | ARC_AMC_TRIGGER)', (20,)),
                 ("stale_irq", '(arc_read("irq status", ARC_IRQ_STATUS) & ARC_TCS_BIT) != 0', "false", (13,)),
+                ("read_mx_after_cx_failure", 'arc_resource_read("cx.lvl") && arc_resource_read("mx.lvl")',
+                 '(unsigned)arc_resource_read("cx.lvl") & (unsigned)arc_resource_read("mx.lvl")', (23,)),
+                ("skip_mx", '&& arc_resource_read("mx.lvl")', '&& true', (20,)),
             ]
             for name, old, new, scenario in mutations:
                 assert PRODUCTION.count(old) == 1, name
                 run(PRODUCTION.replace(old, new, 1), directory, [scenario], reject=True)
-            print(f"ARC CX failure mutations: {len(mutations)} rejected")
-    print(f"ARC CX production probe: {len(scenarios)} success, failure and replay cases PASS")
+            print(f"ARC CX/MX failure mutations: {len(mutations)} rejected")
+    print(f"ARC CX/MX production probe: {len(scenarios)} success, failure and replay cases PASS")
 
 
 if __name__ == "__main__":

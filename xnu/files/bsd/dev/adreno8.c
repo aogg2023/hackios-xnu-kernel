@@ -36,7 +36,8 @@
  * adreno8_raw_nop=N   stop before CP_INIT: 1=two RAW NOP words, 2=ten RAW NOP words,
  *                  3=setup-only health checks without RAW publication
  * adreno8_direct_ring=1  ordinary HFI and one direct ring; stage17/keep1/return0/gmuclk2,
- *                  secure_preflight0, no only/skip/empty_powerup; raw_nop3 stops before SQE, default stops after CP_INIT idle
+ *                  secure_preflight0, no only/skip/empty_powerup; raw_nop2 checks SQE HALT,
+ *                  raw_nop3 stops before SQE, default stops after CP_INIT idle
  * adreno8_empty_powerup=1  stage-17 CP_INIT with a zeroed powerup page; stop after idle;
  *                  requires keep=1 return=0, no only/skip/raw_nop; default uses the generated list
  * adreno8_watch=S     inspect GMU status for S seconds after step 11 or later (default 20)
@@ -131,10 +132,9 @@ adreno8_sleep_ms(uint32_t ms)
 /* ---- register access ------------------------------------------------------------------------------- */
 
 /*
- * One access is one plain load or store of a general register. Some of what is touched here (the
- * SMMU at least) is not the hardware but the hypervisor's imitation of it: the access traps and
- * is carried out on our behalf, which works for the simplest instruction forms only. So the
- * compiler does not get to choose the instruction. (redwood_adreno.c, unchanged.)
+ * Some Qualcomm hypervisors emulate SMMU global-register accesses and do not handle
+ * XZR/WZR stores. Keep a simple general-register ldr/str form; emulation coverage
+ * on this device is unconfirmed.
  */
 
 uint32_t __attribute__((noinline))
@@ -392,9 +392,9 @@ adreno8_init(void)
 	PE_parse_boot_argn("adreno8_direct_ring", &direct_ring, sizeof(direct_ring));
 	adreno8_direct_ring = direct_ring == 1;
 	if (direct_ring && (direct_ring != 1 || asked != 17 || only != 0 ||
-	    adreno8_skip_steps != 0 || !adreno8_gpu8_keep || adreno8_gpu8_return || (raw_nop != 0 && raw_nop != 3) ||
+	    adreno8_skip_steps != 0 || !adreno8_gpu8_keep || adreno8_gpu8_return || (raw_nop != 0 && raw_nop != 2 && raw_nop != 3) ||
 	    empty_powerup != 0 || secure_mode_arg != 0 || adreno8_gmu_from_pll != 2)) {
-		printf("adreno8: direct_ring=1 requires complete adreno8=17, keep=1 return=0 gmuclk=2 secure_preflight=0 raw_nop=0/3 without only, skip or empty_powerup; no steps attempted\n");
+		printf("adreno8: direct_ring=1 requires complete adreno8=17, keep=1 return=0 gmuclk=2 secure_preflight=0 raw_nop=0/2/3 without only, skip or empty_powerup; no steps attempted\n");
 		return;
 	}
 	if (empty_powerup && (empty_powerup != 1 || asked != 17 || only != 0 ||

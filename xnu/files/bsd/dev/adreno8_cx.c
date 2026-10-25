@@ -400,6 +400,14 @@ adreno8_step_gpucc(void)
 	adreno8_get(&adreno8_gpucc, "memnoc_gfx", GPUCC_MEMNOC_GFX_CBCR);
 	adreno8_get(&adreno8_gpucc, "hub_aon", GPUCC_HUB_AON_CBCR);
 	adreno8_get(&adreno8_gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR);
+	/* gpucc-sun.c enables these branches during probe, before KGSL starts. */
+	static const struct { const char *name; uint32_t offset; } always_on[] = {
+		{ "cb", 0x93a4 }, { "cxo_aon", 0x9008 }, { "gx_ahb_ff", 0x9064 },
+		{ "rscc_hub_aon", 0x93a8 }, { "rscc_xo_aon", 0x9004 }, { "sleep", 0x90cc }
+	};
+	for (unsigned i = 0; i < sizeof(always_on) / sizeof(always_on[0]); i++)
+		if (adreno8_get(&adreno8_gpucc, always_on[i].name, always_on[i].offset) == 0xffffffffu)
+			return false;
 	adreno8_get(&adreno8_gpucc, "gpu_cc_gmu bcr", GPUCC_GMU_BCR);
 	adreno8_get(&adreno8_gpucc, "gmu_clk_src command", GPUCC_GMU_RCGR);
 	adreno8_get(&adreno8_gpucc, "gmu_clk_src source", GPUCC_GMU_RCGR + 4);

@@ -204,7 +204,7 @@ static void ring_setup_wait(void)
 {
     assert(ring_input_mask==7 && ring_setup_read_mask==127);
     assert(ring_halt_reads==4);
-    assert(!ring_sqe_writes && !ring_wptr_writes && !ring_payloads && !raw_calls);
+    assert(ring_sqe_writes==(raw_nop_asked==2) && !ring_wptr_writes && !ring_payloads && !raw_calls);
     if (setup_waits==ring_setup_fault_at) {
         if (ring_setup_fault==1) poll_ok=false;
         if (ring_setup_fault==2) smmu_ok=false;
@@ -284,7 +284,7 @@ void adreno8_wr(vm_offset_t address, uint32_t value)
         }
         if (reg == 0x815) {
             ring_sqe_writes++;
-            assert(ring_input_mask == 7 && ring_setup_read_mask == 127 && value == 1);
+            assert(ring_input_mask == 7 && ring_setup_read_mask == 127 && value == (raw_nop_asked==2 ? 3u : 1u));
             if (reg == ring_drop_write) return;
         }
         if (reg == 0x807) {
@@ -609,7 +609,7 @@ static void check_direct_ring(void)
         prepare_ring(); gpu_regs[0][i?0x807:0x806]=1;
         assert(!adreno8_gpu_cp_init() && !ring_wptr_writes); ring_retained(0);
     }
-    for(unsigned bad=0;bad<9;bad++) {
+    for(unsigned bad=0;bad<8;bad++) {
         prepare_ring();
         switch(bad) {
         case 0: ordinary_ok=false; break;
@@ -620,7 +620,6 @@ static void check_direct_ring(void)
         case 5: raw_nop_asked=1; break;
         case 6: empty_powerup_asked=1; break;
         case 7: adreno8_skip_steps=1; break;
-        case 8: raw_nop_asked=2; break;
         }
         assert(!adreno8_gpu_cp_init() && !oob_requested && !gx_writes && !gmu_writes);
     }
@@ -931,15 +930,15 @@ if __name__ == "__main__":
         checks.append(("ring-WPTR-post-barrier", production.replace(fenced, missing_barrier, 1), None))
         hwcg = re.search(r"static bool\ngpu_hwcg\(.*?\n}", production, re.S)[0]
         checks.append(("ring-HWCG-enabled", production.replace(hwcg, hwcg.replace('if (adreno8_direct_ring)', 'if (false)', 1), 1), None))
-        setup_only = re.search(r"\tif \(setup_only\) \{.*?\n\t}", ring_body, re.S)[0]
+        setup_only = re.search(r"\tif \(raw_mode\) \{.*?\n\t}", ring_body, re.S)[0]
         setup_mutations = [
-            ("setup-dispatch", 'gpu_direct_ring_init(raw_nop == 3)', 'gpu_direct_ring_init(false)'),
-            ("setup-SQE-started", 'if (setup_only) {', 'if (setup_only) { gpu_write(GEN8_CP_SQE_CNTL,1);'),
+            ("setup-dispatch", 'gpu_direct_ring_init(raw_nop)', 'gpu_direct_ring_init(false)'),
+            ("setup-SQE-started", 'if (raw_mode) {', 'if (raw_mode) { gpu_write(GEN8_CP_SQE_CNTL,1);'),
             ("setup-window-short", 'i < 100; i++', 'i < 99; i++'),
             ("setup-HFI-health", '!adreno8_hfi_poll() || !gpu_status_ok()', '!gpu_status_ok()'),
             ("setup-CP-health", '!adreno8_hfi_poll() || !gpu_status_ok()', '!adreno8_hfi_poll()'),
             ("setup-ready", 'return gpu_fail("ordinary setup-only diagnostic stop");', 'gpu_state=GPU_CP_READY; return true;'),
-            ("setup-mode-guard", '(raw_nop != 0 && raw_nop != 3)', 'false'),
+            ("setup-mode-guard", '(raw_nop != 0 && raw_nop != 2 && raw_nop != 3)', 'false'),
             ("setup-halt-read-missing", 'i < A8_COUNT(halt); i++', 'i < A8_COUNT(halt)-1; i++'),
             ("setup-halt-all1", 'if (value == 0xffffffffu)', 'if (false)'),
             ("setup-halt-cleared", 'uint32_t value = gpu_read(halt[i]);', 'gpu_write(halt[i],0); uint32_t value = gpu_read(halt[i]);'),

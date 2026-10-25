@@ -444,10 +444,10 @@ gpu_ring_wptr(uint32_t value)
 }
 
 /* Linux a8xx_hw_init/a8xx_cp_init at efbda69d92e6 use a zeroed powerup page,
- * BR/BV RPTR shadows and a 32 KiB ring before enabling SQE. Setup-only stops
- * before SQE; the ring probe stops after CP_INIT. Both retain allocations and OOB until cold reset. */
+ * BR/BV RPTR shadows and a 32 KiB ring before enabling SQE. The setup probes
+ * stop before CP_INIT and retain allocations and OOB until cold reset. */
 static bool
-gpu_direct_ring_init(bool setup_only)
+gpu_direct_ring_init(uint32_t raw_mode)
 {
 	if (!ring || ring->size != 32768 || scratch->size < 16 || powerup->size != 4096)
 		return gpu_fail("direct ring buffer bounds");
@@ -472,7 +472,19 @@ gpu_direct_ring_init(bool setup_only)
 		if (gpu_read(setup[i].reg) != setup[i].value)
 			return gpu_fail("direct ring register readback");
 	}
-	if (setup_only) {
+	if (raw_mode) {
+		if (raw_mode == 2) {
+			uint32_t inherited = gpu_read(GEN8_CP_SQE_CNTL);
+			printf("adreno8: ordinary SQE HALT inherited control %#x = %#x\n",
+			    adreno8_gpu.phys + 4u * GEN8_CP_SQE_CNTL, inherited);
+			if (inherited == 0xffffffffu)
+				return gpu_fail("ordinary SQE HALT inherited read");
+			/* a8xx_recover at efbda69d92e6 writes 3 to halt SQE. */
+			gpu_write(GEN8_CP_SQE_CNTL, 3);
+			adreno8_settle();
+			if (gpu_read(GEN8_CP_SQE_CNTL) != 3)
+				return gpu_fail("ordinary SQE HALT readback");
+		}
 		/* Mainline reads HALT after writes and polls ACK during shutdown. */
 		const uint32_t halt[] = { GEN8_GBIF_HALT, GEN8_GBIF_HALT_ACK,
 			GEN8_RBBM_GBIF_HALT, GEN8_RBBM_GBIF_HALT_ACK };
@@ -482,13 +494,15 @@ gpu_direct_ring_init(bool setup_only)
 			if (value == 0xffffffffu)
 				return gpu_fail("ordinary setup-only halt read");
 		}
-		printf("adreno8: ordinary setup-only: ring registers verified; SQE enable and CP_INIT remain unissued\n");
+		printf("adreno8: ordinary setup-only: ring registers verified; %s; CP_INIT remains unissued\n",
+		    raw_mode == 2 ? "SQE HALT verified" : "SQE enable remains unissued");
 		for (unsigned i = 0; i < 100; i++) {
 			adreno8_sleep_us(100000);
 			if (!adreno8_hfi_poll() || !gpu_status_ok())
 				return gpu_fail("ordinary setup-only HFI or GPU fault");
 		}
-		printf("adreno8: ordinary setup-only remained healthy for 10 seconds through the final check; SQE was not started by this probe\n");
+		printf("adreno8: ordinary setup-only remained healthy for 10 seconds through the final check; %s\n",
+		    raw_mode == 2 ? "SQE HALT was written and verified before this interval" : "SQE was not started by this probe");
 		return gpu_fail("ordinary setup-only diagnostic stop");
 	}
 	gpu_write(GEN8_CP_SQE_CNTL, 1);
@@ -542,14 +556,14 @@ adreno8_gpu_cp_init(void)
 		return gpu_fail("empty powerup diagnostic prerequisites");
 	if (adreno8_direct_ring && (adreno8_step != 17 || adreno8_newest_step != 17 ||
 	    !adreno8_gpu8_keep || adreno8_gpu8_return || adreno8_skip_steps != 0 ||
-	    (raw_nop != 0 && raw_nop != 3) || empty_powerup))
+	    (raw_nop != 0 && raw_nop != 2 && raw_nop != 3) || empty_powerup))
 		return gpu_fail("direct ring diagnostic prerequisites");
 	if (!gpu_oob_get() || !gpu_register_config() ||
 	    !gpu_ucode_base(GEN8_CP_SQE_INSTR_BASE_LO, sqe) ||
 	    !gpu_ucode_base(GEN8_CP_AQE_INSTR_BASE_LO_0, aqe))
 		return false;
 	if (adreno8_direct_ring)
-		return gpu_direct_ring_init(raw_nop == 3);
+		return gpu_direct_ring_init(raw_nop);
 	/* Separate delayed failure after setup from failure after publishing RAW. */
 	if (raw_nop == 3) {
 		for (unsigned i = 0; i < 100; i++) {

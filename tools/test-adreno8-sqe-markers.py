@@ -30,7 +30,7 @@ static unsigned marker_count, marker_stall, marker_last_action, marker_pause_cou
 static bool marker_scope_only, marker_expect_pause;
 static jmp_buf marker_jump;
 static unsigned marker_values[6];
-static uint32_t adreno8_fine;
+static uint32_t adreno8_fine, marker_sqe_answer;
 static bool adreno8_quiet;
 static char adreno8_last_write[96];
 static void marker_push(unsigned value) {
@@ -71,7 +71,10 @@ static void host_store(vm_offset_t address, uint32_t value)
 old_put = re.search(r'void adreno8_put\(struct adreno8_block \*block,.*?\n}', source, re.S)[0]
 source = replace_once(source, old_put, raw + '\n#define printf adreno8_say\n' + put + '\n#undef printf')
 source = replace_once(source, "    if (reg == GEN8_CP_APERTURE_CNTL_HOST) return current_pipe << 12;", r'''
-    if (adreno8_direct_ring && reg == 0x815 && marker_count) marker_push(6);
+    if (adreno8_direct_ring && reg == 0x815 && marker_count) {
+        marker_push(6);
+        if (marker_sqe_answer) return marker_sqe_answer;
+    }
     if (reg == GEN8_CP_APERTURE_CNTL_HOST) return current_pipe << 12;''')
 source += r'''
 void loader_log_line(const char *line) {
@@ -80,7 +83,7 @@ void loader_log_line(const char *line) {
         if (marker_expect_pause) assert(marker_last_action == 1 && marker_pause_count);
         marker_push(1);
     } else if (!strcmp(line, "adreno8: ordinary SQE raw STR returned\n")) marker_push(3);
-    else if (!strcmp(line, "adreno8: ordinary SQE HALT DSB returned\n")) {
+    else if (!strcmp(line, "adreno8: ordinary SQE zero-value control DSB returned\n")) {
         assert(raw_nop_asked == 2 && last_mmio == MMIO_BARRIER); marker_push(5);
     } else if (!strcmp(line, "adreno8: ordinary SQE start DSB returned\n")) {
         assert(raw_nop_asked == 0 && last_mmio == MMIO_BARRIER); marker_push(5);
@@ -89,7 +92,8 @@ void loader_log_line(const char *line) {
 static void prepare_markers(unsigned mode, unsigned pause, unsigned fine, bool quiet) {
     marker_count = marker_stall = marker_last_action = marker_pause_count = 0;
     marker_scope_only = marker_expect_pause = false;
-    prepare_ring(); raw_nop_asked = mode;
+    prepare_ring(); raw_nop_asked = mode; marker_sqe_answer = 0;
+    if (mode == 2) gpu_regs[0][0x815] = 0;
     adreno8_pause_ms = pause; adreno8_fine = fine; adreno8_quiet = quiet;
     marker_expect_pause = pause && fine && !quiet;
 }
@@ -112,10 +116,25 @@ int main(int argc, char **argv) {
             }
     prepare_markers(3, 100, 1, false);
     assert(!adreno8_gpu_cp_init()); ring_retained(0); assert(!marker_count && !ring_sqe_writes);
+    const uint32_t invalid_inherited[] = {1,2,3,0x80000000,0xffffffff};
+    for (unsigned i = 0; i < sizeof(invalid_inherited)/sizeof(*invalid_inherited); i++) {
+        prepare_markers(2, 100, 1, false); gpu_regs[0][0x815] = invalid_inherited[i];
+        assert(!adreno8_gpu_cp_init()); ring_retained(0);
+        assert(!marker_count && !ring_sqe_writes && !setup_waits);
+    }
     for (unsigned mode = 0; mode <= 2; mode += 2) {
+        /* Dropping the write of zero leaves its inherited-zero readback unchanged. */
         prepare_markers(mode, 100, 1, false); ring_drop_write = 0x815;
         assert(!adreno8_gpu_cp_init()); ring_retained(0);
         assert(marker_count == 6 && !ring_wptr_writes && !ring_payloads);
+        assert(setup_waits == (mode == 2 ? 100u : 0u) && ring_setup_completed == (mode == 2));
+        const uint32_t bad_readback[] = {1,2,4,0xffffffff};
+        for (unsigned i = 0; i < sizeof(bad_readback)/sizeof(*bad_readback); i++) {
+            if (!mode && bad_readback[i] == 1) continue;
+            prepare_markers(mode, 100, 1, false); marker_sqe_answer = bad_readback[i];
+            assert(!adreno8_gpu_cp_init()); ring_retained(0);
+            assert(marker_count == 6 && !setup_waits && !ring_wptr_writes && !ring_payloads);
+        }
         for (unsigned stop = 1; stop <= 2; stop++) {
             prepare_markers(mode, 100, 1, false); marker_stall = stop;
             if (!setjmp(marker_jump)) { (void)adreno8_gpu_cp_init(); assert(false); }
@@ -149,7 +168,7 @@ source = replace_once(source, '    for (unsigned mode = 0; mode <= 2; mode += 2)
                       fixture['table_checks'] + '\n    for (unsigned mode = 0; mode <= 2; mode += 2)\n')
 raw_pre = 'if (ordinary_sqe) loader_log_line("adreno8: ordinary SQE raw STR enter\\n");'
 raw_post = 'if (ordinary_sqe) loader_log_line("adreno8: ordinary SQE raw STR returned\\n");'
-halt = 'loader_log_line("adreno8: ordinary SQE HALT DSB returned\\n");'
+zero = 'loader_log_line("adreno8: ordinary SQE zero-value control DSB returned\\n");'
 start = 'loader_log_line("adreno8: ordinary SQE start DSB returned\\n");'
 mutations = [
     ("pre-missing", "raw", raw_pre, ""),
@@ -162,18 +181,19 @@ mutations = [
     ("all-registers-marked", "raw", 'address == adreno8_gpu.base + 0x2054', '(address != 0)'),
     ("console-pre", "raw", raw_pre, raw_pre.replace('loader_log_line', 'adreno8_say')),
     ("console-post", "raw", raw_post, raw_post.replace('loader_log_line', 'adreno8_say')),
-    ("halt-missing", "gpu", halt, ''),
+    ("zero-missing", "gpu", zero, ''),
     ("start-missing", "gpu", start, ''),
-    ("halt-early", "gpu", '\t\t\tadreno8_settle();\n\t\t\t' + halt, '\t\t\t' + halt + '\n\t\t\tadreno8_settle();'),
+    ("zero-early", "gpu", '\t\t\tadreno8_settle();\n\t\t\t' + zero, '\t\t\t' + zero + '\n\t\t\tadreno8_settle();'),
     ("start-early", "gpu", '\tadreno8_settle();\n\t' + start, '\t' + start + '\n\tadreno8_settle();'),
-    ("halt-barrier-missing", "gpu", '\t\t\tadreno8_settle();\n\t\t\t' + halt, '\t\t\t' + halt),
+    ("zero-barrier-missing", "gpu", '\t\t\tadreno8_settle();\n\t\t\t' + zero, '\t\t\t' + zero),
     ("start-barrier-missing", "gpu", '\tadreno8_settle();\n\t' + start, '\t' + start),
-    ("halt-wrong-label", "gpu", halt, start),
-    ("start-wrong-label", "gpu", start, halt),
-    ("HALT-after-read", "gpu", halt + '\n\t\t\tif (gpu_read(GEN8_CP_SQE_CNTL) != 3)\n\t\t\t\treturn gpu_fail("ordinary SQE HALT readback");',
-     'if (gpu_read(GEN8_CP_SQE_CNTL) != 3)\n\t\t\t\treturn gpu_fail("ordinary SQE HALT readback");\n\t\t\t' + halt),
+    ("zero-wrong-label", "gpu", zero, start),
+    ("start-wrong-label", "gpu", start, zero),
+    ("zero-after-read", "gpu", zero + '\n\t\t\tif (gpu_read(GEN8_CP_SQE_CNTL) != 0)\n\t\t\t\treturn gpu_fail("ordinary SQE zero-value control readback");',
+     'if (gpu_read(GEN8_CP_SQE_CNTL) != 0)\n\t\t\t\treturn gpu_fail("ordinary SQE zero-value control readback");\n\t\t\t' + zero),
     ("start-after-read", "gpu", start + '\n\tif (gpu_read(GEN8_CP_SQE_CNTL) != 1)\n\t\treturn gpu_fail("direct ring SQE enable readback");',
      'if (gpu_read(GEN8_CP_SQE_CNTL) != 1)\n\t\treturn gpu_fail("direct ring SQE enable readback");\n\t' + start),
+    ("nonzero-inherited-accepted", "gpu", 'if (inherited != 0)', 'if (false)'),
     ("access-pause-missing", "put", 'adreno8_hold(true);', ''),
 ]
 with tempfile.TemporaryDirectory(prefix="adreno8-sqe-markers-") as temp:

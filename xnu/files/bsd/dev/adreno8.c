@@ -36,7 +36,7 @@
  * adreno8_raw_nop=N   stop before CP_INIT: 1=two RAW NOP words, 2=ten RAW NOP words,
  *                  3=setup-only health checks without RAW publication
  * adreno8_direct_ring=1  ordinary HFI and one direct ring; stage17/keep1/return0/gmuclk2,
- *                  secure_preflight0, no only/skip/empty_powerup; raw_nop2 checks SQE HALT,
+ *                  secure_preflight0, no only/skip/empty_powerup; raw_nop2 writes back inherited SQE control 0,
  *                  raw_nop3 stops before SQE, default stops after CP_INIT idle
  * adreno8_empty_powerup=1  stage-17 CP_INIT with a zeroed powerup page; stop after idle;
  *                  requires keep=1 return=0, no only/skip/raw_nop; default uses the generated list

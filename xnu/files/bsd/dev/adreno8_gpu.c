@@ -466,16 +466,16 @@ gpu_direct_ring_init(uint32_t raw_mode)
 	if (raw_mode) {
 		if (raw_mode == 2) {
 			uint32_t inherited = gpu_read(GEN8_CP_SQE_CNTL);
-			printf("adreno8: ordinary SQE HALT inherited control %#x = %#x\n",
+			printf("adreno8: ordinary SQE zero-value control inherited %#x = %#x\n",
 			    adreno8_gpu.phys + 4u * GEN8_CP_SQE_CNTL, inherited);
-			if (inherited == 0xffffffffu)
-				return gpu_fail("ordinary SQE HALT inherited read");
-			/* a8xx_recover at efbda69d92e6 writes 3 to halt SQE. */
-			gpu_write(GEN8_CP_SQE_CNTL, 3);
+			if (inherited != 0)
+				return gpu_fail("ordinary SQE zero-value control requires inherited 0");
+			/* Vendor adreno_hwsched.c writes CP_ME_CNTL=0 during active/GX-on stall recovery. */
+			gpu_write(GEN8_CP_SQE_CNTL, 0);
 			adreno8_settle();
-			loader_log_line("adreno8: ordinary SQE HALT DSB returned\n");
-			if (gpu_read(GEN8_CP_SQE_CNTL) != 3)
-				return gpu_fail("ordinary SQE HALT readback");
+			loader_log_line("adreno8: ordinary SQE zero-value control DSB returned\n");
+			if (gpu_read(GEN8_CP_SQE_CNTL) != 0)
+				return gpu_fail("ordinary SQE zero-value control readback");
 		}
 		/* Mainline reads HALT after writes and polls ACK during shutdown. */
 		const uint32_t halt[] = { GEN8_GBIF_HALT, GEN8_GBIF_HALT_ACK,
@@ -487,14 +487,14 @@ gpu_direct_ring_init(uint32_t raw_mode)
 				return gpu_fail("ordinary setup-only halt read");
 		}
 		printf("adreno8: ordinary setup-only: ring registers verified; %s; CP_INIT remains unissued\n",
-		    raw_mode == 2 ? "SQE HALT verified" : "SQE enable remains unissued");
+		    raw_mode == 2 ? "SQE zero-value control readback verified" : "SQE enable remains unissued");
 		for (unsigned i = 0; i < 100; i++) {
 			adreno8_sleep_us(100000);
 			if (!adreno8_hfi_poll() || !gpu_status_ok())
 				return gpu_fail("ordinary setup-only HFI or GPU fault");
 		}
 		printf("adreno8: ordinary setup-only remained healthy for 10 seconds through the final check; %s\n",
-		    raw_mode == 2 ? "SQE HALT was written and verified before this interval" : "SQE was not started by this probe");
+		    raw_mode == 2 ? "SQE zero-value write was issued and zero readback verified before this interval" : "SQE was not started by this probe");
 		return gpu_fail("ordinary setup-only diagnostic stop");
 	}
 	gpu_write(GEN8_CP_SQE_CNTL, 1);

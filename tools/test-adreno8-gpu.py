@@ -299,7 +299,7 @@ void adreno8_wr(vm_offset_t address, uint32_t value)
         }
         if (reg == 0x815) {
             ring_sqe_writes++;
-            assert(ring_input_mask == 7 && ring_setup_read_mask == 127 && value == (raw_nop_asked==2 ? 3u : 1u));
+            assert(ring_input_mask == 7 && ring_setup_read_mask == 127 && value == (raw_nop_asked==2 ? 0u : 1u));
             if (reg == ring_drop_write) return;
         }
         if (reg == 0x807) {

@@ -25,6 +25,7 @@ static vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd;
 static vm_offset_t adreno8_hfi_view_resp, adreno8_hfi_view_debug;
 static unsigned adreno8_step, scenario, sleeps, failures, response_reads, barriers, diagnostic_calls;
 static unsigned memory_failures, feature_logs;
+static bool adreno8_direct_ring;
 static bool publication_pending;
 static char feature_log[160];
 static uint64_t clock_ns, publication_ns;
@@ -133,7 +134,7 @@ static bool adreno8_hwsched_request(const uint32_t *request, uint32_t words, uin
 static void reset(unsigned test) {
     memset(command, 0, sizeof(command)); memset(response, 0, sizeof(response));
     memset(debug, 0, sizeof(debug)); memset(regs, 0, sizeof(regs));
-    adreno8_hfi_init_table(table, 0x60006000);
+    adreno8_hfi_init_table(table, 0x60006000, false);
     adreno8_gmu.base = (uintptr_t)regs;
     adreno8_hfi_view_table = (uintptr_t)table;
     adreno8_hfi_view_cmd = (uintptr_t)command;
@@ -266,6 +267,9 @@ static struct block adreno8_gmu;
 static uint32_t adreno8_step, adreno8_gx_count = 2;
 static uint32_t adreno8_speed_asked;
 static bool adreno8_gpu8_keep, adreno8_gpu8_return, adreno8_reset_required;
+static bool adreno8_direct_ring;
+static bool ordinary_ready;
+static bool adreno8_ordinary_ready(void) { return ordinary_ready; }
 static bool adreno8_hfi_tables_sent, hwsched_ready = true;
 static bool adreno8_hwsched_ready(void) { return hwsched_ready; }
 static uint32_t adreno8_gx_hz[17], adreno8_gx_level[17];
@@ -399,6 +403,13 @@ int main(void) {
     hwsched_ready = true;
     assert(adreno8_step_gx_power() && send_count == 1 && adreno8_reset_required);
     assert(ids[0] == 30 && lengths[0] == 3 && sent[0][0] == 1 && sent[0][1] == 1 && sent[0][2] == 2);
+    send_count = 0; adreno8_direct_ring = true;
+    assert(!adreno8_step_gx_power() && send_count == 0);
+    hwsched_ready = false; ordinary_ready = true;
+    assert(adreno8_step_gx_power() && send_count == 1);
+    adreno8_direct_ring = false;
+    send_count = 0; assert(!adreno8_step_gx_power() && send_count == 0);
+    hwsched_ready = true;
     send_count = 0; fail_id = 30; adreno8_reset_required = false;
     assert(!adreno8_step_gx_power() && adreno8_reset_required);
     puts("HFI version, perf/BW payloads, ACV threshold, AB=0 and minimum DCVS: PASS");

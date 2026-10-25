@@ -23,6 +23,7 @@ typedef uintptr_t vm_offset_t;
 struct block { vm_offset_t base; };
 static struct block adreno8_gmu;
 static uint32_t table[1024], commands[1024], responses[1024], debug[1024], regs[4];
+static bool adreno8_direct_ring;
 static vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd;
 static vm_offset_t adreno8_hfi_view_resp, adreno8_hfi_view_debug;
 static bool adreno8_gmu_talks, adreno8_gpu8_keep, adreno8_gpu8_return, adreno8_reset_required;
@@ -171,11 +172,12 @@ static void reset(unsigned next_mode) {
     memset(commands, 0, sizeof(commands)); memset(responses, 0, sizeof(responses));
     memset(debug, 0, sizeof(debug)); memset(regs, 0, sizeof(regs));
     memset(captured, 0, sizeof(captured)); memset(lengths, 0, sizeof(lengths));
-    adreno8_hfi_init_table(table, 0x60006000);
+    adreno8_hfi_init_table(table, 0x60006000, false);
     adreno8_hfi_view_table = (uintptr_t)table; adreno8_hfi_view_cmd = (uintptr_t)commands;
     adreno8_hfi_view_resp = (uintptr_t)responses; adreno8_hfi_view_debug = (uintptr_t)debug;
     adreno8_gmu.base = (uintptr_t)regs;
     adreno8_gmu_talks = adreno8_gpu8_keep = cx_ready = allocation_ok = adreno8_hfi_tables_sent = true;
+    adreno8_direct_ring = false;
     adreno8_hwsched_attempted = adreno8_hwsched_started = false;
     adreno8_gpu8_return = adreno8_reset_required = false;
     clock_ok = true; clock_calls = memory_failures = 0;
@@ -208,6 +210,9 @@ static void check_boot(void) {
 }
 int main(void) {
     uint32_t msg[11], reply[10], reply_words;
+    reset(NORMAL); adreno8_direct_ring = true; adreno8_hwsched_started = true;
+    assert(!adreno8_hwsched_ready());
+    assert(!adreno8_hwsched_start() && !sent_count && !alloc_calls);
     reset(NORMAL); hwsched_ack_value = 7; check_boot();
     uint32_t pm4[10] = {0x70000000};
     assert(adreno8_hwsched_raw(pm4, 10, "CP init"));
@@ -330,6 +335,8 @@ with tempfile.TemporaryDirectory(prefix="adreno8-hwsched-") as directory:
     clock_block = "\tif (!adreno8_clock_started()) {\n\t\tadreno8_hwsched_memory_failed();\n\t\treturn false;\n\t}\n"
     assert source.count(clock_block) == 1
     mutations = [
+        source.replace("return !adreno8_direct_ring && adreno8_hwsched_started", "return adreno8_hwsched_started"),
+        source.replace("if (adreno8_direct_ring || adreno8_hwsched_attempted", "if (adreno8_hwsched_attempted"),
         source.replace(clock_block, ""),
         source.replace("if (!adreno8_clock_started())", "if (!adreno8_clock_started() && false)"),
         source.replace(clock_block, "").replace("\tif (!adreno8_hfi_send(14,", clock_block + "\tif (!adreno8_hfi_send(14,"),
@@ -345,4 +352,4 @@ with tempfile.TemporaryDirectory(prefix="adreno8-hwsched-") as directory:
             print(result.stdout, end="")
         else:
             assert result.returncode != 0, index
-    print("START clock transition: missing, ignored failure and pre-ACK mutations rejected: PASS")
+    print("HWSCHED ordinary-mode rejection and START clock transition: 5 mutations rejected: PASS")

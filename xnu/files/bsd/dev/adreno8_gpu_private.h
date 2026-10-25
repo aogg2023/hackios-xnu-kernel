@@ -12,6 +12,8 @@
  * gen8_0_1 catalog +0xa8 selects gen8_0_0_nonctxt_regs[25],
  * { register 0xb600, value 0x10000000, pipes 1 } (file offset 0x4f29c).
  * PM4 construction follows adreno_pm4types.h and gen8_cp_init_cmds.
+ * The ordinary ring sequence also follows Linux a8xx_gpu.c and a6xx_gpu.c:
+ * https://github.com/torvalds/linux/tree/efbda69d92e6a4822c5f2d09910f547872a9498d/drivers/gpu/drm/msm/adreno
  */
 #ifndef _DEV_ADRENO8_GPU_PRIVATE_H
 #define _DEV_ADRENO8_GPU_PRIVATE_H
@@ -25,6 +27,17 @@ struct a8_reg_pipes { uint32_t reg, pipes; };
 struct a8_protect_span { uint32_t reg, start, end, noaccess; };
 
 #define GEN8_CP_APERTURE_CNTL_HOST 0x81c
+#define GEN8_CP_RB_BASE_LO_GC 0x800
+#define GEN8_CP_RB_BASE_HI_GC 0x801
+#define GEN8_CP_RB_CNTL_GC 0x802
+#define GEN8_CP_RB_RPTR_ADDR_LO_BR 0x804
+#define GEN8_CP_RB_RPTR_ADDR_HI_BR 0x805
+#define GEN8_CP_RB_RPTR_BR 0x806
+#define GEN8_CP_RB_WPTR_GC 0x807
+#define GEN8_CP_RB_RPTR_ADDR_LO_BV 0x808
+#define GEN8_CP_RB_RPTR_ADDR_HI_BV 0x809
+#define GEN8_CP_RB_RPTR_BV 0x80a
+#define GEN8_CP_SQE_CNTL 0x815
 #define GEN8_CP_APRIV_CNTL_PIPE 0x84d
 #define GEN8_CP_AQE_INSTR_BASE_LO_0 0x818
 #define GEN8_CP_HW_FAULT_STATUS_MASK_PIPE 0x8b4
@@ -44,6 +57,7 @@ struct a8_protect_span { uint32_t reg, start, end, noaccess; };
 #define GEN8_GMUCX_POWER_COUNTER_ENABLE 0x1fc10
 #define GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_0 0x1fc40
 #define GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_1 0x1fc41
+#define GEN8_GBIF_CX_CONFIG 0x3c00
 #define GEN8_GRAS_DBG_ECO_CNTL 0x8702
 #define GEN8_GRAS_NC_MODE_CNTL 0x8700
 #define GEN8_GRAS_TSEFE_DBG_ECO_CNTL 0x8600
@@ -64,6 +78,7 @@ struct a8_protect_span { uint32_t reg, start, end, noaccess; };
 #define GEN8_RBBM_INTERFACE_HANG_INT_CNTL 0x02f
 #define GEN8_RBBM_INT_0_MASK 0x062
 #define GEN8_RBBM_INT_0_STATUS 0x06a
+#define GEN8_RBBM_STATUS 0x012
 #define GEN8_RBBM_NC_MODE_CNTL 0x440
 #define GEN8_RBBM_PERFCTR_GPU_BUSY_MASKED 0x19e
 #define GEN8_RBBM_SECVID_TSB_CNTL 0xf803

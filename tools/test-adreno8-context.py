@@ -32,6 +32,7 @@ struct adreno8_gpu_space {
 struct adreno8_gpu_space adreno8_gpu_space;
 static struct adreno8_block adreno8_gmu;
 static uint32_t table[1024], commands[1024], responses[1024], debug[1024], registers[4];
+static bool adreno8_direct_ring;
 static vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd;
 static vm_offset_t adreno8_hfi_view_resp, adreno8_hfi_view_debug;
 static uint32_t adreno8_step = 22, adreno8_gpu8_secure_mode = 4;
@@ -233,7 +234,7 @@ static void reset(unsigned next_mode) {
     memset(allocations, 0, sizeof(allocations)); allocation_count = 0;
     memset(commands, 0, sizeof(commands)); memset(responses, 0, sizeof(responses));
     memset(debug, 0, sizeof(debug)); memset(registers, 0, sizeof(registers));
-    adreno8_hfi_init_table(table, 0x60006000);
+    adreno8_hfi_init_table(table, 0x60006000, false);
     adreno8_hfi_view_table = (uintptr_t)table; adreno8_hfi_view_cmd = (uintptr_t)commands;
     adreno8_hfi_view_resp = (uintptr_t)responses; adreno8_hfi_view_debug = (uintptr_t)debug;
     adreno8_gmu.base = (uintptr_t)registers;

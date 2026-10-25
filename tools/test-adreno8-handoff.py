@@ -74,6 +74,7 @@ world = r'''
 struct block { vm_offset_t base; };
 static struct block adreno8_gmu;
 static uint32_t table[1024], commands[1024], responses[1024], debug[1024], gmu_regs[4];
+static bool adreno8_direct_ring;
 static vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd;
 static vm_offset_t adreno8_hfi_view_resp, adreno8_hfi_view_debug;
 static bool adreno8_gmu_talks, adreno8_gpu8_keep, adreno8_gpu8_return, adreno8_reset_required;
@@ -150,7 +151,7 @@ static void world(void) {
     memset(commands, 0, sizeof(commands)); memset(responses, 0, sizeof(responses));
     memset(debug, 0, sizeof(debug)); memset(gmu_regs, 0, sizeof(gmu_regs));
     memset(captured, 0, sizeof(captured)); memset(lengths, 0, sizeof(lengths));
-    adreno8_hfi_init_table(table, 0x60006000);
+    adreno8_hfi_init_table(table, 0x60006000, false);
     adreno8_hfi_view_table = (uintptr_t)table; adreno8_hfi_view_cmd = (uintptr_t)commands;
     adreno8_hfi_view_resp = (uintptr_t)responses; adreno8_hfi_view_debug = (uintptr_t)debug;
     adreno8_gmu.base = (uintptr_t)gmu_regs;

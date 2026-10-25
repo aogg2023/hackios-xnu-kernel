@@ -80,6 +80,7 @@ bool adreno8_secure_lost(void) { return false; }
 static const struct adreno8_memory *adreno8_gmu_vrb;
 static struct adreno8_block adreno8_gmu = {"gmu", 0, 0x68000, 0}, adreno8_gpu, adreno8_rscc;
 static struct adreno8_gpu_block adreno8_gmu_log, adreno8_gmu_hfi;
+static bool adreno8_direct_ring;
 static bool adreno8_fw_loaded, adreno8_gmu_runs, adreno8_rsc_asleep_at_first, adreno8_rsc_woken_by_us;
 static bool adreno8_scm_gpu_init(void) { return true; }
 static void adreno8_gmu_post_mortem(void) {}
@@ -185,7 +186,7 @@ variants = {
     "missing-bank-publish": gmu_code.replace(" || !adreno8_memory_publish(vrb, 0, vrb->size)", ""),
     "unprivileged-mapping": gmu_code.replace(" | ADRENO8_MEM_PRIV;", ";"),
     "ignore-readback": gmu_code.replace("!= adreno8_gmu_vrb->gmu_address) {", "== UINT32_MAX) {"),
-    "missing-vrb-admission": gmu_code.replace("!adreno8_gmu_vrb || ", ""),
+    "missing-vrb-admission": gmu_code.replace("(!adreno8_direct_ring && !adreno8_gmu_vrb) || ", ""),
 }
 with tempfile.TemporaryDirectory(prefix="adreno8-vrb-") as directory:
     target = Path(directory)

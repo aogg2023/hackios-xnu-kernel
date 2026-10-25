@@ -272,6 +272,10 @@ extern struct adreno8_gpu_block adreno8_gmu_log;
 extern struct adreno8_gpu_block adreno8_gmu_hfi;
 extern bool adreno8_gmu_runs;
 extern bool adreno8_gmu_talks;
+extern bool adreno8_direct_ring;
+/* Cold diagnostic: START can be attempted once; HFI failure permanently clears ready. */
+bool adreno8_ordinary_start(void);
+bool adreno8_ordinary_ready(void);
 extern bool adreno8_fw_loaded;
 extern bool adreno8_rsc_woken_by_us;
 extern vm_offset_t adreno8_log_view[4];

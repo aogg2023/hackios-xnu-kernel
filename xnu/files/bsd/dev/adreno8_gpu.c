@@ -19,7 +19,7 @@
 
 enum gpu_state { GPU_COLD, GPU_PREPARED, GPU_CP_READY, GPU_UNSECURE, GPU_TESTED, GPU_FAILED };
 static enum gpu_state gpu_state;
-static struct adreno8_memory *sqe, *aqe, *powerup, *scratch;
+static struct adreno8_memory *sqe, *aqe, *powerup, *scratch, *ring;
 static bool oob_requested, oob_acked;
 
 static bool
@@ -105,7 +105,8 @@ gpu_pipe_write(uint32_t pipe, uint32_t reg, uint32_t value)
 static bool
 gpu_accessible(void)
 {
-	if (gpu_state == GPU_FAILED || !oob_acked || !adreno8_hwsched_ready() ||
+	if (gpu_state == GPU_FAILED || !oob_acked ||
+	    !(adreno8_direct_ring ? adreno8_ordinary_ready() : adreno8_hwsched_ready()) ||
 	    !adreno8_gpu_memory_ready() || adreno8_gpu_faulted())
 		return false;
 	return GMU_PWR_GX_UP(gpu_gmu_read(GMU_PWR_CLK_STATUS));
@@ -186,7 +187,9 @@ adreno8_gpu_prepare(void)
 	    ADRENO8_MEM_READ | ADRENO8_MEM_WRITE | ADRENO8_MEM_PRIV);
 	scratch = adreno8_gpu_alloc("CP scratch", 4096, 4096,
 	    ADRENO8_MEM_READ | ADRENO8_MEM_WRITE | ADRENO8_MEM_PRIV);
-	if (!powerup || !scratch)
+	if (adreno8_direct_ring)
+		ring = adreno8_gpu_alloc("direct ring", 32768, 4096, ADRENO8_MEM_READ | ADRENO8_MEM_PRIV);
+	if (!powerup || !scratch || (adreno8_direct_ring && !ring))
 		return gpu_fail("GPU buffer allocation");
 	memset((void *)scratch->memory, 0, scratch->size);
 	if (!adreno8_memory_publish(scratch, 0, scratch->size))
@@ -198,7 +201,8 @@ adreno8_gpu_prepare(void)
 static bool
 gpu_oob_get(void)
 {
-	if (!adreno8_hwsched_ready() || !adreno8_gpu_memory_ready() || adreno8_gpu_faulted())
+	if (!(adreno8_direct_ring ? adreno8_ordinary_ready() : adreno8_hwsched_ready()) ||
+	    !adreno8_gpu_memory_ready() || adreno8_gpu_faulted())
 		return gpu_fail("OOB prerequisites");
 	/* gen8_gmu_oob_set(oob_gpu): request bit 30, response bit 31. */
 	adreno8_reset_required = true;
@@ -224,6 +228,8 @@ static bool
 gpu_noncontext(void)
 {
 	for (unsigned pipe = 0; pipe <= 5; pipe++) {
+		if (adreno8_direct_ring && pipe == A8_PIPE_LPAC)
+			continue;
 		if (!gpu_aperture(pipe))
 			return false;
 		for (unsigned i = 0; i < A8_COUNT(a8_noncontext); i++)
@@ -256,6 +262,20 @@ gpu_protect(void)
 static bool
 gpu_hwcg(void)
 {
+	/* a8xx_set_hwcg(false) keeps gating disabled until after the first CP_INIT. */
+	if (adreno8_direct_ring) {
+		gpu_gmu_write(GMU(GEN8_GMUAO_CGC_MODE_CNTL), 0);
+		gpu_gmu_write(GMU(GEN8_GMUAO_CGC_DELAY_CNTL), 0);
+		gpu_gmu_write(GMU(GEN8_GMUAO_CGC_HYST_CNTL), 0);
+		gpu_write(GEN8_RBBM_CLOCK_CNTL_GLOBAL, 1);
+		gpu_write(GEN8_RBBM_CGC_GLOBAL_LOAD_CMD, 0);
+		uint32_t gbif = gpu_read(GEN8_GBIF_CX_CONFIG);
+		if (gbif == 0xffffffffu)
+			return gpu_fail("GBIF clock-gating read");
+		gpu_write(GEN8_GBIF_CX_CONFIG, gbif & ~1u);
+		adreno8_settle();
+		return gpu_state != GPU_FAILED;
+	}
 	gpu_write(GEN8_RBBM_CGC_0_PC, 0x702);
 	for (unsigned i = 0; i < A8_COUNT(a8_ao_hwcg); i++)
 		gpu_gmu_write(GMU(a8_ao_hwcg[i].reg), a8_ao_hwcg[i].value);
@@ -360,6 +380,8 @@ gpu_register_config(void)
 		return false;
 	/* No LLCC slices are allocated; vendor LLCC helpers return in this case. */
 	for (unsigned pipe = 1; pipe <= 7; pipe++) {
+		if (adreno8_direct_ring && pipe == A8_PIPE_LPAC)
+			continue;
 		if (!gpu_pipe_write(pipe, GEN8_CP_APRIV_CNTL_PIPE, pipe == 1 ? 0x6f : 0xf))
 			return false;
 		gpu_write(GEN8_CP_INTERRUPT_STATUS_MASK_PIPE, A8_CP_SW_MASK);
@@ -369,10 +391,10 @@ gpu_register_config(void)
 		return false;
 	gpu_write(GEN8_CP_INTERRUPT_STATUS_MASK_GLOBAL, A8_CP_GLOBAL_MASK);
 	gpu_write(GEN8_RBBM_SECVID_TSB_CNTL, 0);
-	gpu_write(GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_LO, ADRENO8_SECURE_IOVA_START);
+	gpu_write(GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_LO, adreno8_direct_ring ? 0 : ADRENO8_SECURE_IOVA_START);
 	gpu_write(GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_HI, 0);
-	gpu_write(GEN8_RBBM_SECVID_TSB_TRUSTED_SIZE, 0xfffff000);
-	if (!gpu_hwcg() || !gpu_powerup_list())
+	gpu_write(GEN8_RBBM_SECVID_TSB_TRUSTED_SIZE, adreno8_direct_ring ? 0 : 0xfffff000);
+	if (!gpu_hwcg() || (!adreno8_direct_ring && !gpu_powerup_list()))
 		return false;
 	adreno8_settle();
 	return gpu_status_ok();
@@ -389,6 +411,93 @@ gpu_ucode_base(uint32_t reg, const struct adreno8_memory *memory)
 	return true;
 }
 
+/* Follow a6xx_fenced_write's WPTR/barrier/bit-0 check. The 200 failed attempts
+ * have a 2 ms delay budget plus MMIO time; logging and diagnostic pauses stay outside. */
+static bool
+gpu_ring_wptr(uint32_t value)
+{
+	if (gpu_state == GPU_FAILED || !adreno8_gpu.base || !adreno8_gmu.base ||
+	    GEN8_CP_RB_WPTR_GC >= adreno8_gpu.size / 4)
+		return gpu_fail("direct ring WPTR aperture");
+	for (unsigned i = 0; i < 200; i++) {
+		adreno8_settle();
+		adreno8_wr(adreno8_gpu.base + 4u * GEN8_CP_RB_WPTR_GC, value);
+		adreno8_settle();
+		uint32_t fence = gpu_gmu_read(GMU_AHB_FENCE_STATUS);
+		if (fence == 0xffffffffu)
+			return gpu_fail("direct ring fence read");
+		if (!(fence & 1u))
+			return true;
+		adreno8_sleep_us(10);
+	}
+	return gpu_fail("direct ring fenced WPTR timeout");
+}
+
+/* Linux a8xx_hw_init/a8xx_cp_init at efbda69d92e6 use a zeroed powerup page,
+ * BR/BV RPTR shadows and a 32 KiB ring before enabling SQE. This probe ends
+ * after the first CP_INIT; allocations and OOB remain held until cold reset. */
+static bool
+gpu_direct_ring_init(void)
+{
+	if (!ring || ring->size != 32768 || scratch->size < 16 || powerup->size != 4096)
+		return gpu_fail("direct ring buffer bounds");
+	memset((void *)ring->memory, 0, ring->size);
+	memset((void *)scratch->memory, 0, scratch->size);
+	memset((void *)powerup->memory, 0, powerup->size);
+	if (!adreno8_memory_publish(ring, 0, ring->size) ||
+	    !adreno8_memory_publish(scratch, 0, scratch->size) ||
+	    !adreno8_memory_publish(powerup, 0, powerup->size))
+		return gpu_fail("direct ring initial publication");
+	if (gpu_read(GEN8_CP_RB_RPTR_BR) != 0 || gpu_read(GEN8_CP_RB_WPTR_GC) != 0)
+		return gpu_fail("direct ring requires cold indices");
+	const struct a8_reg_pair setup[] = {
+		{ GEN8_CP_RB_BASE_LO_GC, ring->gpu_address }, { GEN8_CP_RB_BASE_HI_GC, 0 },
+		{ GEN8_CP_RB_CNTL_GC, 0x20c },
+		{ GEN8_CP_RB_RPTR_ADDR_LO_BR, scratch->gpu_address }, { GEN8_CP_RB_RPTR_ADDR_HI_BR, 0 },
+		{ GEN8_CP_RB_RPTR_ADDR_LO_BV, scratch->gpu_address + 8 }, { GEN8_CP_RB_RPTR_ADDR_HI_BV, 0 }
+	};
+	for (unsigned i = 0; i < A8_COUNT(setup); i++) {
+		gpu_write(setup[i].reg, setup[i].value);
+		adreno8_settle();
+		if (gpu_read(setup[i].reg) != setup[i].value)
+			return gpu_fail("direct ring register readback");
+	}
+	gpu_write(GEN8_CP_SQE_CNTL, 1);
+	adreno8_settle();
+	if (gpu_read(GEN8_CP_SQE_CNTL) != 1)
+		return gpu_fail("direct ring SQE enable readback");
+	uint32_t count = adreno8_pm4_cp_init((uint32_t *)ring->memory, ring->size / 4, powerup->gpu_address);
+	if (count != 10 || !adreno8_memory_publish(ring, 0, count * 4))
+		return gpu_fail("direct ring CP_INIT publication");
+	printf("adreno8: direct ring CP_INIT published: ring=%#x shadow=%#x powerup=%#x dwords=%u\n",
+	    ring->gpu_address, scratch->gpu_address, powerup->gpu_address, count);
+	if (!gpu_ring_wptr(count))
+		return false;
+	for (unsigned i = 0; i < 2000; i++) {
+		if (!adreno8_hfi_poll() || !gpu_status_ok())
+			return gpu_fail("direct ring HFI, GPU or GMU fault");
+		uint32_t rptr = gpu_read(GEN8_CP_RB_RPTR_BR), bv = gpu_read(GEN8_CP_RB_RPTR_BV);
+		if (!adreno8_memory_acquire(scratch, 0, 16))
+			return gpu_fail("direct ring shadow acquire");
+		uint32_t br_shadow = *(volatile uint32_t *)scratch->memory;
+		uint32_t bv_shadow = *(volatile uint32_t *)(scratch->memory + 8);
+		if (rptr >= ring->size / 4 || bv >= ring->size / 4 ||
+		    br_shadow >= ring->size / 4 || bv_shadow >= ring->size / 4)
+			return gpu_fail("direct ring RPTR bounds");
+		if (rptr == count && br_shadow == count &&
+		    !(gpu_gmu_read(GMU(GEN8_GMUAO_GPU_CX_BUSY_STATUS)) & (1u << 23)) &&
+		    !(gpu_read(GEN8_RBBM_STATUS) & ~1u)) {
+			if (!gpu_status_ok())
+				return false;
+			printf("adreno8: direct ring CP_INIT consumed and idle: BR=%u shadow=%u BV=%u shadow=%u\n",
+			    rptr, br_shadow, bv, bv_shadow);
+			return gpu_fail("direct ring diagnostic complete; stop");
+		}
+		adreno8_sleep_us(100);
+	}
+	return gpu_fail("direct ring CP_INIT completion timeout");
+}
+
 bool
 adreno8_gpu_cp_init(void)
 {
@@ -402,10 +511,15 @@ adreno8_gpu_cp_init(void)
 	if (empty_powerup && (empty_powerup != 1 || adreno8_step != 17 || adreno8_newest_step != 17 ||
 	    !adreno8_gpu8_keep || adreno8_gpu8_return || adreno8_skip_steps != 0 || raw_nop != 0))
 		return gpu_fail("empty powerup diagnostic prerequisites");
+	if (adreno8_direct_ring && (adreno8_step != 17 || adreno8_newest_step != 17 ||
+	    !adreno8_gpu8_keep || adreno8_gpu8_return || adreno8_skip_steps != 0 || raw_nop || empty_powerup))
+		return gpu_fail("direct ring diagnostic prerequisites");
 	if (!gpu_oob_get() || !gpu_register_config() ||
 	    !gpu_ucode_base(GEN8_CP_SQE_INSTR_BASE_LO, sqe) ||
 	    !gpu_ucode_base(GEN8_CP_AQE_INSTR_BASE_LO_0, aqe))
 		return false;
+	if (adreno8_direct_ring)
+		return gpu_direct_ring_init();
 	/* Separate delayed failure after setup from failure after publishing RAW. */
 	if (raw_nop == 3) {
 		for (unsigned i = 0; i < 100; i++) {

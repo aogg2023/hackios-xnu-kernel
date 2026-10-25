@@ -35,6 +35,8 @@
  * adreno8_fine=1      also pause before individual accesses in that step
  * adreno8_raw_nop=N   stop before CP_INIT: 1=two RAW NOP words, 2=ten RAW NOP words,
  *                  3=setup-only health checks without RAW publication
+ * adreno8_direct_ring=1  ordinary HFI and one direct ring; stage17/keep1/return0/gmuclk2,
+ *                  secure_preflight0 and no only/skip/raw_nop/empty_powerup; stop after CP_INIT idle
  * adreno8_empty_powerup=1  stage-17 CP_INIT with a zeroed powerup page; stop after idle;
  *                  requires keep=1 return=0, no only/skip/raw_nop; default uses the generated list
  * adreno8_watch=S     inspect GMU status for S seconds after step 11 or later (default 20)
@@ -86,6 +88,7 @@ uint32_t adreno8_speed_asked;                  /* adreno8_speed: 1 lowest (step 
 
 uint32_t adreno8_gmu_from_pll;                 /* adreno8_gmuclk */
 
+bool adreno8_direct_ring;                      /* cold-boot ordinary HFI/CP_INIT diagnostic */
 bool adreno8_gpu_stall;                        /* adreno8_gpu_stall=1 */
 
 uint32_t adreno8_step;                         /* the one being performed */
@@ -317,13 +320,14 @@ adreno8_gpu8_block_stop(void)
 /* ---- the walk ----------------------------------------------------------------------------------------------- */
 
 static bool
-adreno8_step_hwsched(void)
+adreno8_step_core_start(void)
 {
 	if (!adreno8_gpu8_keep || adreno8_gpu8_return) {
-		printf("adreno8: HWSCHED probes require keep=1, return=0 and host cold reset\n");
+		printf("adreno8: GPU startup probes require keep=1, return=0 and host cold reset\n");
 		return false;
 	}
-	return adreno8_gpu_prepare() && adreno8_gpu_memory_enable() && adreno8_hwsched_start();
+	return adreno8_gpu_prepare() && adreno8_gpu_memory_enable() &&
+	    (adreno8_direct_ring ? adreno8_ordinary_start() : adreno8_hwsched_start());
 }
 
 static bool
@@ -345,13 +349,14 @@ adreno8_init(void)
 	static bool (*const each[])(void) = {
 		adreno8_step_outside, adreno8_step_gpucc, adreno8_step_cx_power, adreno8_step_cx_awake, adreno8_step_clocks,
 		adreno8_step_first_words, adreno8_step_gmu_memory, adreno8_step_smmu_read, adreno8_step_gmu_space, adreno8_step_firmware,
-		adreno8_step_gmu_start, adreno8_step_queues, adreno8_step_tables, adreno8_step_hwsched,
+		adreno8_step_gmu_start, adreno8_step_queues, adreno8_step_tables, adreno8_step_core_start,
 		adreno8_step_gx_power, adreno8_gpu_memory_verify, adreno8_gpu_cp_init, adreno8_step_zap,
 		adreno8_step_secure_exit, adreno8_gpu_scratch_test, adreno8_step_last_look, adreno8_context_test,
 		adreno8_step_service
 	};
 	const unsigned count = sizeof(each) / sizeof(each[0]);
 	uint32_t asked = 0, only = 0, one = 0, completed = 0, empty_powerup = 0, raw_nop = 0;
+	uint32_t direct_ring = 0, secure_mode_arg = 0;
 
 	if (!PE_parse_boot_argn("adreno8", &asked, sizeof(asked)) || asked == 0) {
 		return;
@@ -372,6 +377,7 @@ adreno8_init(void)
 			printf("adreno8: adreno8_secure_preflight=%u is not a known mode; the secure path stays off\n", one);
 		}
 	}
+	secure_mode_arg = one;
 	one = 0;
 	if (PE_parse_boot_argn("adreno8_cbscan", &one, sizeof(one)) && one != 0) {
 		adreno8_smmu_cb_scan_ask();
@@ -383,6 +389,14 @@ adreno8_init(void)
 	PE_parse_boot_argn("adreno8_skip", &adreno8_skip_steps, sizeof(adreno8_skip_steps));
 	PE_parse_boot_argn("adreno8_empty_powerup", &empty_powerup, sizeof(empty_powerup));
 	PE_parse_boot_argn("adreno8_raw_nop", &raw_nop, sizeof(raw_nop));
+	PE_parse_boot_argn("adreno8_direct_ring", &direct_ring, sizeof(direct_ring));
+	adreno8_direct_ring = direct_ring == 1;
+	if (direct_ring && (direct_ring != 1 || asked != 17 || only != 0 ||
+	    adreno8_skip_steps != 0 || !adreno8_gpu8_keep || adreno8_gpu8_return || raw_nop != 0 ||
+	    empty_powerup != 0 || secure_mode_arg != 0 || adreno8_gmu_from_pll != 2)) {
+		printf("adreno8: direct_ring=1 requires complete adreno8=17, keep=1 return=0 gmuclk=2 secure_preflight=0 without other command probes; no steps attempted\n");
+		return;
+	}
 	if (empty_powerup && (empty_powerup != 1 || asked != 17 || only != 0 ||
 	    adreno8_skip_steps != 0 || !adreno8_gpu8_keep || adreno8_gpu8_return || raw_nop != 0)) {
 		printf("adreno8: empty_powerup=1 requires adreno8=17, keep=1 return=0 without only, skip or raw_nop; no steps attempted\n");

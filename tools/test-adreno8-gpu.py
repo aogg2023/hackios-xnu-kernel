@@ -145,6 +145,9 @@ bool adreno8_reset_required;
 uint32_t adreno8_pause_ms, adreno8_step, adreno8_newest_step;
 uint32_t adreno8_skip_steps;
 bool adreno8_gpu8_keep, adreno8_gpu8_return;
+bool adreno8_direct_ring;
+bool adreno8_ordinary_ready(void);
+static unsigned ring_completed;
 static uint32_t raw_nop_asked, empty_powerup_asked;
 bool PE_parse_boot_argn(const char *name, void *value, int size)
 {
@@ -155,7 +158,10 @@ bool PE_parse_boot_argn(const char *name, void *value, int size)
     if (asked) memcpy(value, &asked, size);
     return asked != 0;
 }
-int adreno8_say(const char *fmt, ...) { (void)fmt; return 0; }
+int adreno8_say(const char *fmt, ...) {
+    if (strstr(fmt, "direct ring CP_INIT consumed and idle:")) ring_completed++;
+    return 0;
+}
 uint32_t adreno8_rd(vm_offset_t);
 void adreno8_wr(vm_offset_t, uint32_t);
 uint32_t adreno8_get(struct adreno8_block *, const char *, uint32_t);
@@ -178,16 +184,23 @@ static unsigned normal_powerup_publications, empty_powerup_publications;
 static bool empty_publish_ok = true;
 static bool smmu_ok = true, hfi_ok = true, oob_ok = true, clock_ok = true;
 static bool raw_ok = true, idle_ok = true, memory_on, smmu_after_raw, corrupt_scratch, acquire_ok = true;
-static struct adreno8_memory allocations[4];
-static uint8_t *device_memory[4], *files[2];
+static struct adreno8_memory allocations[5];
+static uint8_t *device_memory[5], *files[2];
 static uint64_t file_sizes[2];
-static uint32_t allocation_prot[4];
+static uint32_t allocation_prot[5];
+static unsigned ring_input_mask, ring_payloads, ring_wptr_writes, ring_fence_drops;
+static unsigned ring_setup_read_mask, ring_publish_fail, ring_read_fault, ring_drop_write;
+static bool ordinary_ok, poll_ok, gmu_smmu_ok, ring_rptr_moves, ring_shadow_moves, ring_alloc_ok;
+static uint32_t ring_fault, ring_bv, ring_bv_shadow, ring_rbbm, ring_fence_extra;
+static const uint32_t ring_setup_regs[] = {0x800,0x801,0x802,0x804,0x805,0x808,0x809};
 
 void adreno8_settle(void) { last_mmio = MMIO_BARRIER; barriers++; }
 
 uint32_t adreno8_rd(vm_offset_t address)
 {
     assert(last_mmio != MMIO_READ);
+    if (adreno8_direct_ring && address == adreno8_gmu.base + GMU_AHB_FENCE_STATUS)
+        assert(last_mmio == MMIO_BARRIER);
     last_mmio = MMIO_READ;
     if (address >= adreno8_gmu.base && address < adreno8_gmu.base + adreno8_gmu.size) {
         gmu_reads++;
@@ -197,6 +210,10 @@ uint32_t adreno8_rd(vm_offset_t address)
     gx_reads++;
     if (address - adreno8_gpu.base > max_gx_offset) max_gx_offset = address - adreno8_gpu.base;
     uint32_t reg = (address - adreno8_gpu.base) / 4;
+    if (adreno8_direct_ring) {
+        if (reg == ring_read_fault) return UINT32_MAX;
+        for (unsigned i=0;i<7;i++) if (reg == ring_setup_regs[i]) ring_setup_read_mask |= 1u<<i;
+    }
     if (reg == GEN8_CP_APERTURE_CNTL_HOST) return current_pipe << 12;
     if (reg == GEN8_RBBM_CGC_P2S_STATUS) return clock_ok;
     return gpu_regs[current_pipe][reg];
@@ -221,6 +238,43 @@ void adreno8_wr(vm_offset_t address, uint32_t value)
     gx_writes++;
     if (address - adreno8_gpu.base > max_gx_offset) max_gx_offset = address - adreno8_gpu.base;
     uint32_t reg = (address - adreno8_gpu.base) / 4;
+    if (adreno8_direct_ring) {
+        assert(!raw_calls);
+        if (reg == 0x81c) assert(value != 3u<<12);
+        if (reg == 0x84d) assert(value == (current_pipe == 1 ? 0x6f : 0xf));
+        if (reg >= 0xf800 && reg <= 0xf803) assert(value == 0);
+        if (reg == 0x9a) assert(value == 1);
+        if (reg == 0x9b) assert(value == 0);
+        if (reg == 0x9c) assert(false);
+        for (unsigned i=0;i<7;i++) if (reg == ring_setup_regs[i]) {
+            assert(ring_input_mask == 7 && !ring_wptr_writes);
+            if (reg == ring_drop_write) return;
+        }
+        if (reg == 0x815) {
+            assert(ring_input_mask == 7 && ring_setup_read_mask == 127 && value == 1);
+            if (reg == ring_drop_write) return;
+        }
+        if (reg == 0x807) {
+            assert(value == 10 && ring_payloads == 1 && ring_input_mask == 7);
+            assert(gpu_regs[0][0x815] == 1 && ring_setup_read_mask == 127);
+            ring_wptr_writes++;
+            if (ring_fence_drops) {
+                ring_fence_drops--; gmu_regs[GMU_AHB_FENCE_STATUS/4]=1; return;
+            }
+            gmu_regs[GMU_AHB_FENCE_STATUS/4]=ring_fence_extra;
+            if (ring_rptr_moves) gpu_regs[0][0x806]=10;
+            if (ring_shadow_moves) ((uint32_t *)device_memory[3])[0]=10;
+            gpu_regs[0][0x80a]=ring_bv;
+            ((uint32_t *)device_memory[3])[2]=ring_bv_shadow;
+            gpu_regs[0][0x12]=ring_rbbm;
+            if (ring_fault==1) poll_ok=false;
+            if (ring_fault==2) smmu_ok=false;
+            if (ring_fault==3) gmu_smmu_ok=false;
+            if (ring_fault==4) gpu_regs[0][GEN8_RBBM_INT_0_STATUS]=1u<<1;
+            if (ring_fault==5) gmu_regs[GMU(GEN8_GMUAO_GPU_CX_BUSY_STATUS)/4]=1u<<23;
+            if (ring_fault==6) gmu_regs[GMU_AHB_FENCE_STATUS/4]=UINT32_MAX;
+        }
+    }
     if (reg == GEN8_CP_APERTURE_CNTL_HOST) { current_pipe = value >> 12; assert(current_pipe < 8); }
     else gpu_regs[current_pipe][reg] = value;
 }
@@ -237,6 +291,7 @@ void adreno8_put(struct adreno8_block *block, const char *name, uint32_t offset,
 {
     assert(block == &adreno8_gpu && !strcmp(name, "command register"));
     assert(adreno8_pause_ms && adreno8_step == adreno8_newest_step && offset <= block->size - 4);
+    assert(!adreno8_direct_ring || offset != 4 * 0x807);
     diagnostic_writes++; diagnostic_offset = offset;
     adreno8_wr(block->base + offset, value);
 }
@@ -251,7 +306,8 @@ const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *s
 
 struct adreno8_memory *adreno8_gpu_alloc(const char *name, uint32_t size, uint32_t align, uint32_t prot)
 {
-    assert(!memory_on && allocation_count < 4 && align == 4096);
+    assert(!memory_on && allocation_count < 5 && align == 4096);
+    if (!strcmp(name,"direct ring") && !ring_alloc_ok) return NULL;
     unsigned i = allocation_count++;
     struct adreno8_memory *m = &allocations[i];
     uint32_t allocated = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -267,7 +323,20 @@ struct adreno8_memory *adreno8_gpu_alloc(const char *name, uint32_t size, uint32
 bool adreno8_memory_publish(const struct adreno8_memory *m, uint32_t offset, uint32_t size)
 {
     assert(offset <= m->size && size <= m->size - offset);
-    if (m == powerup) {
+    if (adreno8_direct_ring) {
+        unsigned input = m == &allocations[4] ? 1 : m == scratch ? 2 : m == powerup ? 4 : 0;
+        if (input && oob_requested) {
+            unsigned phase = m == &allocations[4] && size == 40 ? 4 : input == 1 ? 1 : input == 2 ? 2 : 3;
+            assert(offset == 0 && size == (phase == 4 ? 40 : m->size));
+            if (phase == 4) {
+                const uint32_t expected[]={0x70970001,0x08000000,0x70c80007,0x14b,3,0x20000000,2,0xc0400000,0,0x80000000};
+                assert(gpu_regs[0][0x815] == 1 && !memcmp((void *)m->memory,expected,40));
+                for(unsigned i=0;i<4096;i++) assert(!device_memory[2][i]);
+            } else for(unsigned i=0;i<size;i++) assert(!((uint8_t *)m->memory)[i]);
+            if (ring_publish_fail == phase) return false;
+            if (phase == 4) ring_payloads++; else ring_input_mask |= input;
+        }
+    } else if (m == powerup) {
         uint32_t *p = (uint32_t *)m->memory;
         if (p[3]) normal_powerup_publications++;
         else {
@@ -292,11 +361,17 @@ bool adreno8_memory_acquire(const struct adreno8_memory *m, uint32_t offset, uin
     return true;
 }
 bool adreno8_gpu_memory_ready(void) { return memory_on; }
-bool adreno8_gpu_faulted(void) { return !smmu_ok; }
-bool adreno8_hwsched_ready(void) { return hfi_ok; }
+bool adreno8_gpu_faulted(void) { return !smmu_ok || !gmu_smmu_ok; }
+bool adreno8_hwsched_ready(void) { return !adreno8_direct_ring && hfi_ok; }
+bool adreno8_ordinary_ready(void) { return adreno8_direct_ring && ordinary_ok; }
+bool adreno8_hfi_poll(void) {
+    if (!poll_ok || adreno8_gpu_faulted()) { ordinary_ok=false; return false; }
+    return true;
+}
 bool adreno8_hwsched_raw(const uint32_t *pm4_words, uint32_t words, const char *name)
 {
     (void)name;
+    assert(!adreno8_direct_ring);
     assert(last_mmio != MMIO_READ);
     assert(oob_requested && oob_acked && memory_on && adreno8_reset_required);
     raw_calls++;
@@ -361,6 +436,10 @@ static void reset(void)
     raw_nop_asked = empty_powerup_asked = adreno8_skip_steps = 0;
     adreno8_gpu8_keep = true; adreno8_gpu8_return = false;
     normal_powerup_publications = empty_powerup_publications = 0; empty_publish_ok = true;
+    adreno8_direct_ring=false; ring_completed=ring_input_mask=ring_payloads=ring_wptr_writes=ring_fence_drops=0;
+    ring_setup_read_mask=ring_publish_fail=ring_read_fault=ring_drop_write=ring_fault=0;
+    ring_bv=ring_bv_shadow=ring_rbbm=ring_fence_extra=0;
+    ordinary_ok=poll_ok=gmu_smmu_ok=ring_rptr_moves=ring_shadow_moves=ring_alloc_ok=true;
     setup_waits = 0;
     diagnostic_reads = diagnostic_writes = diagnostic_offset = 0;
     last_mmio = MMIO_NONE; barriers = gmu_reads = gmu_writes = 0;
@@ -411,6 +490,105 @@ static void empty_retained(void)
     unsigned reads = gx_reads + gmu_reads, writes = gx_writes + gmu_writes;
     assert(!adreno8_gpu_cp_init());
     assert(reads == gx_reads + gmu_reads && writes == gx_writes + gmu_writes);
+}
+
+static void prepare_ring(void)
+{
+    reset(); adreno8_direct_ring=true;
+    assert(adreno8_gpu_prepare() && allocation_count==5);
+    assert(allocations[4].size==32768 && allocation_prot[4]==9 && allocation_prot[3]==11);
+    assert(!adreno8_hwsched_ready() && adreno8_ordinary_ready());
+    adreno8_step=adreno8_newest_step=17; adreno8_pause_ms=100;
+    memory_on=true;
+    for(unsigned i=0;i<7;i++) gpu_regs[0][ring_setup_regs[i]]=0xa5;
+    gpu_regs[0][0x815]=0xa5; gpu_regs[0][0x3c00]=0xabcdef01;
+    for(unsigned b=2;b<5;b++) {
+        memset((void *)allocations[b].memory,0x5a,allocations[b].size);
+        memset(device_memory[b],0x5a,allocations[b].size);
+    }
+}
+
+static void ring_retained(unsigned completed)
+{
+    assert(gpu_state==GPU_FAILED && ring_completed==completed && !raw_calls);
+    assert(allocation_count==5 && oob_requested && oob_acked && adreno8_reset_required && memory_on);
+    assert(!adreno8_hwsched_ready() && !adreno8_gpu_cp_ready());
+    unsigned reads=gx_reads+gmu_reads, writes=gx_writes+gmu_writes;
+    assert(!adreno8_gpu_cp_init() && !adreno8_gpu_secure_exit() && !adreno8_gpu_scratch_test());
+    assert(reads==gx_reads+gmu_reads && writes==gx_writes+gmu_writes && !raw_calls);
+    for(unsigned i=0;i<2;i++) {
+        assert(!memcmp(device_memory[i],files[i]+4,file_sizes[i]-4));
+        assert(!memcmp((void *)allocations[i].memory,files[i]+4,file_sizes[i]-4));
+    }
+}
+
+static void check_direct_ring(void)
+{
+    prepare_ring(); assert(!adreno8_gpu_cp_init()); ring_retained(1);
+    assert(ring_wptr_writes==1 && ring_payloads==1 && ring_input_mask==7);
+    assert(gpu_regs[0][0x800]==0xc0800000 && gpu_regs[0][0x801]==0 && gpu_regs[0][0x802]==0x20c);
+    assert(gpu_regs[0][0x804]==0xc0600000 && gpu_regs[0][0x805]==0);
+    assert(gpu_regs[0][0x808]==0xc0600008 && gpu_regs[0][0x809]==0);
+    assert(gpu_regs[0][0x806]==10 && gpu_regs[0][0x807]==10 && gpu_regs[0][0x80a]==0);
+    assert(((uint32_t *)device_memory[3])[0]==10 && ((uint32_t *)device_memory[3])[2]==0);
+    assert(gpu_regs[0][0x9a]==1 && gpu_regs[0][0x9b]==0 && gpu_regs[0][0x3c00]==0xabcdef00);
+    assert(!gmu_regs[GMU(0x23b09)/4] && !gmu_regs[GMU(0x23b0a)/4] && !gmu_regs[GMU(0x23b0b)/4]);
+    for(unsigned i=0;i<4096;i++) assert(!device_memory[2][i]);
+    prepare_ring(); ring_fence_drops=3; ring_fence_extra=2; ring_rbbm=1;
+    assert(!adreno8_gpu_cp_init()); ring_retained(1); assert(ring_wptr_writes==4);
+    prepare_ring(); ring_fence_drops=201;
+    assert(!adreno8_gpu_cp_init()); ring_retained(0); assert(ring_wptr_writes==200);
+    for(unsigned phase=1;phase<=4;phase++) {
+        prepare_ring(); ring_publish_fail=phase;
+        assert(!adreno8_gpu_cp_init() && !ring_wptr_writes); ring_retained(0);
+    }
+    for(unsigned i=0;i<8;i++) {
+        uint32_t reg=i<7?ring_setup_regs[i]:0x815;
+        prepare_ring(); ring_read_fault=reg;
+        assert(!adreno8_gpu_cp_init() && !ring_wptr_writes); ring_retained(0);
+        prepare_ring(); ring_drop_write=reg;
+        assert(!adreno8_gpu_cp_init() && !ring_wptr_writes); ring_retained(0);
+    }
+    for(unsigned fault=1;fault<=6;fault++) {
+        prepare_ring(); ring_fault=fault;
+        assert(!adreno8_gpu_cp_init()); ring_retained(0);
+        if(fault<=3) assert(!adreno8_ordinary_ready());
+    }
+    prepare_ring(); ring_rptr_moves=false;
+    assert(!adreno8_gpu_cp_init()); ring_retained(0);
+    prepare_ring(); ring_shadow_moves=false;
+    assert(!adreno8_gpu_cp_init()); ring_retained(0);
+    prepare_ring(); acquire_ok=false;
+    assert(!adreno8_gpu_cp_init()); ring_retained(0);
+    prepare_ring(); ring_rbbm=2;
+    assert(!adreno8_gpu_cp_init()); ring_retained(0);
+    prepare_ring(); ring_bv=8192;
+    assert(!adreno8_gpu_cp_init()); ring_retained(0);
+    prepare_ring(); ring_bv_shadow=UINT32_MAX;
+    assert(!adreno8_gpu_cp_init()); ring_retained(0);
+    prepare_ring(); gpu_regs[0][0x3c00]=UINT32_MAX;
+    assert(!adreno8_gpu_cp_init() && !ring_wptr_writes); ring_retained(0);
+    for(unsigned i=0;i<2;i++) {
+        prepare_ring(); gpu_regs[0][i?0x807:0x806]=1;
+        assert(!adreno8_gpu_cp_init() && !ring_wptr_writes); ring_retained(0);
+    }
+    for(unsigned bad=0;bad<8;bad++) {
+        prepare_ring();
+        switch(bad) {
+        case 0: ordinary_ok=false; break;
+        case 1: adreno8_step=16; break;
+        case 2: adreno8_newest_step=18; break;
+        case 3: adreno8_gpu8_keep=false; break;
+        case 4: adreno8_gpu8_return=true; break;
+        case 5: raw_nop_asked=1; break;
+        case 6: empty_powerup_asked=1; break;
+        case 7: adreno8_skip_steps=1; break;
+        }
+        assert(!adreno8_gpu_cp_init() && !oob_requested && !gx_writes && !gmu_writes);
+    }
+    reset(); adreno8_direct_ring=true; ring_alloc_ok=false;
+    assert(!adreno8_gpu_prepare() && allocation_count==4 && gpu_state==GPU_FAILED && !gx_writes && !gmu_writes);
+    puts("ordinary direct ring: publication, fixed setup/readback, fenced WPTR, BR completion/BV0, idle/fault and retention passed");
 }
 
 int main(int argc, char **argv)
@@ -568,6 +746,7 @@ int main(int argc, char **argv)
     corrupt_scratch = true; assert(!adreno8_gpu_scratch_test() && gpu_state == GPU_FAILED);
     reset(); prepare(); assert(adreno8_gpu_cp_init() && adreno8_gpu_secure_exit());
     acquire_ok = false; assert(!adreno8_gpu_scratch_test() && gpu_state == GPU_FAILED);
+    check_direct_ring();
     reset(); free(files[0]); free(files[1]);
     puts("gen8.0.0 vendor aperture/tables, bounded ordered MMIO, PM4, firmware and startup failures passed");
     return 0;
@@ -639,9 +818,54 @@ with tempfile.TemporaryDirectory(prefix="adreno8-gpu-test-") as temp:
         ("empty-skip-guard", "adreno8_skip_steps != 0 || ", ""),
         ("empty-NOP-guard", "|| raw_nop != 0", ""),
     ]
+    cp_source = production[production.index("\nbool\nadreno8_gpu_cp_init("):production.index("\nbool\nadreno8_gpu_cp_ready(")]
     for name, before, after in empty_variants:
-        assert production.count(before) == 1, name
+        assert before in cp_source, name
+        changed = cp_source.replace(before, after, 1)
+        checks.append((name, production.replace(cp_source, changed, 1), None))
+    ring_variants = [
+        ("ring-size", '"direct ring", 32768, 4096', '"direct ring", 4096, 4096'),
+        ("ring-write-permission", '32768, 4096, ADRENO8_MEM_READ | ADRENO8_MEM_PRIV',
+         '32768, 4096, ADRENO8_MEM_READ | ADRENO8_MEM_WRITE | ADRENO8_MEM_PRIV'),
+        ("ring-zero", 'memset((void *)ring->memory, 0, ring->size);', ''),
+        ("ring-initial-publication", '!adreno8_memory_publish(ring, 0, ring->size)', 'false'),
+        ("ring-shadow-publication", '!adreno8_memory_publish(scratch, 0, scratch->size)', 'false'),
+        ("ring-powerup-publication", '!adreno8_memory_publish(powerup, 0, powerup->size)', 'false'),
+        ("ring-control", '{ GEN8_CP_RB_CNTL_GC, 0x20c }', '{ GEN8_CP_RB_CNTL_GC, 0x30c }'),
+        ("ring-BV-shadow-offset", 'scratch->gpu_address + 8', 'scratch->gpu_address + 4'),
+        ("ring-readback", 'if (gpu_read(setup[i].reg) != setup[i].value)', 'if (false)'),
+        ("ring-SQE-readback", 'if (gpu_read(GEN8_CP_SQE_CNTL) != 1)', 'if (false)'),
+        ("ring-command-publication", '!adreno8_memory_publish(ring, 0, count * 4)', 'false'),
+        ("ring-fence-mask", 'if (!(fence & 1u))', 'if (!(fence & 2u))'),
+        ("ring-fence-bound", 'i < 200; i++', 'i < 201; i++'),
+        ("ring-HFI-health", '!adreno8_hfi_poll() || !gpu_status_ok()', '!gpu_status_ok()'),
+        ("ring-RPTR-completion", 'rptr == count && br_shadow == count', 'br_shadow == count'),
+        ("ring-shadow-completion", 'rptr == count && br_shadow == count', 'rptr == count'),
+        ("ring-BV-too-strict", 'rptr == count && br_shadow == count', 'rptr == count && br_shadow == count && bv == count'),
+        ("ring-GMU-idle", '!(gpu_gmu_read(GMU(GEN8_GMUAO_GPU_CX_BUSY_STATUS)) & (1u << 23))', 'true'),
+        ("ring-RBBM-idle", '!(gpu_read(GEN8_RBBM_STATUS) & ~1u)', 'true'),
+        ("ring-ready-promotion", 'return gpu_fail("direct ring diagnostic complete; stop");', 'gpu_state=GPU_CP_READY; return true;'),
+        ("ring-LPAC", 'if (adreno8_direct_ring && pipe == A8_PIPE_LPAC)', 'if (false)'),
+        ("ring-trusted-range", 'adreno8_direct_ring ? 0 : ADRENO8_SECURE_IOVA_START', 'ADRENO8_SECURE_IOVA_START'),
+    ]
+    ring_body = re.search(r"static bool\ngpu_direct_ring_init\(.*?\n}", production, re.S)[0]
+    for name, before, after in ring_variants:
+        owner = ring_body if before in ring_body else production
+        assert before in owner, name
+        checks.append((name, production.replace(owner, owner.replace(before, after, 1), 1), None))
+    for name, before, after in (
+        ("ring-cold-indices", 'if (gpu_read(GEN8_CP_RB_RPTR_BR) != 0 || gpu_read(GEN8_CP_RB_WPTR_GC) != 0)', 'if (false)'),
+        ("ring-WPTR-value", 'if (!gpu_ring_wptr(count))', 'if (!gpu_ring_wptr(count + 1))'),
+    ):
+        assert before in production, name
         checks.append((name, production.replace(before, after, 1), None))
+    fenced = re.search(r"static bool\ngpu_ring_wptr\(.*?\n}", production, re.S)[0]
+    missing_barrier = fenced.replace('adreno8_wr(adreno8_gpu.base + 4u * GEN8_CP_RB_WPTR_GC, value);\n\t\tadreno8_settle();',
+                                     'adreno8_wr(adreno8_gpu.base + 4u * GEN8_CP_RB_WPTR_GC, value);')
+    assert missing_barrier != fenced
+    checks.append(("ring-WPTR-post-barrier", production.replace(fenced, missing_barrier, 1), None))
+    hwcg = re.search(r"static bool\ngpu_hwcg\(.*?\n}", production, re.S)[0]
+    checks.append(("ring-HWCG-enabled", production.replace(hwcg, hwcg.replace('if (adreno8_direct_ring)', 'if (false)', 1), 1), None))
     for name, mutated, mutated_header in checks:
         assert mutated != production or (mutated_header is not None and mutated_header != private), name
         variant = Path(temp) / name
@@ -660,3 +884,4 @@ with tempfile.TemporaryDirectory(prefix="adreno8-gpu-test-") as temp:
     print(f"GPU MMIO barrier mutations rejected: {len(variants)} variants x 2 page sizes")
     print("GPU TPL1 catalog/startup/powerup mutations rejected: 3 variants x 2 page sizes")
     print(f"GPU empty powerup mutations rejected: {len(empty_variants)} variants x 2 page sizes")
+    print(f"GPU ordinary ring mutations rejected: {len(ring_variants) + 4} variants x 2 page sizes")

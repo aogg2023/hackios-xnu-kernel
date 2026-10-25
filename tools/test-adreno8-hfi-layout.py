@@ -92,6 +92,7 @@ static struct adreno8_block adreno8_gmu;
 static struct { bool is_on; } adreno8_gmu_space;
 static unsigned adreno8_gmu_demand_count, adreno8_step, contiguous_calls, maps, smmu_calls, hwsched_memory_calls;
 static unsigned barriers, publications, doorbells;
+static bool adreno8_direct_ring;
 static bool fail_contiguous, fail_mapping;
 static vm_offset_t adreno8_log_view[4], adreno8_hfi_view_table, adreno8_hfi_view_cmd;
 static vm_offset_t adreno8_hfi_view_resp, adreno8_hfi_view_debug;
@@ -168,7 +169,7 @@ int main(void) {
     memset(table, 0xa5, sizeof(table)); memset(expected, 0xa5, sizeof(expected));
     struct kgsl_memdesc md = {0x60006000, expected}; struct gen8_hfi vendor_hfi = {&md};
     init_vendor_queues(&vendor_hfi);
-    adreno8_hfi_init_table((uint32_t *)table, md.gmuaddr);
+    adreno8_hfi_init_table((uint32_t *)table, md.gmuaddr, false);
     assert(sizeof(struct hfi_queue_table) == 840);
     assert(!memcmp(table, expected, sizeof(table)));
     assert(ADRENO8_HFI_ALLOC_BYTES == 0x4000);
@@ -219,6 +220,22 @@ int main(void) {
             assert(header[10] == header[11]);
         }
     }
+    release(); adreno8_direct_ring = true;
+    assert(adreno8_step_gmu_space() && contiguous_calls == 1 && maps == 5 && adreno8_gmu_space.is_on);
+    assert(!hwsched_memory_calls);
+    uint32_t *normal = (uint32_t *)adreno8_hfi_view_table;
+    assert(normal[0] == 0 && normal[1] == 168 && normal[2] == 6 && normal[3] == 12);
+    assert(normal[4] == 3 && normal[5] == 3);
+    for (unsigned q = 0; q < 3; q++) {
+        uint32_t *hdr = normal + 6 + q * 12;
+        assert(hdr[0] == 1 && hdr[1] == 0x60007000 + q * 4096);
+        assert(hdr[2] == (0xa00u | q) && hdr[3] == 1024);
+        for (unsigned word = 4; word < 12; word++)
+            assert(hdr[word] == (word >= 6 && word <= 8 ? 1 : 0));
+    }
+    assert(adreno8_hfi_view_cmd == adreno8_hfi_view_table + 4096);
+    assert(adreno8_hfi_view_resp == adreno8_hfi_view_table + 8192);
+    assert(adreno8_hfi_view_debug == adreno8_hfi_view_table + 12288);
     release();
     puts("Pinned vendor table, contiguous allocation, uncached views and cross-page ring publication/wrap: PASS");
 }
@@ -227,11 +244,13 @@ int main(void) {
 header = (DEV / "adreno8_wire_private.h").read_text()
 variants = {
     "baseline": (source, header),
-    "old-gmu-address": (source, header.replace("address + ADRENO8_HFI_QUEUE_OFFSET(q)", "address + 4096 * (q + 1)")),
+    "old-gmu-address": (source, header.replace("address + adreno8_hfi_queue_offset(q, ordinary)", "address + 4096 * (q + 1)")),
     "table-overwrite": (source, header.replace("memset(table, 0, ADRENO8_HFI_TABLE_DWORDS * 4u)", "memset(table, 0, 4096)")),
     "noncontiguous-allocation": (source.replace("if (b == &adreno8_gmu_hfi)", "if (false)"), header),
     "short-cpu-view": (source.replace("kvtophys(adreno8_gmu_hfi.memory), adreno8_gmu_hfi.size", "kvtophys(adreno8_gmu_hfi.memory), 4096"), header),
-    "wrong-cpu-offset": (source.replace("adreno8_hfi_view_table + ADRENO8_HFI_QUEUE_OFFSET(0);", "adreno8_hfi_view_table + 4096;"), header),
+    "wrong-cpu-offset": (source.replace("adreno8_hfi_view_table + adreno8_hfi_queue_offset(0, adreno8_direct_ring);", "adreno8_hfi_view_table + 4096;"), header),
+    "ordinary-vrb-allocation": (source.replace("if (!adreno8_direct_ring && !adreno8_gmu_hwsched_memory())", "if (!adreno8_gmu_hwsched_memory())"), header),
+    "ordinary-cpu-offset": (source.replace("adreno8_hfi_queue_offset(0, adreno8_direct_ring);", "adreno8_hfi_queue_offset(0, false);"), header),
     "missing-padding": (source.replace("i < aligned; i++", "i < dwords; i++"), header),
 }
 with tempfile.TemporaryDirectory(prefix="adreno8-hfi-layout-") as directory:

@@ -8,14 +8,14 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DEV = ROOT / "xnu/files/bsd/dev"
-ORDER = "return adreno8_gpu_prepare() && adreno8_gpu_memory_enable() && adreno8_hwsched_start();"
+ORDER = "return adreno8_gpu_prepare() && adreno8_gpu_memory_enable() &&\n\t    (adreno8_direct_ring ? adreno8_ordinary_start() : adreno8_hwsched_start());"
 
 WRAPPER_TEST = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-static bool adreno8_gpu8_keep, adreno8_gpu8_return;
+static bool adreno8_gpu8_keep, adreno8_gpu8_return, adreno8_direct_ring;
 static unsigned failure, count, retained;
 static char calls[4];
 static void record(char value) { assert(count < 3); calls[count++] = value; }
@@ -29,21 +29,25 @@ static bool adreno8_gpu_memory_enable(void) {
     return failure != 2;
 }
 static bool adreno8_hwsched_start(void) {
-    assert(count == 2 && calls[1] == 'M' && failure != 2); record('H');
+    assert(!adreno8_direct_ring && count == 2 && calls[1] == 'M' && failure != 2); record('H');
+    return failure != 3;
+}
+static bool adreno8_ordinary_start(void) {
+    assert(adreno8_direct_ring && count == 2 && calls[1] == 'M' && failure != 2); record('O');
     return failure != 3;
 }
 #define printf adreno8_say
 @@WRAPPER@@
 #undef printf
 int main(void) {
-    for (unsigned keep = 0; keep <= 1; keep++) {
+    for (unsigned direct = 0; direct <= 1; direct++) for (unsigned keep = 0; keep <= 1; keep++) {
         for (unsigned back = 0; back <= 1; back++) {
             for (failure = 0; failure <= 3; failure++) {
-                adreno8_gpu8_keep = keep; adreno8_gpu8_return = back;
+                adreno8_gpu8_keep = keep; adreno8_gpu8_return = back; adreno8_direct_ring = direct;
                 count = retained = 0; memset(calls, 0, sizeof(calls));
-                assert(adreno8_step_hwsched() == (keep && !back && !failure));
+                assert(adreno8_step_core_start() == (keep && !back && !failure));
                 if (!keep || back) { assert(!count && !retained); continue; }
-                const char *expected = failure == 1 ? "P" : failure == 2 ? "PM" : "PMH";
+                const char *expected = failure == 1 ? "P" : failure == 2 ? "PM" : direct ? "PMO" : "PMH";
                 assert(!strcmp(calls, expected) && retained == 1);
             }
         }
@@ -154,18 +158,24 @@ def compile_run(directory, source, page_size, args=(), success=True):
 
 def main():
     production = (DEV / "adreno8.c").read_text()
-    wrapper = re.search(r"static bool\nadreno8_step_hwsched\(void\)\n\{.*?\n\}", production, re.S).group()
+    wrapper = re.search(r"static bool\nadreno8_step_core_start\(void\)\n\{.*?\n\}", production, re.S).group()
     assert "adreno8_step_gx_power, adreno8_gpu_memory_verify, adreno8_gpu_cp_init" in production
     with tempfile.TemporaryDirectory(prefix="adreno8-start-order-") as directory:
         target = Path(directory)
         print(compile_run(target, WRAPPER_TEST.replace("@@WRAPPER@@", wrapper), 4096).stdout.strip())
-        for replacement in ("return adreno8_gpu_prepare() && adreno8_hwsched_start();",
-                "return adreno8_gpu_memory_enable() && adreno8_gpu_prepare() && adreno8_hwsched_start();",
-                "return adreno8_gpu_prepare() && adreno8_hwsched_start() && adreno8_gpu_memory_enable();",
-                "return adreno8_gpu_prepare() && (adreno8_gpu_memory_enable(), adreno8_hwsched_start());"):
+        selector = "(adreno8_direct_ring ? adreno8_ordinary_start() : adreno8_hwsched_start())"
+        replacements = [
+            f"return adreno8_gpu_prepare() && {selector};",
+            f"return adreno8_gpu_memory_enable() && adreno8_gpu_prepare() && {selector};",
+            f"return adreno8_gpu_prepare() && {selector} && adreno8_gpu_memory_enable();",
+            f"return adreno8_gpu_prepare() && (adreno8_gpu_memory_enable(), {selector});",
+            ORDER.replace("adreno8_direct_ring ?", "false ?"),
+            ORDER.replace("adreno8_direct_ring ?", "true ?"),
+        ]
+        for replacement in replacements:
             mutant = replace_once(wrapper, ORDER, replacement)
             compile_run(target, WRAPPER_TEST.replace("@@WRAPPER@@", mutant), 4096, success=False)
-        print("START order mutations detected: 4")
+        print("START order/mode mutations detected:", len(replacements))
         service = runpy.run_path(str(ROOT / "tools/test-adreno8-service.py"))
         base = service["base"]
         stub = replace_once(service["stub"], "    scm_calls++;", "    check_cb0_before_assign();\n    scm_calls++;")

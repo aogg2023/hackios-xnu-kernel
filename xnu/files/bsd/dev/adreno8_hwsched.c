@@ -129,7 +129,7 @@ adreno8_hwsched_request(const uint32_t *request, uint32_t words,
 bool
 adreno8_hwsched_ready(void)
 {
-	return adreno8_hwsched_started &&
+	return !adreno8_direct_ring && adreno8_hwsched_started &&
 	    (adreno8_gpu8_secure_mode != SECURE_MODE_TRANSLATION_B || !adreno8_gpu_faulted());
 }
 
@@ -139,7 +139,7 @@ adreno8_hwsched_start(void)
 	const uint32_t features[][3] = {{9, 0, 0}, {1, 1, 0}, {16, 1, 0}};
 	const uint32_t handle = 0, preemption[] = {2, 0, 0}, aqe[] = {29, 1, 0};
 
-	if (adreno8_hwsched_attempted || !adreno8_cx_ready() || !adreno8_gmu_talks ||
+	if (adreno8_direct_ring || adreno8_hwsched_attempted || !adreno8_cx_ready() || !adreno8_gmu_talks ||
 	    !adreno8_hfi_tables_sent || !adreno8_gpu8_keep || adreno8_gpu8_return) {
 		printf("adreno8: HWSCHED requires fresh HFI tables, keep=1 and return=0\n");
 		adreno8_hwsched_memory_failed();

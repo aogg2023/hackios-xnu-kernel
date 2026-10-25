@@ -316,11 +316,11 @@ INIT_STUB = r'''
 #include <string.h>
 static uint32_t requested, selected, omitted, clock_mode;
 static uint32_t keep_arg=1, return_arg;
-static uint32_t empty_powerup_arg, raw_nop_arg;
+static uint32_t empty_powerup_arg, raw_nop_arg, direct_ring_arg, secure_mode_arg;
 static uint32_t adreno8_pause_ms, adreno8_watch_seconds, adreno8_speed_asked;
 static uint32_t adreno8_gmu_from_pll, adreno8_gpu8_secure_mode, adreno8_fine;
 static uint32_t adreno8_skip_steps, adreno8_newest_step, adreno8_step;
-static bool adreno8_gpu8_keep, adreno8_gpu8_return, adreno8_gpu_stall, adreno8_cx_changed;
+static bool adreno8_gpu8_keep, adreno8_gpu8_return, adreno8_gpu_stall, adreno8_cx_changed, adreno8_direct_ring;
 static struct { uintptr_t base; } adreno8_gmu;
 static unsigned calls, holds, stopped, returned, last_stage, checks;
 static uint32_t visited;
@@ -343,6 +343,8 @@ static bool PE_parse_boot_argn(const char *key, void *out, unsigned size) {
     else if(!strcmp(key,"adreno8_return")) value=return_arg;
     else if(!strcmp(key,"adreno8_empty_powerup")) value=empty_powerup_arg;
     else if(!strcmp(key,"adreno8_raw_nop")) value=raw_nop_arg;
+    else if(!strcmp(key,"adreno8_direct_ring")) value=direct_ring_arg;
+    else if(!strcmp(key,"adreno8_secure_preflight")) value=secure_mode_arg;
     else if(!strcmp(key,"adreno8_watch")) value=0;
     else return false;
     memcpy(out,&value,sizeof(value)); return true;
@@ -365,6 +367,7 @@ static void check(uint32_t mode, uint32_t asked, uint32_t only, uint32_t skip, u
     requested=asked; selected=only; omitted=skip; clock_mode=mode;
     adreno8_gmu_from_pll=adreno8_skip_steps=adreno8_newest_step=adreno8_step=0;
     adreno8_gpu8_keep=adreno8_gpu8_return=adreno8_cx_changed=false;
+    adreno8_gpu8_secure_mode=0; adreno8_direct_ring=false;
     calls=holds=stopped=returned=last_stage=visited=0;
     adreno8_init();
     unsigned count=0;
@@ -429,6 +432,28 @@ int main(void) {
         keep_arg=1; return_arg=0; empty_powerup_arg=0;
         raw_nop_arg=1; check(mode,17,0,0,0x1ffff); raw_nop_arg=0;
     }
+    direct_ring_arg=1;
+    check(2,17,0,0,0x1ffff); assert(adreno8_direct_ring);
+    const uint32_t direct_bad_targets[]={0,5,14,16,18,22,23,UINT32_MAX};
+    for(unsigned i=0;i<sizeof(direct_bad_targets)/sizeof(*direct_bad_targets);i++)
+        check(2,direct_bad_targets[i],0,0,0);
+    check(2,17,17,0,0); check(2,17,0,1u<<5,0); check(2,17,0,1u<<31,0);
+    direct_ring_arg=2; check(2,17,0,0,0); direct_ring_arg=UINT32_MAX; check(2,17,0,0,0);
+    direct_ring_arg=1;
+    for(unsigned mode=0;mode<2;mode++) check(mode,17,0,0,0);
+    for(unsigned mode=3;mode<5;mode++) check(mode,17,0,0,0);
+    for(unsigned value=1;value<=5;value++) {
+        raw_nop_arg=value; check(2,17,0,0,0); raw_nop_arg=0;
+        empty_powerup_arg=value; check(2,17,0,0,0); empty_powerup_arg=0;
+        secure_mode_arg=value; check(2,17,0,0,0); secure_mode_arg=0;
+    }
+    secure_mode_arg=UINT32_MAX; check(2,17,0,0,0); secure_mode_arg=0;
+    for(unsigned keep=0;keep<2;keep++) for(unsigned back=0;back<2;back++) {
+        keep_arg=keep; return_arg=back;
+        check(2,17,0,0,keep && !back ? 0x1ffff : 0);
+    }
+    keep_arg=1; return_arg=0; direct_ring_arg=0;
+    check(2,17,0,0,0x1ffff); assert(!adreno8_direct_ring);
     printf("Sun init admission: %u production cases PASS\n",checks);
     return 0;
 }
@@ -549,6 +574,34 @@ def main():
             run("init-empty-powerup-" + label, INIT_STUB + phases + changed,
                 success=False, cases=INIT_CASES)
         print("Empty powerup init admission mutations rejected:", len(empty_mutations))
+
+        direct_guard = re.search(r"\tif \(direct_ring.*?\n\t}", init, re.S)[0]
+        direct_mutations = [
+            ("value", "direct_ring != 1 || ", ""),
+            ("asked", "asked != 17 || ", ""),
+            ("only", "only != 0 ||", ""),
+            ("skip", "adreno8_skip_steps != 0 || ", ""),
+            ("keep", "!adreno8_gpu8_keep || ", ""),
+            ("return", "adreno8_gpu8_return || ", ""),
+            ("raw", "raw_nop != 0 ||", ""),
+            ("empty", "empty_powerup != 0 ||", ""),
+            ("secure", "secure_mode_arg != 0 ||", ""),
+            ("clock", "adreno8_gmu_from_pll != 2", "false"),
+        ]
+        direct_cases = (INIT_CASES.split("int main(void) {", 1)[0] +
+                        "int main(void) {\n    direct_ring_arg=1;" + INIT_CASES.split("    direct_ring_arg=1;", 1)[1])
+        # Isolate direct-mode cases so the independent clock guard cannot hide a removed restriction.
+        for label, before, after in direct_mutations:
+            assert direct_guard.count(before) == 1, label
+            changed = init.replace(direct_guard, direct_guard.replace(before, after, 1), 1)
+            if label in ("asked", "only", "skip", "keep", "return"):
+                changed = changed.replace(clock_guard, clock_guard.replace("adreno8_gmu_from_pll == 2", "false"), 1)
+            if label == "secure":
+                changed = changed.replace("secure_mode_arg = one;", "secure_mode_arg = one; (void)secure_mode_arg;", 1)
+            run("init-direct-ring-" + label, INIT_STUB + phases + changed,
+                success=False, cases=direct_cases)
+        print("Direct ring init admission mutations rejected:", len(direct_mutations))
+
 
 
 if __name__ == "__main__":

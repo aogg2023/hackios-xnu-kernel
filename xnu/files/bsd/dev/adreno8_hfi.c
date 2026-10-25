@@ -2,10 +2,12 @@
 #include "adreno8_private.h"
 #include "adreno8_hwsched_private.h"
 #include "adreno8_memory_private.h"
+#include "adreno8_clock_private.h"
 
 #define printf adreno8_say
 
 static unsigned adreno8_hfi_seq;
+static bool adreno8_ordinary_attempted, adreno8_ordinary_started;
 bool adreno8_hfi_tables_sent;
 
 static vm_offset_t
@@ -106,6 +108,8 @@ adreno8_hfi_reply(uint32_t id, const uint32_t *payload, uint32_t count)
 static bool
 adreno8_hfi_failed(void)
 {
+	if (adreno8_direct_ring) adreno8_ordinary_attempted = true;
+	adreno8_ordinary_started = false;
 	adreno8_hwsched_memory_failed();
 	return false;
 }
@@ -121,7 +125,7 @@ adreno8_hfi_health(void)
 		printf("adreno8: %u: GMU fault during HFI: interrupt %#x init %#x\n", adreno8_step, irq, init);
 		return false;
 	}
-	if (adreno8_gpu8_secure_mode == SECURE_MODE_TRANSLATION_B && adreno8_gpu_faulted()) {
+	if ((adreno8_direct_ring || adreno8_gpu8_secure_mode == SECURE_MODE_TRANSLATION_B) && adreno8_gpu_faulted()) {
 		printf("adreno8: HFI stopped after an address-space fault\n");
 		return false;
 	}
@@ -169,7 +173,8 @@ adreno8_hfi_pump(uint32_t request, bool *ack, unsigned *notices)
 					if (resp[3] != 0) return false;
 				}
 				/* These HWSCHED messages share gen8_hfi_send_cmd_async's status contract. */
-				bool hwsched = id == 10 || id == 128 || id == 129 || id == 131 || id == 134;
+				bool hwsched = !adreno8_direct_ring &&
+				    (id == 10 || id == 128 || id == 129 || id == 131 || id == 134);
 				if (hwsched ? resp[2] == 0xffffffffu : resp[2] != 0) {
 					printf("adreno8: %u: HFI %u failed: %#x\n", adreno8_step, id, resp[2]);
 					return false;
@@ -187,7 +192,7 @@ adreno8_hfi_pump(uint32_t request, bool *ack, unsigned *notices)
 					printf("adreno8: %u: GMU debug type %u timestamp %u data %#x\n", adreno8_step, resp[1], resp[2], resp[3]);
 			} else if (type == 0 && (received_id == 20 || received_id == 110)) {
 				uint32_t reply[10], reply_words = 0;
-				if (id != 10 || queue != 1 ||
+				if (adreno8_direct_ring || id != 10 || queue != 1 ||
 				    !adreno8_hwsched_request(resp, (uint32_t)words, reply, &reply_words) ||
 				    !adreno8_hfi_reply(received_id, reply, reply_words)) {
 					printf("adreno8: START resource request %u failed (%d words)\n", received_id, words);
@@ -211,10 +216,12 @@ adreno8_hfi_poll(void)
 {
 	unsigned notices = 0;
 	bool ack = false;
+	if (adreno8_direct_ring && adreno8_ordinary_attempted && !adreno8_ordinary_started)
+		return adreno8_hfi_failed();
 	if (adreno8_gmu.base == 0 || adreno8_hfi_view_table == 0 ||
 	    adreno8_hfi_view_resp == 0 || adreno8_hfi_view_debug == 0 ||
 	    !adreno8_hfi_pump(0, &ack, &notices)) {
-		adreno8_hwsched_memory_failed();
+		adreno8_hfi_failed();
 		adreno8_gmu_post_mortem();
 		return false;
 	}
@@ -228,8 +235,10 @@ adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, const cha
 	uint64_t start, elapsed = 0;
 	unsigned notices = 0;
 
+	if (adreno8_direct_ring && adreno8_ordinary_attempted && !adreno8_ordinary_started)
+		return adreno8_hfi_failed();
 	if (id > 0xff || count >= ADRENO8_HFI_MAX_DWORDS || (count != 0 && payload == NULL) ||
-	    (adreno8_gpu8_secure_mode == SECURE_MODE_TRANSLATION_B && adreno8_gpu_faulted())) {
+	    ((adreno8_direct_ring || adreno8_gpu8_secure_mode == SECURE_MODE_TRANSLATION_B) && adreno8_gpu_faulted())) {
 		return adreno8_hfi_failed();
 	}
 	adreno8_hfi_seq = (adreno8_hfi_seq + 1) & 0xfff;
@@ -253,7 +262,7 @@ adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t count, const cha
 		if (ack) return true;
 		adreno8_sleep_us(100);
 	}
-	adreno8_hwsched_memory_failed();
+	adreno8_hfi_failed();
 	adreno8_gmu_post_mortem();
 	return false;
 }
@@ -487,7 +496,7 @@ adreno8_step_tables(void)
 
 /* ---- step 15: minimum DCVS request --------------------------------------------------------------- */
 
-/* HWSCHED sets default votes after START and before GPU MMU/OOB.
+/* Minimum votes follow START and precede OOB_GPU.
  * All six live K90 DT bins map 160 MHz to DDR index 2. This probe does not access GX registers. */
 bool
 adreno8_step_gx_power(void)
@@ -495,7 +504,8 @@ adreno8_step_gx_power(void)
 	uint32_t msg[3] = {1, 1, 2}; /* Blocking ACK, 160 MHz, DDR index 2; AB=0. */
 	uint32_t power;
 
-	if (!adreno8_cx_ready() || !adreno8_gmu_talks || !adreno8_hwsched_ready()) {
+	if (!adreno8_cx_ready() || !adreno8_gmu_talks ||
+	    !(adreno8_direct_ring ? adreno8_ordinary_ready() : adreno8_hwsched_ready())) {
 		return false;
 	}
 	if (!adreno8_gpu8_keep || adreno8_gpu8_return || adreno8_gx_count != 2 ||
@@ -548,4 +558,36 @@ adreno8_step_last_look(void)
 	printf("adreno8: %u: GMU diagnostics complete; log %#x, GX power/clock status %#x\n",
 	    adreno8_step, adreno8_gmu_log.address, power);
 	return true;
+}
+
+/* Ordinary HFI reaches START without HWSCHED features or host resource replies.
+ * Firmware state and all mappings remain retained until cold reset after an attempt. */
+bool
+adreno8_ordinary_start(void)
+{
+	const uint32_t ifpc[] = {9, 0, 0}, handle = 0;
+
+	if (!adreno8_direct_ring || adreno8_ordinary_attempted || adreno8_step != 14 ||
+	    adreno8_newest_step != 17 || !adreno8_cx_ready() || !adreno8_gmu_talks ||
+	    !adreno8_hfi_tables_sent || !adreno8_gpu8_keep || adreno8_gpu8_return) {
+		return adreno8_hfi_failed();
+	}
+	/* The caller serializes startup; attempted closes reentry after success or failure. */
+	adreno8_reset_required = true;
+	if (!adreno8_hfi_send(11, ifpc, 3, "disable ordinary HFI IFPC") ||
+	    !adreno8_hfi_send(14, &handle, 1, "ordinary core firmware") ||
+	    !adreno8_hfi_send(10, NULL, 0, "ordinary START") ||
+	    !adreno8_clock_started()) {
+		return adreno8_hfi_failed();
+	}
+	adreno8_ordinary_attempted = true;
+	adreno8_ordinary_started = true;
+	printf("adreno8: ordinary HFI START acknowledged; direct ring initialization is pending\n");
+	return true;
+}
+
+bool
+adreno8_ordinary_ready(void)
+{
+	return adreno8_direct_ring && adreno8_ordinary_started;
 }

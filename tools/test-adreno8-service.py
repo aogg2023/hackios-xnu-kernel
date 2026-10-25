@@ -285,8 +285,8 @@ if __name__ == "__main__":
             "hfi_failure_does_not_close": ("check.c", source.replace(
                 base["transport"], base["transport"].replace("adreno8_hwsched_memory_failed();", ""), 1), 1),
             "postmortem_before_close": ("check.c", source.replace(
-                "adreno8_hwsched_memory_failed();\n\tadreno8_gmu_post_mortem();",
-                "adreno8_gmu_post_mortem();\n\tadreno8_hwsched_memory_failed();", 1), 2),
+                "adreno8_hfi_failed();\n\tadreno8_gmu_post_mortem();",
+                "adreno8_gmu_post_mortem();\n\tadreno8_hfi_failed();", 1), 2),
             "secure_fault_reads_table": ("adreno8_smmu.c", smmu.replace(
                 "if (space == &adreno8_secure_space) {", "if (false) {", 1), 9),
             "ignore_settled_route": ("adreno8_smmu.c", smmu.replace(settled_check, "false ||", 1), 11),

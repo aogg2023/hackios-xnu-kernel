@@ -29,6 +29,8 @@ driver, replaced = re.subn(
 assert replaced == 1
 # Compile the extracted secure walker with the same production SMMU source.
 driver += "\n" + (ROOT / "xnu/files/bsd/dev/adreno8_translation.c").read_text()
+stall_parser = re.search(r'^\tadreno8_gpu_stall = PE_parse_boot_argn\("adreno8_gpu_stall".*?;$',
+    (ROOT / "xnu/files/bsd/dev/adreno8.c").read_text(), re.M).group()
 stub = r'''
 #include <assert.h>
 #include <stdarg.h>
@@ -47,6 +49,18 @@ typedef size_t vm_size_t;
 #define KERN_SUCCESS 0
 static int kernel_map;
 static unsigned adreno8_step;
+static bool adreno8_gpu_stall;
+static bool bootarg_present;
+static uint32_t bootarg_value;
+static bool PE_parse_boot_argn(const char *name, void *out, int size) {
+    assert(strcmp(name, "adreno8_gpu_stall") == 0 && size == sizeof(uint32_t));
+    if (bootarg_present) memcpy(out, &bootarg_value, size);
+    return bootarg_present;
+}
+static void parse_stall(void) {
+    uint32_t one = 0;
+''' + stall_parser + r'''
+}
 extern uint32_t adreno8_gpu8_secure_mode; /* defined by the memory harness; unused by the SMMU tests */
 ''' + structures + "\n" + constants + r'''
 /* One record per cache-clean call: address, length, and a snapshot of the
@@ -85,7 +99,7 @@ static unsigned write_log_count;
 static unsigned reads[0x40000 / 4];
 static bool sync_ok = true, atos_ok = true, atos_wait_ok = true;
 static uint32_t reject_offset = ~0u, reject_value;
-static uint32_t sctlr_raz_mask, tcr2_read_xor, s2cr_trans_raz_mask;
+static uint32_t sctlr_raz_mask, sctlr_enable_bits, tcr2_read_xor, s2cr_trans_raz_mask;
 static int alloc_fail_after = -1;
 struct allocation { uintptr_t va; size_t size; uint64_t pa; };
 static struct allocation allocations[2048];
@@ -176,7 +190,10 @@ static void adreno8_put(struct adreno8_block *b, const char *name, uint32_t offs
     write_log[write_log_count++] = (struct write_record){offset, value};
     writes++;
     if (offset == reject_offset && value == reject_value) return;
-    if (offset == 0x22000 + SMMU_CB_SCTLR) value &= ~sctlr_raz_mask;
+    if (offset >= 0x20000 && (offset & 0xfff) == SMMU_CB_SCTLR) {
+        value &= ~sctlr_raz_mask;
+        if (value & SCTLR_M) value |= sctlr_enable_bits;
+    }
     if (offset == 0x22000 + SMMU_CB_TCR2) value = (value | 0x60) ^ tcr2_read_xor;
     if (offset >= 0x20000 && (offset & 0xfff) == SMMU_CB_FSR) {
         regs[offset / 4] &= ~value;
@@ -236,6 +253,8 @@ static void reset(struct adreno8_gpu_space *space, bool atos) {
     regs[SMMU_SCR0 / 4] = 0x2e0406;
     sync_ok = atos_ok = atos_wait_ok = true;
     sctlr_raz_mask = 1u << 12;
+    sctlr_enable_bits = 0;
+    adreno8_gpu_stall = false;
     tcr2_read_xor = s2cr_trans_raz_mask = 0;
     writes = translations = ats_requests = 0;
     write_log_count = 0;
@@ -261,6 +280,14 @@ static void seed_gmu_route(void) {
 }
 int main(void) {
     struct adreno8_gpu_space space;
+    const uint32_t args[] = {0, 1, 2, UINT32_MAX};
+    for (unsigned present = 0; present <= 1; present++) {
+        for (unsigned i = 0; i < sizeof(args) / sizeof(args[0]); i++) {
+            bootarg_present = present; bootarg_value = args[i];
+            parse_stall();
+            assert(adreno8_gpu_stall == (present && args[i] == 1));
+        }
+    }
     assert(GMU_CONTEXT == 2 && adreno8_gmu_space.context == 2 && SMR_MASK == 0);
     assert(SMMU_CBA2R(1) == 0x804 && SMMU_CBA2R(2) == 0x808);
     reset(&space, false);
@@ -284,6 +311,42 @@ int main(void) {
     assert((PTE_PAGE & (3u << 10)) == (3u << 10) && (MAIR0_NORMAL & 255) == 0x44);
     assert(TCR_39_BITS == 0x803519 && TCR2_39_BITS == 0x38011);
     assert(STAGE_1 == 0x1f300);
+    assert(SCTLR_ON == 0x27 && SCTLR_CFCFG == 0x80);
+    for (unsigned stall = 0; stall <= 1; stall++) {
+        const uint32_t contexts[] = {0, GMU_CONTEXT, SECURE_CONTEXT};
+        for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+            reset(&space, false);
+            space.context = contexts[i];
+            adreno8_gpu_stall = stall;
+            map_one(&space);
+            uint32_t stream = space.context == 0 ? 0 : space.context == GMU_CONTEXT ? 5 : 2;
+            uint32_t match = space.context == 0 ? 0 : space.context == GMU_CONTEXT ? 1 : 2;
+            assert(adreno8_space_on(&space, stream, match));
+            uint32_t sctlr = regs[((0x20 + space.context) * 0x1000 + SMMU_CB_SCTLR) / 4];
+            assert(sctlr == (stall && space.context != GMU_CONTEXT ? 0xa7 : 0x27));
+            assert(!(sctlr & (1u << 6)));
+            adreno8_space_off(&space, match);
+            assert(!space.is_on);
+        }
+        /* Contexts outside the two GPU banks keep the baseline control value. */
+        assert(adreno8_smmu_sctlr(1) == 0x27 && adreno8_smmu_sctlr(20) == 0x27);
+    }
+    const uint32_t gpu_contexts[] = {0, SECURE_CONTEXT};
+    for (unsigned i = 0; i < sizeof(gpu_contexts) / sizeof(gpu_contexts[0]); i++) {
+        for (unsigned unexpected = 0; unexpected <= 1; unexpected++) {
+            reset(&space, false);
+            space.context = gpu_contexts[i];
+            adreno8_gpu_stall = true;
+            map_one(&space);
+            if (unexpected) sctlr_enable_bits = 1u << 6;
+            else sctlr_raz_mask |= SCTLR_CFCFG;
+            uint32_t match = space.context == 0 ? 0 : 2;
+            assert(!adreno8_space_on(&space, space.context == 0 ? 0 : 2, match));
+            assert(!space.is_on && space.table_count == 3 && allocation_count == 3);
+            assert(regs[SMMU_S2CR(match) / 4] == 0x20300);
+        }
+    }
+    puts("GPU stall: CB0/CB3 only, CFIE clear, exact readback and failed setup retained: PASS");
     for (unsigned bit = 8; bit <= 9; bit++) {
         reset(&space, false);
         map_one(&space);
@@ -732,3 +795,25 @@ if __name__ == "__main__":
                 if "preflight" in l:
                     print(l)
             print(f"XNU PAGE_SIZE={page_size}: PASS")
+
+        control = (ROOT / "xnu/files/bsd/dev/adreno8_smmu_private.h").read_text()
+        variants = {
+            "stall_includes_gmu": control.replace(
+                "context == 0 || context == SECURE_CONTEXT",
+                "context == 0 || context == SECURE_CONTEXT || context == GMU_CONTEXT", 1),
+            "stall_enables_interrupt": control.replace(
+                "? SCTLR_CFCFG : 0", "? (SCTLR_CFCFG | 1u << 6) : 0", 1),
+            "stall_disabled": control.replace(
+                "adreno8_gpu_stall &&", "false &&", 1),
+        }
+        for name, mutated in variants.items():
+            assert mutated != control, name
+            (target / "adreno8_smmu_private.h").write_text(mutated)
+            for page_size in (4096, 16384):
+                binary = target / f"mutant-{name}-{page_size}"
+                subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}",
+                                "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                                str(target / "check.c"), "-o", str(binary)], check=True)
+                result = subprocess.run([str(binary)], capture_output=True, text=True)
+                assert result.returncode != 0, f"mutation survived: {name}, PAGE_SIZE={page_size}"
+        print(f"GPU stall control mutations rejected: {len(variants)} for both page sizes")

@@ -65,7 +65,7 @@ static void adreno8_wr(vm_offset_t address, uint32_t value) {
         resource_replies++;
         assert(adreno8_secure_xfer_state() == SECURE_XFER_READY);
         assert(regs[SMMU_S2CR(SECURE_MATCH) / 4] == 0x303);
-        assert(regs[(0x23000 + SMMU_CB_SCTLR) / 4] == 0x27);
+        assert(regs[(0x23000 + SMMU_CB_SCTLR) / 4] == (adreno8_gpu_stall ? 0xa7 : 0x27));
         if (resource_replies == 1) {
             assert(words == 11 && (msg[0] & 0xff) == 20);
             assert(msg[2] == 0xf0000000u && msg[3] == 0 && msg[4] == 0x1007 && msg[5] == 5);
@@ -134,6 +134,8 @@ static void check_closed(unsigned calls_before, unsigned entries_before) {
 int main(int argc, char **argv) {
     unsigned scenario = argc > 1 ? (unsigned)atoi(argv[1]) : NORMAL;
     prepare();
+    adreno8_gpu_stall = argc > 2 && atoi(argv[2]) == 1;
+    assert(regs[(0x22000 + SMMU_CB_SCTLR) / 4] == 0x27);
     hmode = scenario;
     adreno8_gpu8_secure_mode = SECURE_MODE_TRANSLATION_B;
     regs[(0x23000 + SMMU_CB_FSR) / 4] = 0x400;
@@ -238,13 +240,14 @@ if __name__ == "__main__":
             subprocess.run(["cc", "-std=c11", f"-DPAGE_SIZE={page_size}",
                             "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                             str(target / "check.c"), "-o", str(binary)], check=True)
-            for scenario in range(21):
-                result = subprocess.run([str(binary), str(scenario)], capture_output=True, text=True)
-                if result.returncode:
-                    print(result.stdout)
-                    print(result.stderr)
-                    result.check_returncode()
-            print(f"Mode 4 real HFI/SCM/translation: 21 scenarios, XNU PAGE_SIZE={page_size}: PASS")
+            for stall in (0, 1):
+                for scenario in range(21):
+                    result = subprocess.run([str(binary), str(scenario), str(stall)], capture_output=True, text=True)
+                    if result.returncode:
+                        print(result.stdout)
+                        print(result.stderr)
+                        result.check_returncode()
+                print(f"Mode 4 real HFI/SCM/translation: 21 scenarios, stall={stall}, XNU PAGE_SIZE={page_size}: PASS")
 
         memory = base["driver"]
         secure = (DEV / "adreno8_secure.c").read_text()
@@ -255,7 +258,7 @@ if __name__ == "__main__":
         settled_check = ('(adreno8_get(&adreno8_smmu, "secure route settled", '
                          'SMMU_S2CR(SECURE_MATCH)) & 0x30303ff) != route ||')
         sctlr_check = ('adreno8_get(&adreno8_smmu, "secure sctlr after translate", '
-                       'cb + SMMU_CB_SCTLR) != SCTLR_ON ||')
+                       'cb + SMMU_CB_SCTLR) != sctlr ||')
         variants = {
             "secure_iova_in_normal_range": ("adreno8_memory.c", memory.replace(
                 "&adreno8_secure_space, ADRENO8_SECURE_IOVA_START, ADRENO8_SECURE_IOVA_END",

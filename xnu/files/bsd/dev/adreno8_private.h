@@ -208,6 +208,7 @@ struct adreno8_gpu_space {
 #define SMMU_CB_TLBSYNC         0x7f0
 #define SMMU_CB_TLBSTATUS       0x7f4           /* bit 0: a sync is still on its way */
 #define SCTLR_ON                (1u | 2u | 4u | 32u) /* M, TRE, AFE and CFRE; faults are polled; ASIDPNE hint disabled */
+#define SCTLR_CFCFG             (1u << 7)       /* SMMUv2 context fault configuration: stall instead of terminate */
 #define SCTLR_M                 1u              /* CB SCTLR bit 0: stage-1 translation on; the secure preflight reads only this bit of context 3 */
 #define TCR_39_BITS             (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)     /* 39 bits, three levels (dt: qcom,use-3-lvl-tables) */
 #define TCR2_39_BITS            (1u | 1u << 4 | 7u << 15) /* 36-bit PA, 16-bit ASID, upstream separation */
@@ -234,6 +235,7 @@ extern uint32_t adreno8_skip_steps;
 extern uint32_t adreno8_pause_ms;
 extern uint32_t adreno8_speed_asked;
 extern uint32_t adreno8_gmu_from_pll;
+extern bool adreno8_gpu_stall;
 extern uint32_t adreno8_step;
 extern uint32_t adreno8_newest_step;
 extern char adreno8_last_write[96];

@@ -10,4 +10,12 @@ extern uint32_t adreno8_smmu_page, adreno8_smmu_pages;
 #define SMMU_S2CR_SHCFG_NSH      (3u << 8)
 #define SMMU_TCR2_TBI            (1u << 5 | 1u << 6)
 
+/* Arm IHI 0062D.c: CFCFG selects stall fault handling; CFIE remains clear so
+ * fault registers can be polled without enabling an unhandled interrupt. */
+static inline uint32_t
+adreno8_smmu_sctlr(uint32_t context)
+{
+	return SCTLR_ON | (adreno8_gpu_stall && (context == 0 || context == SECURE_CONTEXT) ? SCTLR_CFCFG : 0);
+}
+
 #endif

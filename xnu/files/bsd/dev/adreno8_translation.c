@@ -188,7 +188,7 @@ adreno8_secure_translation_3a(struct adreno8_gpu_space *space)
 	adreno8_settle();
 	/* Retain the context even if the enable write cannot be confirmed. */
 	space->is_on = true;
-	value = SCTLR_ON;
+	value = adreno8_smmu_sctlr(SECURE_CONTEXT);
 	if (!adreno8_3a_write(cb + SMMU_CB_SCTLR, value, &read, "cb sctlr")) {
 		return adreno8_3a_stop("cb sctlr", value, read);
 	}
@@ -213,6 +213,7 @@ adreno8_secure_translation_3b(struct adreno8_gpu_space *space)
 	uint32_t cb = (adreno8_smmu_pages + SECURE_CONTEXT) * adreno8_smmu_page;
 	uint32_t route = SMMU_S2CR_SHCFG_NSH | SECURE_CONTEXT;
 	uint32_t blocked = SMMU_S2CR_FAULT | SMMU_S2CR_SHCFG_NSH;
+	uint32_t sctlr = adreno8_smmu_sctlr(SECURE_CONTEXT);
 
 	if (space != &adreno8_secure_space || !space->is_on || space->context != SECURE_CONTEXT) {
 		return false;
@@ -220,7 +221,7 @@ adreno8_secure_translation_3b(struct adreno8_gpu_space *space)
 	if (adreno8_get(&adreno8_smmu, "secure smr", SMMU_SMR(SECURE_MATCH)) !=
 	    (SMR_VALID | SMR_MASK << 16 | SECURE_STREAM) ||
 	    (adreno8_get(&adreno8_smmu, "secure route before translate", SMMU_S2CR(SECURE_MATCH)) & 0x30303ff) != blocked ||
-	    adreno8_get(&adreno8_smmu, "secure sctlr before translate", cb + SMMU_CB_SCTLR) != SCTLR_ON ||
+	    adreno8_get(&adreno8_smmu, "secure sctlr before translate", cb + SMMU_CB_SCTLR) != sctlr ||
 	    adreno8_space_faulted(space)) {
 		goto failed;
 	}
@@ -230,13 +231,13 @@ adreno8_secure_translation_3b(struct adreno8_gpu_space *space)
 	}
 	adreno8_settle();
 	if ((adreno8_get(&adreno8_smmu, "secure route settled", SMMU_S2CR(SECURE_MATCH)) & 0x30303ff) != route ||
-	    adreno8_get(&adreno8_smmu, "secure sctlr after translate", cb + SMMU_CB_SCTLR) != SCTLR_ON ||
+	    adreno8_get(&adreno8_smmu, "secure sctlr after translate", cb + SMMU_CB_SCTLR) != sctlr ||
 	    adreno8_space_faulted(space)) {
 		goto failed;
 	}
 	printf("adreno8: secure translation 3b ready: stream %u match %u context %u route %#x;"
 	    " SCTLR %#x, effective fault bits clear\n", SECURE_STREAM, SECURE_MATCH, SECURE_CONTEXT,
-	    route, SCTLR_ON);
+	    route, sctlr);
 	return true;
 failed:
 	adreno8_put(&adreno8_smmu, "secure route fault", SMMU_S2CR(SECURE_MATCH), blocked);

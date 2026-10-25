@@ -684,6 +684,7 @@ adreno8_space_on(struct adreno8_gpu_space *space, uint32_t stream, uint32_t matc
 	uint64_t root;
 	uint32_t cb, idr0, idr1, idr2, smr = SMR_VALID | SMR_MASK << 16 | stream;
 	uint32_t s2cr = SMMU_S2CR_SHCFG_NSH | space->context;
+	uint32_t sctlr = adreno8_smmu_sctlr(space->context);
 	bool atos, registers_ok;
 
 	adreno8_announce("configure %s SMMU context %u and verify its page mappings", space->name, space->context);
@@ -739,10 +740,10 @@ adreno8_space_on(struct adreno8_gpu_space *space, uint32_t stream, uint32_t matc
 	if (!adreno8_space_sync(space)) {
 		goto fail;
 	}
-	adreno8_put(&adreno8_smmu, "cb sctlr", cb + SMMU_CB_SCTLR, SCTLR_ON);
+	adreno8_put(&adreno8_smmu, "cb sctlr", cb + SMMU_CB_SCTLR, sctlr);
 	adreno8_settle();
 	/* TBI0/1 can read as one on MMU-500; all IOVAs here are untagged 32-bit values. */
-	registers_ok = adreno8_get(&adreno8_smmu, "cb sctlr", cb + SMMU_CB_SCTLR) == SCTLR_ON;
+	registers_ok = adreno8_get(&adreno8_smmu, "cb sctlr", cb + SMMU_CB_SCTLR) == sctlr;
 	registers_ok &= adreno8_get(&adreno8_smmu, "cb a2r", adreno8_smmu_page + SMMU_CBA2R(space->context)) == 1;
 	registers_ok &= adreno8_get(&adreno8_smmu, "cb bar", adreno8_smmu_page + SMMU_CBAR(space->context)) == STAGE_1;
 	registers_ok &= (adreno8_get(&adreno8_smmu, "cb tcr2", cb + SMMU_CB_TCR2) & ~SMMU_TCR2_TBI) == TCR2_39_BITS;

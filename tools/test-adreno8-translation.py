@@ -16,11 +16,13 @@ stub = fixture["stub"].replace(
 stub = stub.replace("aligned_alloc(PAGE_SIZE, size)",
                     "aligned_alloc(16384, (size + 16383) & ~(size_t)16383)")
 stub = stub.replace("static uint32_t reject_offset = ~0u, reject_value;",
-                    "static uint32_t reject_offset = ~0u, reject_value, fsr_after_enable;")
+                    "static uint32_t reject_offset = ~0u, reject_value, fsr_after_enable, sctlr_after_route_xor;")
 stub = stub.replace("    regs[offset / 4] = value;",
     "    regs[offset / 4] = value;\n"
-    "    if (offset == 0x23000 + SMMU_CB_SCTLR && value == SCTLR_ON)\n"
-    "        regs[(0x23000 + SMMU_CB_FSR) / 4] |= fsr_after_enable;")
+    "    if (offset == 0x23000 + SMMU_CB_SCTLR && (value & SCTLR_M))\n"
+    "        regs[(0x23000 + SMMU_CB_FSR) / 4] |= fsr_after_enable;\n"
+    "    if (offset == SMMU_S2CR(SECURE_MATCH) && value == 0x303)\n"
+    "        regs[(0x23000 + SMMU_CB_SCTLR) / 4] ^= sctlr_after_route_xor;")
 tests = r'''
 #include <sys/mman.h>
 static const uint32_t mapping_size = 0x138000;
@@ -146,6 +148,43 @@ int main(void) {
     assert(regs[(0x23000 + SMMU_CB_SCTLR) / 4] == 0);
     puts("secure context writes: each failed readback stops, TLB timeout stops before enable: PASS");
 
+    for (unsigned stall = 0; stall <= 1; stall++) {
+        prepare();
+        adreno8_gpu_stall = stall;
+        assert(adreno8_secure_translation_3a(&adreno8_secure_space));
+        assert(regs[(0x23000 + SMMU_CB_SCTLR) / 4] == (stall ? 0xa7 : 0x27));
+        assert(adreno8_secure_translation_3b(&adreno8_secure_space));
+        assert(regs[SMMU_S2CR(SECURE_MATCH) / 4] == 0x303);
+    }
+    for (unsigned unexpected = 0; unexpected <= 1; unexpected++) {
+        prepare();
+        adreno8_gpu_stall = true;
+        if (unexpected) sctlr_enable_bits = 1u << 6;
+        else sctlr_raz_mask |= SCTLR_CFCFG;
+        assert(!adreno8_secure_translation_3a(&adreno8_secure_space));
+        assert(adreno8_secure_space.is_on && regs[SMMU_S2CR(SECURE_MATCH) / 4] == 0x20300);
+        assert(write_log[write_log_count - 1].offset == 0x23000 + SMMU_CB_SCTLR);
+    }
+    const uint32_t sctlr_damage[] = {SCTLR_CFCFG, 1u << 6};
+    for (unsigned i = 0; i < sizeof(sctlr_damage) / sizeof(sctlr_damage[0]); i++) {
+        for (unsigned after_route = 0; after_route <= 1; after_route++) {
+            prepare();
+            adreno8_gpu_stall = true;
+            assert(adreno8_secure_translation_3a(&adreno8_secure_space));
+            if (after_route) sctlr_after_route_xor = sctlr_damage[i];
+            else regs[(0x23000 + SMMU_CB_SCTLR) / 4] ^= sctlr_damage[i];
+            unsigned route_writes = write_log_count;
+            assert(!adreno8_secure_translation_3b(&adreno8_secure_space));
+            assert(adreno8_secure_space.is_on && regs[SMMU_S2CR(SECURE_MATCH) / 4] == 0x20300);
+            if (!after_route) {
+                for (unsigned j = route_writes; j < write_log_count; j++)
+                    assert(write_log[j].offset != SMMU_S2CR(SECURE_MATCH) || write_log[j].value != 0x303);
+            }
+            sctlr_after_route_xor = 0;
+        }
+    }
+    puts("secure stall: 3a/3b exact control value, missing CFCFG and extra CFIE stop and retain: PASS");
+
     /* SMMUv2 FSR.Format [10:9] is read-only. Format 0b10 selects AArch64;
      * it remains set after W1C and must not prevent either validation step. */
     prepare();
@@ -153,24 +192,28 @@ int main(void) {
     assert(adreno8_secure_translation_3a(&adreno8_secure_space));
     assert(regs[(0x23000 + SMMU_CB_FSR) / 4] == 0x400);
     assert(!adreno8_space_faulted(&adreno8_secure_space));
-    for (unsigned bit = 0; bit < 32; bit++) {
-        uint32_t fault = 1u << bit;
-        if (!(fault & FSR_ALL)) continue;
-        prepare();
-        regs[(0x23000 + SMMU_CB_FSR) / 4] = 0x400 | fault;
-        reject_offset = 0x23000 + SMMU_CB_FSR;
-        reject_value = FSR_ALL;
-        assert(!adreno8_secure_translation_3a(&adreno8_secure_space));
-        assert(!adreno8_secure_space.is_on);
-        assert(write_log[write_log_count - 1].offset == reject_offset);
-        assert(adreno8_space_faulted(&adreno8_secure_space));
-        prepare();
-        regs[(0x23000 + SMMU_CB_FSR) / 4] = 0x400;
-        fsr_after_enable = fault;
-        assert(!adreno8_secure_translation_3a(&adreno8_secure_space));
-        assert(adreno8_secure_space.is_on);
-        assert(adreno8_space_faulted(&adreno8_secure_space));
-        fsr_after_enable = 0;
+    for (unsigned stall = 0; stall <= 1; stall++) {
+        for (unsigned bit = 0; bit < 32; bit++) {
+            uint32_t fault = 1u << bit;
+            if (!(fault & FSR_ALL)) continue;
+            prepare();
+            adreno8_gpu_stall = stall;
+            regs[(0x23000 + SMMU_CB_FSR) / 4] = 0x400 | fault;
+            reject_offset = 0x23000 + SMMU_CB_FSR;
+            reject_value = FSR_ALL;
+            assert(!adreno8_secure_translation_3a(&adreno8_secure_space));
+            assert(!adreno8_secure_space.is_on);
+            assert(write_log[write_log_count - 1].offset == reject_offset);
+            assert(adreno8_space_faulted(&adreno8_secure_space));
+            prepare();
+            adreno8_gpu_stall = stall;
+            regs[(0x23000 + SMMU_CB_FSR) / 4] = 0x400;
+            fsr_after_enable = fault;
+            assert(!adreno8_secure_translation_3a(&adreno8_secure_space));
+            assert(adreno8_secure_space.is_on);
+            assert(adreno8_space_faulted(&adreno8_secure_space));
+            fsr_after_enable = 0;
+        }
     }
     puts("secure FSR: AArch64 format accepted; every fault bit stops before/after enable: PASS");
 
@@ -224,6 +267,14 @@ if __name__ == "__main__":
         walker = (ROOT / "xnu/files/bsd/dev/adreno8_translation.c").read_text()
         smmu = fixture["driver"][:-len(walker)]
         variants = {
+            "omit_stall_in_3a": smmu + walker.replace(
+                "value = adreno8_smmu_sctlr(SECURE_CONTEXT);", "value = SCTLR_ON;", 1),
+            "ignore_pre_route_sctlr": smmu + walker.replace(
+                'adreno8_get(&adreno8_smmu, "secure sctlr before translate", '
+                'cb + SMMU_CB_SCTLR) != sctlr', 'false', 1),
+            "ignore_post_route_sctlr": smmu + walker.replace(
+                'adreno8_get(&adreno8_smmu, "secure sctlr after translate", '
+                'cb + SMMU_CB_SCTLR) != sctlr', 'false', 1),
             "reject_format_as_fault": (smmu + walker).replace(
                 "if ((read & FSR_ALL) != 0) {", "if (read != 0) {", 1),
             "ignore_pre_enable_fault": (smmu + walker).replace(

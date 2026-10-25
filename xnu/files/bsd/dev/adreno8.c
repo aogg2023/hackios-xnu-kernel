@@ -46,7 +46,9 @@
  * adreno8_cbscan=1    diagnostic only: after the step-8 SMMU read, print context-bank 0-5 and
  *                  20 registers (SCTLR, TTBR0, TCR, FSR) and read context 3's SCTLR twice;
  *                  read-only, the values enter no decision, off unless asked
- * adreno8_speed=N     GX operating point; only 1 (125 MHz) is exposed before SKU selection
+ * adreno8_gpu_stall=1  diagnostic only: stall faults in GPU contexts 0 and 3; poll fault
+ *                  registers with context fault interrupts disabled; GMU context 2 is unchanged
+ * adreno8_speed=N     GX operating point; only 1 (160 MHz) is exposed before SKU selection
  * adreno8_gmuclk=1    select the GPU PLL clock parent; default uses the crystal
  * adreno8_return=1    return to the resident loader after cleanup
  *
@@ -72,6 +74,8 @@ uint32_t adreno8_skip_steps, adreno8_pause_ms = 2200, adreno8_fine, adreno8_watc
 uint32_t adreno8_speed_asked;                  /* adreno8_speed: 1 lowest (step 15) */
 
 uint32_t adreno8_gmu_from_pll;                 /* adreno8_gmuclk=1 */
+
+bool adreno8_gpu_stall;                        /* adreno8_gpu_stall=1 */
 
 uint32_t adreno8_step;                         /* the one being performed */
 
@@ -362,6 +366,8 @@ adreno8_init(void)
 	}
 	one = 0;
 	adreno8_fine = PE_parse_boot_argn("adreno8_fine", &one, sizeof(one)) && one != 0;
+	one = 0;
+	adreno8_gpu_stall = PE_parse_boot_argn("adreno8_gpu_stall", &one, sizeof(one)) && one == 1;
 	PE_parse_boot_argn("adreno8_skip", &adreno8_skip_steps, sizeof(adreno8_skip_steps));
 	if (asked > count) {
 		asked = count;

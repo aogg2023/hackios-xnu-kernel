@@ -25,8 +25,9 @@ static vm_offset_t adreno8_hfi_view_table, adreno8_hfi_view_cmd;
 static vm_offset_t adreno8_hfi_view_resp, adreno8_hfi_view_debug;
 static unsigned adreno8_step, scenario, sleeps, failures, response_reads, barriers, diagnostic_calls;
 static unsigned memory_failures, feature_logs;
+static bool publication_pending;
 static char feature_log[160];
-static uint64_t clock_ns;
+static uint64_t clock_ns, publication_ns;
 static uint32_t sent_header;
 #define GMU_HOST2GMU_SET 0
 #define GMU_GMU2HOST_INFO 4
@@ -44,6 +45,7 @@ static int adreno8_say(const char *format, ...) {
     return 0;
 }
 static void adreno8_announce(const char *format, ...) {
+    assert(!publication_pending);
     (void)format; diagnostic_calls++; clock_ns += 2000000000ULL;
 }
 #define printf adreno8_say
@@ -71,7 +73,12 @@ static uint32_t adreno8_rd(vm_offset_t address) {
 }
 static void adreno8_wr(vm_offset_t address, uint32_t value) {
     *(uint32_t *)address = value;
+    if (address == (uintptr_t)(table + ADRENO8_HFI_HEADER(0) + 11)) {
+        publication_pending = true; publication_ns = clock_ns;
+    }
     if (address != adreno8_gmu.base + GMU_HOST2GMU_SET) return;
+    assert(publication_pending && clock_ns == publication_ns);
+    publication_pending = false;
     assert(barriers >= 2);
     sent_header = command[0];
     switch (scenario) {
@@ -133,6 +140,7 @@ static void reset(unsigned test) {
     adreno8_hfi_view_resp = (uintptr_t)response;
     adreno8_hfi_view_debug = (uintptr_t)debug;
     scenario = test; sleeps = failures = response_reads = barriers = diagnostic_calls = 0;
+    publication_pending = false;
     memory_failures = feature_logs = 0; feature_log[0] = 0;
     clock_ns = 0;
 }
@@ -190,9 +198,9 @@ int main(void) {
     assert(!adreno8_hfi_send(14, msg, UINT32_MAX, "test"));
     assert(!adreno8_hfi_send(14, msg, 255, "test"));
     reset(1); assert(adreno8_hfi_send(131, msg, 2, "RAW diagnostic pauses"));
-    assert(clock_ns == 4000000000ULL && diagnostic_calls == 2 && sleeps == 0);
+    assert(clock_ns == 2000000000ULL && diagnostic_calls == 1 && sleeps == 0);
     reset(0); assert(!adreno8_hfi_send(131, msg, 2, "RAW timeout after pauses"));
-    assert(clock_ns == 5000000000ULL && diagnostic_calls == 2 && sleeps == 10000);
+    assert(clock_ns == 3000000000ULL && diagnostic_calls == 1 && sleeps == 10000);
     const uint32_t feature[3] = {1, 1, 0};
     for (unsigned i = 14; i <= 17; i++) {
         reset(i); assert(!adreno8_hfi_send(11, feature, 3, "FEATURE_CTRL v5 rejected"));
@@ -398,6 +406,11 @@ int main(void) {
 '''
 
 checks = [("queues", SOURCE, False), ("power tables", STAGE_SOURCE, False)]
+publication = "\tadreno8_wr(header + 44, write);\n\tadreno8_settle();\n"
+assert SOURCE.count(publication) == 1
+for label, delayed in (("pause after producer", 'adreno8_announce("published");'),
+                       ("delay after producer", "adreno8_sleep_us(1);")):
+    checks.append((label, SOURCE.replace(publication, publication + "\t" + delayed + "\n", 1), True))
 feature_mutations = [
     ("missing FEATURE_CTRL error", "if (resp[3] != 0) return false;", "if (false) return false;"),
     ("limited FEATURE_CTRL errors", "if (resp[3] != 0) return false;", "if (resp[3] == 6 || resp[3] == 8) return false;"),
@@ -444,3 +457,4 @@ for label, source, rejected in checks:
             print(result.stdout, end="")
 print("HFI power encoding mutations rejected:", len(vote_mutations))
 print("HFI FEATURE_CTRL v5 mutations rejected:", len(feature_mutations) + 1)
+print("HFI publication timing mutations rejected: 2")

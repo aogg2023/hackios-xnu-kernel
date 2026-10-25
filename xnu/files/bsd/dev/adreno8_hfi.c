@@ -48,11 +48,12 @@ adreno8_queue_write(const uint32_t *msg, uint32_t dwords)
 	adreno8_settle();
 	bool raw = (msg[0] & 0x000f00ffu) == 131;
 	if (raw) adreno8_announce("RAW131 payload ready: %u dwords; producer publication follows", dwords);
+	/* Firmware can observe the published producer before notification. Keep
+	 * diagnostics outside the vendor's producer/barrier/doorbell sequence. */
 	adreno8_wr(header + 44, write);
 	adreno8_settle();
-	if (raw) adreno8_announce("RAW131 producer published at %u; doorbell follows", write);
 	adreno8_wr(adreno8_gmu.base + GMU_HOST2GMU_SET, 1);
-	if (raw) printf("adreno8: RAW131 doorbell write returned\n");
+	if (raw) printf("adreno8: RAW131 producer %u and doorbell writes returned\n", write);
 	return true;
 }
 

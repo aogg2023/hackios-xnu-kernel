@@ -40,7 +40,13 @@
  *                  secure page-table pages, then the GPU memory path stops; mode 0 and
  *                  unknown values stop after the preflight with the closed-path log; none
  *                  of the modes replies to MEM_ALLOC, writes CB3 or hands addresses to the
- *                  firmware
+ *                  firmware; 3 (3a) goes on to point context 3 at the handed-over tables,
+ *                  switch it on and keep stream 2's route faulting, with register read-backs
+ *                  and a clear FSR as the only proof; 4 (3b) is reserved for the routing
+ *                  switch and the MEM_ALLOC reply and is not implemented in this kernel
+ * adreno8_cbscan=1    diagnostic only: after the step-8 SMMU read, print context-bank 0-5 and
+ *                  20 registers (SCTLR, TTBR0, TCR, FSR) and read context 3's SCTLR twice;
+ *                  read-only, the values enter no decision, off unless asked
  * adreno8_speed=N     GX operating point; only 1 (125 MHz) is exposed before SKU selection
  * adreno8_gmuclk=1    select the GPU PLL clock parent; default uses the crystal
  * adreno8_return=1    return to the resident loader after cleanup
@@ -345,11 +351,15 @@ adreno8_init(void)
 	adreno8_gpu8_return = PE_parse_boot_argn("adreno8_return", &one, sizeof(one)) && one != 0;
 	one = 0;
 	if (PE_parse_boot_argn("adreno8_secure_preflight", &one, sizeof(one))) {
-		if (one <= SECURE_MODE_HANDOVER) {
+		if (one <= SECURE_MODE_TRANSLATION_B) {
 			adreno8_gpu8_secure_mode = one;
 		} else {
 			printf("adreno8: adreno8_secure_preflight=%u is not a known mode; the secure path stays off\n", one);
 		}
+	}
+	one = 0;
+	if (PE_parse_boot_argn("adreno8_cbscan", &one, sizeof(one)) && one != 0) {
+		adreno8_smmu_cb_scan_ask();
 	}
 	one = 0;
 	adreno8_fine = PE_parse_boot_argn("adreno8_fine", &one, sizeof(one)) && one != 0;

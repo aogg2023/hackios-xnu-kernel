@@ -412,7 +412,11 @@ adreno8_step_gmu_space(void)
 			return false;
 		}
 	}
-	return adreno8_space_on(&adreno8_gmu_space, GMU_STREAM, GMU_MATCH);
+	if (!adreno8_space_on(&adreno8_gmu_space, GMU_STREAM, GMU_MATCH)) {
+		return false;
+	}
+	adreno8_smmu_cb_scan_after_step9();
+	return true;
 }
 
 /* ---- step 10: the firmware itself ------------------------------------------------------------------------- */

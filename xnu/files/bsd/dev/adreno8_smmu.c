@@ -43,6 +43,86 @@ adreno8_smmu_layout(void)
 	return true;
 }
 
+/* Diagnostic-only context-bank dump (boot-args adreno8_cbscan=1). Reads a
+ * few context banks so the log shows whether one holds a configuration, is
+ * uninitialised, or cannot be read at all; the values never enter a decision
+ * and no register is written. Contexts are grouped to answer three questions:
+ * 0..3 are the vendor-reserved and own contexts named at step 8, 4 and 5 are
+ * implemented but unused by HLOS, and 20 is the last implemented context.
+ * Called twice: after the step-8 read and again once step 9 has configured the
+ * GMU context, so the second dump carries a context bank whose write is known
+ * to have landed and reads CB3 at the state the step-14 preflight judges. */
+static uint32_t adreno8_cbscan_asked;
+static bool adreno8_cbscan_done;   /* the step-8 dump, once: that read runs more than once */
+
+void
+adreno8_smmu_cb_scan_ask(void)
+{
+	adreno8_cbscan_asked = 1;
+}
+
+static void
+adreno8_cb_scan_one(uint32_t cb, const char *role)
+{
+	uint32_t base;
+
+	if (cb >= adreno8_smmu_contexts) {
+		printf("adreno8: %u: cbscan context %u (%s): not implemented in this SMMU (%u contexts); skipped\n",
+		    adreno8_step, cb, role, adreno8_smmu_contexts);
+		return;
+	}
+	base = (adreno8_smmu_pages + cb) * adreno8_smmu_page;
+	if ((adreno8_smmu_pages + cb + 1) * adreno8_smmu_page > adreno8_smmu.size) {
+		printf("adreno8: %u: cbscan context %u (%s) at %#x: past the mapped SMMU block (%u bytes); skipped\n",
+		    adreno8_step, cb, role, base, adreno8_smmu.size);
+		return;
+	}
+	printf("adreno8: %u: cbscan context %u (%s) at %#x\n", adreno8_step, cb, role, base);
+	adreno8_get(&adreno8_smmu, "cbscan sctlr", base + SMMU_CB_SCTLR);
+	adreno8_get(&adreno8_smmu, "cbscan ttbr0, low", base + SMMU_CB_TTBR0);
+	adreno8_get(&adreno8_smmu, "cbscan ttbr0, high", base + SMMU_CB_TTBR0 + 4);
+	adreno8_get(&adreno8_smmu, "cbscan tcr", base + SMMU_CB_TCR);
+	adreno8_get(&adreno8_smmu, "cbscan fsr", base + SMMU_CB_FSR);
+}
+
+static void
+adreno8_cb_scan(const char *when)
+{
+	volatile uint32_t spin;
+
+	adreno8_announce("cbscan (%s): read-only context-bank dump; no register is written and no value is judged", when);
+	adreno8_cb_scan_one(0, "GPU SID 0, vendor reserved");
+	adreno8_cb_scan_one(1, "LPAC SID 1, vendor reserved");
+	adreno8_cb_scan_one(GMU_CONTEXT, "GMU, ours; 0x27 once step 9 has run");
+	adreno8_cb_scan_one(SECURE_CONTEXT, "gfx3d_secure candidate");
+	adreno8_cb_scan_one(4, "implemented, unused by HLOS");
+	adreno8_cb_scan_one(5, "implemented, unused by HLOS");
+	adreno8_cb_scan_one(20, "last implemented context, boundary");
+
+	/* The same register a second time after a short delay: a repeatable value
+	 * supports "programmed by someone", a moving one supports "not readable". */
+	if (SECURE_CONTEXT < adreno8_smmu_contexts) {
+		uint32_t base = (adreno8_smmu_pages + SECURE_CONTEXT) * adreno8_smmu_page;
+
+		if ((adreno8_smmu_pages + SECURE_CONTEXT + 1) * adreno8_smmu_page <= adreno8_smmu.size) {
+			for (spin = 0; spin < 400000u; spin++) {
+			}
+			adreno8_get(&adreno8_smmu, "cbscan sctlr, second read", base + SMMU_CB_SCTLR);
+		}
+	}
+}
+
+/* Called once step 9 has written the GMU context's SCTLR: from here the dump
+ * carries a context bank whose configuration is known to have taken effect. */
+void
+adreno8_smmu_cb_scan_after_step9(void)
+{
+	if (!adreno8_cbscan_asked) {
+		return;
+	}
+	adreno8_cb_scan("post-step-9");
+}
+
 bool
 adreno8_step_smmu_read(void)
 {
@@ -88,6 +168,10 @@ adreno8_step_smmu_read(void)
 		adreno8_get(&adreno8_smmu, "cb ttbr0, high", base + SMMU_CB_TTBR0 + 4);
 		adreno8_get(&adreno8_smmu, "cb tcr", base + SMMU_CB_TCR);
 		adreno8_get(&adreno8_smmu, "cb fsr", base + SMMU_CB_FSR);
+	}
+	if (adreno8_cbscan_asked && !adreno8_cbscan_done) {
+		adreno8_cbscan_done = true;
+		adreno8_cb_scan("after step 8");
 	}
 	return true;
 }
@@ -736,5 +820,148 @@ adreno8_space_faulted(struct adreno8_gpu_space *space)
 	    adreno8_rd(adreno8_smmu.base + cb + SMMU_CB_SCTLR),
 	    leaf != NULL ? ((uint64_t *)leaf->table)[address >> 12 & 0x1ff] : 0,
 	    adreno8_rd(adreno8_smmu.base + SMMU_SGFSR));
+	return true;
+}
+
+/*
+ * Mode 3 (3a): point secure context 3 at the tables just handed over and switch it on,
+ * leaving stream 2's route at fault so no transaction reaches it. The proofs a
+ * write-restricted path can give are all here: the IOVA resolves to the buffer's page in a
+ * software walk (run before the handover, see adreno8_secure_translation_walk), every
+ * write reads back, the TLB invalidate completes, and FSR is clear. This SMMU reports
+ * IDR0.ATOSNS=1, so ATS1PR/ATSR cannot add a hardware translation proof; only the
+ * firmware's own traffic in 3b can.
+ *
+ * A failed step stops here. Context 3's registers are not put back: the bank was not
+ * enabled before this attempt, and a write-back could not prove the secure world never
+ * used it, so the extra write buys nothing and touches a bank that may not be ours.
+ */
+static bool
+adreno8_3a_write(uint32_t offset, uint32_t value, uint32_t *read_out, const char *name)
+{
+	adreno8_put(&adreno8_smmu, name, offset, value);
+	*read_out = adreno8_get(&adreno8_smmu, name, offset);
+	printf("adreno8: %u: 3a %s (%#x) write %#010x read %#010x\n", adreno8_step, name,
+	    adreno8_smmu.phys + offset, value, *read_out);
+	return *read_out == value;
+}
+
+static bool
+adreno8_3a_stop(const char *name, uint32_t wrote, uint32_t read)
+{
+	printf("adreno8: %u: secure translation 3a stopped at %s: wrote %#010x, reads %#010x;"
+	    " context %u left as it is, stream %u stays faulted\n", adreno8_step, name, wrote, read,
+	    SECURE_CONTEXT, SECURE_STREAM);
+	return false;
+}
+
+/* Software walk, run while the pages are still the kernel's: the buffer's IOVA must
+ * resolve to the buffer's first page through the secure space's own table chain. */
+bool
+adreno8_secure_translation_walk(struct adreno8_gpu_space *space, uint32_t iova, vm_offset_t memory)
+{
+	uint64_t *entry = adreno8_space_entry(space, iova);
+	uint64_t phys = kvtophys(memory);
+
+	if (entry == NULL || (phys & (SMMU_GRANULE - 1)) != 0 ||
+	    (*entry & PTE_ADDRESS) != (phys & PTE_ADDRESS)) {
+		printf("adreno8: %u: secure translation 3a: IOVA %#x does not resolve to the buffer's"
+		    " page (PTE %#llx, PA %#llx)\n", adreno8_step, iova,
+		    entry != NULL ? *entry : 0, phys);
+		return false;
+	}
+	printf("adreno8: %u: secure translation 3a: table walk of IOVA %#x resolves to PA %#llx\n",
+	    adreno8_step, iova, phys);
+	return true;
+}
+
+bool
+adreno8_secure_translation_3a(struct adreno8_gpu_space *space)
+{
+	uint32_t cb = (adreno8_smmu_pages + SECURE_CONTEXT) * adreno8_smmu_page;
+	uint64_t root = space->tables[0].phys | (uint64_t)space->context << 48;
+	uint32_t read, value;
+
+	adreno8_announce("secure translation 3a: context %u pointed at the handed-over tables and"
+	    " switched on; stream %u stays faulted", SECURE_CONTEXT, SECURE_STREAM);
+	/* Claim the route slot as fault first: the SMR write below then cannot expose a
+	 * translate entry before the context holds our tables. */
+	value = SMMU_S2CR_FAULT | SMMU_S2CR_SHCFG_NSH;
+	if (!adreno8_3a_write(SMMU_S2CR(SECURE_MATCH), value, &read, "s2cr fault") ||
+	    (read & 0x30000) != SMMU_S2CR_FAULT) {
+		return adreno8_3a_stop("s2cr fault", value, read);
+	}
+	value = SMR_VALID | SMR_MASK << 16 | SECURE_STREAM;
+	if (!adreno8_3a_write(SMMU_SMR(SECURE_MATCH), value, &read, "smr")) {
+		return adreno8_3a_stop("smr", value, read);
+	}
+	/* Ownership probe: a bank this kernel may write reads back the zero just written. */
+	value = 0;
+	if (!adreno8_3a_write(cb + SMMU_CB_SCTLR, value, &read, "cb sctlr disabled")) {
+		return adreno8_3a_stop("cb sctlr disabled", value, read);
+	}
+	/* CBAR selects stage 1 alone, CBA2R makes TTBR0 a 64-bit register (without it the
+	 * high half of the root address need not take effect), MAIR0 supplies attribute
+	 * index 0 which every PTE of this space uses. */
+	value = STAGE_1;
+	if (!adreno8_3a_write(adreno8_smmu_page + SMMU_CBAR(SECURE_CONTEXT), value, &read, "cb bar")) {
+		return adreno8_3a_stop("cb bar", value, read);
+	}
+	value = 1;
+	if (!adreno8_3a_write(adreno8_smmu_page + SMMU_CBA2R(SECURE_CONTEXT), value, &read, "cb a2r")) {
+		return adreno8_3a_stop("cb a2r", value, read);
+	}
+	 /* TBI0/1 may read as one; the same allowance adreno8_space_on makes. */
+	adreno8_put(&adreno8_smmu, "cb tcr2", cb + SMMU_CB_TCR2, TCR2_39_BITS);
+	read = adreno8_get(&adreno8_smmu, "cb tcr2", cb + SMMU_CB_TCR2);
+	printf("adreno8: %u: 3a cb tcr2 (%#x) write %#010x read %#010x\n", adreno8_step,
+	    adreno8_smmu.phys + cb + SMMU_CB_TCR2, TCR2_39_BITS, read);
+	if ((read & ~SMMU_TCR2_TBI) != TCR2_39_BITS) {
+		return adreno8_3a_stop("cb tcr2", TCR2_39_BITS, read);
+	}
+	if (!adreno8_3a_write(cb + SMMU_CB_TCR, TCR_39_BITS, &read, "cb tcr")) {
+		return adreno8_3a_stop("cb tcr", TCR_39_BITS, read);
+	}
+	if (!adreno8_3a_write(cb + SMMU_CB_TTBR0, (uint32_t)root, &read, "cb ttbr0, low")) {
+		return adreno8_3a_stop("cb ttbr0, low", (uint32_t)root, read);
+	}
+	value = (uint32_t)(root >> 32);
+	if (!adreno8_3a_write(cb + SMMU_CB_TTBR0 + 4, value, &read, "cb ttbr0, high")) {
+		return adreno8_3a_stop("cb ttbr0, high", value, read);
+	}
+	if (!adreno8_3a_write(cb + SMMU_CB_MAIR0, MAIR0_NORMAL, &read, "cb mair0")) {
+		return adreno8_3a_stop("cb mair0", MAIR0_NORMAL, read);
+	}
+	/* A stale fault bit would colour every later reading; this space owns no traffic yet. */
+	adreno8_put(&adreno8_smmu, "cb fsr", cb + SMMU_CB_FSR, FSR_ALL);
+	read = adreno8_get(&adreno8_smmu, "cb fsr", cb + SMMU_CB_FSR);
+	printf("adreno8: %u: 3a cb fsr (%#x) write %#010x read %#010x\n", adreno8_step,
+	    adreno8_smmu.phys + cb + SMMU_CB_FSR, FSR_ALL, read);
+	if (read != 0) {
+		return adreno8_3a_stop("cb fsr", FSR_ALL, read);
+	}
+	adreno8_settle();
+	adreno8_put(&adreno8_smmu, "cb tlb asid", cb + SMMU_CB_TLBASID, SECURE_CONTEXT);
+	adreno8_put(&adreno8_smmu, "cb tlb sync", cb + SMMU_CB_TLBSYNC, 1);
+	if (!adreno8_wait_for(&adreno8_smmu, cb + SMMU_CB_TLBSTATUS, 1, 0, 100)) {
+		printf("adreno8: %u: secure translation 3a stopped at the TLB invalidate: context %u"
+		    " TLBSTATUS did not clear\n", adreno8_step, SECURE_CONTEXT);
+		return false;
+	}
+	adreno8_settle();
+	value = SCTLR_ON;
+	if (!adreno8_3a_write(cb + SMMU_CB_SCTLR, value, &read, "cb sctlr")) {
+		return adreno8_3a_stop("cb sctlr", value, read);
+	}
+	adreno8_settle();
+	read = adreno8_get(&adreno8_smmu, "cb fsr after enable", cb + SMMU_CB_FSR);
+	printf("adreno8: %u: 3a cb fsr after enable (%#x) read %#010x\n", adreno8_step,
+	    adreno8_smmu.phys + cb + SMMU_CB_FSR, read);
+	if ((read & FSR_ALL) != 0) {
+		return adreno8_3a_stop("cb fsr after enable", 0, read);
+	}
+	printf("adreno8: %u: secure translation 3a ready: context %u enabled, stream %u still"
+	    " faulted, root PA %#llx\n", adreno8_step, SECURE_CONTEXT, SECURE_STREAM,
+	    space->tables[0].phys);
 	return true;
 }

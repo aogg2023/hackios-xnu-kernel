@@ -112,7 +112,7 @@ adreno8_memory_alloc(const char *name, uint32_t size, uint32_t alignment,
  */
 static struct adreno8_memory *
 adreno8_memory_alloc_xfer(const char *name, uint32_t size, uint32_t alignment,
-    uint32_t gpu_prot, uint64_t allocated)
+    uint32_t gpu_prot, uint64_t allocated, bool translate)
 {
 	struct adreno8_memory_entry *entry;
 	struct adreno8_memory *buffer;
@@ -157,9 +157,23 @@ adreno8_memory_alloc_xfer(const char *name, uint32_t size, uint32_t alignment,
 		adreno8_secure_xfer_abort();
 		return NULL;
 	}
+	/* Mode 3/4: prove the IOVA resolves through our own tables while the pages are
+	 * still the kernel's; after the handover the CPU must not read them again. */
+	if (translate && !adreno8_secure_translation_walk(&adreno8_secure_space, buffer->gpu_address,
+	    buffer->memory)) {
+		printf("adreno8: secure translation 3a stopped before the handover; no page transferred\n");
+		adreno8_secure_xfer_abort();
+		return NULL;
+	}
 	if (!adreno8_secure_xfer(&adreno8_secure_space, buffer)) {
 		adreno8_memory_failed = true;
 		printf("adreno8: secure allocation failed; retain GPU memory until cold reset\n");
+		return NULL;
+	}
+	if (translate && !adreno8_secure_translation_3a(&adreno8_secure_space)) {
+		entry->complete = true;
+		entry->terminal = true;
+		printf("adreno8: secure translation 3a stopped after the handover; the pages stay assigned and no reply is built\n");
 		return NULL;
 	}
 	entry->complete = true;
@@ -215,7 +229,12 @@ adreno8_memory_alloc_secure(const char *name, uint32_t size, uint32_t alignment,
 	}
 	switch (adreno8_gpu8_secure_mode) {
 	case SECURE_MODE_HANDOVER:
-		return adreno8_memory_alloc_xfer(name, size, alignment, gpu_prot, allocated);
+		return adreno8_memory_alloc_xfer(name, size, alignment, gpu_prot, allocated, false);
+	case SECURE_MODE_TRANSLATION_A:
+		return adreno8_memory_alloc_xfer(name, size, alignment, gpu_prot, allocated, true);
+	case SECURE_MODE_TRANSLATION_B:
+		printf("adreno8: secure translation 3b is not implemented in this kernel; the secure path stays closed\n");
+		break;
 	case SECURE_MODE_PREFLIGHT:
 		printf("adreno8: secure preflight-only mode: START stops here without MP_ASSIGN or MEM_ALLOC reply\n");
 		break;

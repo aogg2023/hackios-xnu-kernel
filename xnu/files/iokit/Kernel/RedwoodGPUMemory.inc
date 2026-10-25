@@ -407,4 +407,3 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
 	}
 	return kIOReturnSuccess;
 }
-

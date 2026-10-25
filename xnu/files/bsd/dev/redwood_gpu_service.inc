@@ -636,4 +636,3 @@ redwood_gpu_recover(void)
 	    gpu_recoveries, gpu_recoveries == 1 ? "" : "s", gpu_fence);
 	return true;
 }
-

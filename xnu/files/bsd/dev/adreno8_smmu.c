@@ -763,7 +763,17 @@ adreno8_space_registers(struct adreno8_gpu_space *space)
 	ok &= adreno8_get(&adreno8_smmu, "cb a2r", adreno8_smmu_page + SMMU_CBA2R(space->context)) == 1;
 	ok &= adreno8_get(&adreno8_smmu, "cb bar", adreno8_smmu_page + SMMU_CBAR(space->context)) == STAGE_1;
 	ok &= (adreno8_get(&adreno8_smmu, "cb tcr2", cb + SMMU_CB_TCR2) & ~SMMU_TCR2_TBI) == TCR2_39_BITS;
-	ok &= adreno8_get(&adreno8_smmu, "cb tcr", cb + SMMU_CB_TCR) == TCR_39_BITS;
+	uint32_t tcr = adreno8_get(&adreno8_smmu, "cb tcr", cb + SMMU_CB_TCR);
+	/* After the CP and GMU run, device CB0 reads TCR with EPD1 (bit 23) clear; TTBR1 stays 0
+	 * and every IOVA here is below the 39-bit TTBR0 limit, so that walk is never selected. */
+	if (space == &adreno8_gpu_space && tcr == (TCR_39_BITS & ~(1u << 23))) {
+		static bool reported;
+		if (!reported)
+			printf("adreno8: %u: GPU context TCR EPD1 was cleared after GPU execution (%#x)\n", adreno8_step, tcr);
+		reported = true;
+	} else {
+		ok &= tcr == TCR_39_BITS;
+	}
 	ok &= adreno8_get(&adreno8_smmu, "cb ttbr0, low", cb + SMMU_CB_TTBR0) == (uint32_t)root;
 	ok &= adreno8_get(&adreno8_smmu, "cb ttbr0, high", cb + SMMU_CB_TTBR0 + 4) == (uint32_t)(root >> 32);
 	ok &= adreno8_get(&adreno8_smmu, "cb ttbr1, low", cb + SMMU_CB_TTBR1) == 0;

@@ -6,7 +6,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 	struct msm_gem_submit_cmd * cmds = NULL;
 	uint64_t addresses[GPU_SUBMIT_CMDS];
 	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
-	uint64_t began, nanos, again;
+	uint64_t entered = mach_absolute_time(), began, nanos, again, roomed;
 	IOReturn ret = kIOReturnBadArgument;
 	const bool a830 = redwood_platform_is_annibale();
 
@@ -31,6 +31,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		goto out;
 	}
 	IOLockLock(gGPULock);
+	roomed = mach_absolute_time();
 	/*
 	 * The A830's queue holds adreno8_context_depth() submissions ahead of the GPU. With that many
 	 * outstanding, the backend would wait for the oldest with this lock held, and every other
@@ -42,6 +43,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 			break;                                  /* (the backend's own wait says what is wrong) */
 		}
 	}
+	gGPUStat.rooming += mach_absolute_time() - roomed;
 	if (gGPUReported || !redwood_gpu_ready()) {
 		IOLockUnlock(gGPULock);
 		ret = kIOReturnNotReady;
@@ -168,15 +170,18 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 	}
 	/* every five seconds in which something was submitted: how much, and what it cost here */
 	gGPUStat.submissions++;
+	gGPUStat.submitting += mach_absolute_time() - entered;
 	gGPUStat.commands += count;
 	if (gGPUStat.since == 0) {
 		gGPUStat.since = began;
 	}
 	absolutetime_to_nanoseconds(mach_absolute_time() - gGPUStat.since, &nanos);
 	if (nanos >= 5 * NSEC_PER_SEC) {
-		uint64_t flushing, waiting, taking, worked;
+		uint64_t flushing, waiting, taking, worked, submitting, rooming;
 		uint32_t timed, by[7];
 
+		absolutetime_to_nanoseconds(gGPUStat.submitting, &submitting);
+		absolutetime_to_nanoseconds(gGPUStat.rooming, &rooming);
 		absolutetime_to_nanoseconds(gGPUStat.flushing, &flushing);
 		absolutetime_to_nanoseconds(gGPUStat.waiting, &waiting);
 		absolutetime_to_nanoseconds(gGPUStat.taking, &taking);
@@ -192,11 +197,13 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		    gGPUStat.made ? allocating / NSEC_PER_USEC / gGPUStat.made : 0,
 		    gGPUStat.made ? locking / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.made_by_size[0], gGPUStat.made_by_size[1],
 		    gGPUStat.made_by_size[2], gGPUStat.made_by_size[3], gGPUStat.given_again, fKeptBytes >> 20);
-		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
+		IOLog("RedwoodGPU: %u submissions in %llu ms: %llu us each in the kernel, %llu of them waiting for room in the queue; "
+		    "%u command buffers and %u buffers named, %llu KB out of the cache "
 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "
 		    "began; %u IOSurfaces taken as buffers in %llu us each; %u buffers, %llu MB\n",
-		    gGPUStat.submissions, nanos / NSEC_PER_MSEC, gGPUStat.commands, gGPUStat.buffers,
+		    gGPUStat.submissions, nanos / NSEC_PER_MSEC, submitting / NSEC_PER_USEC / gGPUStat.submissions,
+		    rooming / NSEC_PER_USEC / gGPUStat.submissions, gGPUStat.commands, gGPUStat.buffers,
 		    (gGPUStat.flushed >> 10) / gGPUStat.submissions, flushing / NSEC_PER_USEC / gGPUStat.submissions,
 		    timed ? worked / timed : 0, timed, by[0], by[1], by[2], by[3], by[4], by[5], by[6], worked / 1000,
 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,

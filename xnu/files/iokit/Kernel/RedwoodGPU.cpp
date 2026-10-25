@@ -224,6 +224,7 @@ static struct {
 	uint64_t allocating;                    /* ... of which getting the memory, before entering it into the GPU's address space */
 	uint32_t made_by_size[4];               /* ... how many of them under 64 KB, 1 MB, 8 MB, and larger */
 	uint64_t locking;                       /* ... and waiting for gGPULock to enter them */
+	uint64_t submitting, rooming;           /* time in submit() from its start, and in it waiting for room in the A830's queue */
 } gGPUStat;
 
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */

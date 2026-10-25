@@ -2,6 +2,7 @@
 #include "adreno8_private.h"
 #include "adreno8_bo_private.h"
 #include "adreno8_context_private.h"
+#include "adreno8_hwsched_private.h"
 #include "redwood_gpu_private.h"
 #include <sys/redwood_input.h>
 
@@ -144,10 +145,7 @@ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]
 		legacy_gpu_worked(microseconds, submissions, by);
 		return;
 	}
-	/* A830 records no hardware timing samples. Its user ioctl returns Unsupported. */
-	*microseconds = 0;
-	*submissions = 0;
-	memset(by, 0, 7 * sizeof(*by));
+	adreno8_hfi_worked(microseconds, submissions, by);
 }
 
 void

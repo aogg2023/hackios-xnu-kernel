@@ -132,6 +132,41 @@ adreno8_hfi_health(void)
 	return true;
 }
 
+/*
+ * How long the GPU worked, from the GMU's TS_RETIRE notifications (kgsl's hfi_ts_retire_cmd:
+ * header, context, timestamp, type, then the 64-bit always-on counts at 19.2 MHz submitted_to_rb,
+ * sop, eop, retired_on_gmu and active, then a version). The time is eop - sop, which kgsl reports
+ * as the work's active time for GMU firmware older than HFI minor 4.
+ */
+static uint64_t retired_ticks;
+static uint32_t retired_count, retired_by[7];
+
+static void
+adreno8_retire_note(const uint32_t *msg)
+{
+	static const uint64_t limits_us[6] = {100, 250, 500, 1000, 2000, 4000};
+	uint64_t sop = msg[6] | (uint64_t)msg[7] << 32, eop = msg[8] | (uint64_t)msg[9] << 32;
+	uint64_t ticks = eop > sop ? eop - sop : 0;
+	unsigned bucket = 0;
+
+	while (bucket < 6 && ticks * 10 / 192 >= limits_us[bucket]) bucket++;
+	retired_by[bucket]++;
+	retired_count++;
+	retired_ticks += ticks;
+}
+
+/* What the notifications said since this was last asked (redwood_gpu_worked's contract). */
+void
+adreno8_hfi_worked(uint64_t *microseconds, uint32_t *count, uint32_t by[7])
+{
+	*microseconds = retired_ticks * 10 / 192;
+	*count = retired_count;
+	memcpy(by, retired_by, sizeof(retired_by));
+	memset(retired_by, 0, sizeof(retired_by));
+	retired_ticks = 0;
+	retired_count = 0;
+}
+
 /* The ACK waiter and EOP polling use the same message handling. A bounded drain
  * keeps a producer that fills a queue continuously from extending a timeout. */
 static bool
@@ -187,6 +222,7 @@ adreno8_hfi_pump(uint32_t request, bool *ack, unsigned *notices)
 			} else if (type == 0 && received_id == 133) {
 				/* EOP memory remains the completion check; this packet is a notification. */
 				if (queue != 1 || words != 15) return false;
+				adreno8_retire_note(resp);
 			} else if (type == 0 && received_id == 101 && words >= 4) {
 				if ((*notices)++ < 8)
 					printf("adreno8: %u: GMU debug type %u timestamp %u data %#x\n", adreno8_step, resp[1], resp[2], resp[3]);

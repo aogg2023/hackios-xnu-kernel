@@ -99,6 +99,7 @@ void adreno8_wr(vm_offset_t, uint32_t);
 uint32_t adreno8_get(struct adreno8_block *, const char *, uint32_t);
 void adreno8_put(struct adreno8_block *, const char *, uint32_t, uint32_t);
 void adreno8_settle(void) {}
+void adreno8_hold(bool single_access) { (void)single_access; }
 void adreno8_sleep_us(uint32_t us) { (void)us; }
 const uint8_t *redwood_image_file(const char *, const char *, uint64_t *, int *);
 #define _DEV_ADRENO8_PRIVATE_H

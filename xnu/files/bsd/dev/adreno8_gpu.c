@@ -121,10 +121,16 @@ gpu_wait_idle(const char *what)
 static bool
 gpu_raw(const uint32_t *words, uint32_t count, const char *what)
 {
+	printf("adreno8: GPU RAW %s: check power, translation and CP status\n", what);
+	adreno8_hold(false);
 	if (!gpu_status_ok())
 		return false;
+	printf("adreno8: GPU RAW %s: queue %u PM4 dwords through HFI 131\n", what, count);
+	adreno8_hold(false);
 	if (!count || !adreno8_hwsched_raw(words, count, what))
 		return gpu_fail(what);
+	printf("adreno8: GPU RAW %s: HFI ACK received; check idle and faults\n", what);
+	adreno8_hold(false);
 	return gpu_wait_idle(what);
 }
 

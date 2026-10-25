@@ -178,6 +178,9 @@ cx = (ROOT / "xnu/files/bsd/dev/adreno8_cx.c").read_text()
 BOOT_DATA = re.search(r"static const struct adreno8_gpu_level adreno8_boot_speeds\[\] = \{.*?\n};", cx, re.S).group()
 BW_DATA = re.search(r"const uint32_t adreno8_bw_kb\[BW_COUNT\] = \{.*?\n};", cx, re.S).group().replace("const uint32_t", "static uint32_t")
 BCM_DATA = re.search(r"const struct adreno8_bcm adreno8_bcms\[\] = \{.*?\n};", cx, re.S).group().replace("const struct", "static const struct")
+GMU_DATA = "\n".join(re.findall(r"^const uint32_t adreno8_gmu_(?:hz|level)\[3\] = .*?;", cx, re.M))
+VOTE_FUNCTIONS = cx[cx.index("bool\nadreno8_arc_vote("):cx.index("static bool\nadreno8_rsc_read(")]
+RPMH_DEFINE = re.search(r"^#define RPMH_LEVELS\s+\d+", private, re.M).group()
 STAGE_SOURCE = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -200,9 +203,7 @@ static bool adreno8_hfi_tables_sent, hwsched_ready = true;
 static bool adreno8_hwsched_ready(void) { return hwsched_ready; }
 static uint32_t adreno8_gx_hz[17], adreno8_gx_level[17];
 static uint32_t adreno8_gx_votes[17], adreno8_gx_dep_votes[17], adreno8_cx_votes[3];
-static const uint32_t adreno8_gmu_hz[3] = {0, 200000000, 500000000};
-static const uint32_t adreno8_gmu_level[3] = {0, 64, 128};
-''' + BW_DEFINE + "\n" + BW_DATA + "\n" + BCM_DATA + r'''
+''' + GMU_DATA + "\n" + RPMH_DEFINE + "\n" + BW_DEFINE + "\n" + BW_DATA + "\n" + BCM_DATA + r'''
 static struct adreno8_bcm_db aux[3] = {{4800000, 64, 0, 0}, {4800000, 16, 1, 0}, {4800000, 0, 1, 0}};
 static bool adreno8_gmu_runs = true, adreno8_gmu_talks, wait_ok = true, vote_ok = true;
 static vm_offset_t adreno8_hfi_view_table = 1, adreno8_hfi_view_cmd = 1;
@@ -231,10 +232,22 @@ static uint32_t adreno8_get(struct block *b, const char *name, uint32_t offset) 
 }
 static bool adreno8_wait_for(struct block *b, unsigned off, unsigned mask, unsigned value, unsigned ms) { return wait_ok; }
 static void adreno8_gmu_post_mortem(void) {}
-static bool adreno8_arc_vote(const char *a, const char *b, uint32_t level, uint32_t *out) { *out = level + 100; return vote_ok; }
-static bool adreno8_dep_vote(uint32_t level, uint32_t *out) { *out = level + 200; return vote_ok; }
-static uint32_t adreno8_rpmh_lookup(const char *name, void *levels, void *count, const uint8_t **data, unsigned *length) {
+static uint32_t adreno8_rpmh_lookup(const char *name, uint16_t *levels, unsigned *count, const uint8_t **data, unsigned *length) {
     unsigned i;
+    if (!vote_ok) return 0;
+    /* Level maps captured from the live CMD DB, independently of the encoder. */
+    static const uint16_t gfx[] = {0,50,52,56,60,64,80,128,144,192,224,256,320,416,448,452};
+    static const uint16_t cx_levels[] = {0,16,64,128,192,256,320,384,416,448,480};
+    static const uint16_t mx[] = {0,16,64,128,192,256,320,384,416,448};
+    const uint16_t *rail = NULL; unsigned entries = 0;
+    if (!strcmp(name,"gfx.lvl")) { rail=gfx; entries=sizeof(gfx)/sizeof(*gfx); }
+    if (!strcmp(name,"cx.lvl")) { rail=cx_levels; entries=sizeof(cx_levels)/sizeof(*cx_levels); }
+    if (!strcmp(name,"mx.lvl")) { rail=mx; entries=sizeof(mx)/sizeof(*mx); }
+    if (rail) {
+        if (count) *count=entries;
+        if (levels) memcpy(levels,rail,entries*sizeof(*rail));
+        return 0x30000;
+    }
     if (!strcmp(name, "CN0")) return 0x2000;
     for (i = 0; i < 3; i++) if (!strcmp(name, adreno8_bcms[i].name)) break;
     if (i == 3) return 0;
@@ -250,8 +263,14 @@ static bool adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t word
     send_count++;
     return id != fail_id;
 }
-''' + BCM_MACRO + "\n" + STAGE_FUNCTIONS + r'''
+''' + VOTE_FUNCTIONS + "\n" + BCM_MACRO + "\n" + STAGE_FUNCTIONS + r'''
 int main(void) {
+    uint32_t dependency;
+    assert(adreno8_dep_vote(0,&dependency) && dependency==UINT32_MAX);
+    assert(adreno8_dep_vote(50,&dependency) && dependency==0xffffc2ffu);
+    assert(adreno8_dep_vote(128,&dependency) && dependency==0xffffc3ffu);
+    assert(adreno8_dep_vote(448,&dependency) && dependency==0xffffc9ffu);
+    assert(!adreno8_dep_vote(480,&dependency));
     assert(sizeof(adreno8_boot_speeds) / sizeof(adreno8_boot_speeds[0]) == 1);
     assert(adreno8_boot_speeds[0].hz == 160000000 && adreno8_boot_speeds[0].level == 50);
     adreno8_gx_hz[1] = adreno8_boot_speeds[0].hz;
@@ -268,9 +287,12 @@ int main(void) {
     assert(adreno8_step_tables() && send_count == 2);
     assert(ids[0] == 15 && lengths[0] == 18);
     assert(sent[0][0] == 0 && sent[0][1] == 1 && sent[0][2] == 2 && sent[0][3] == 3);
-    assert(sent[0][4] == 100 && sent[0][5] == 200 && sent[0][6] == 0);
-    assert(sent[0][7] == 150 && sent[0][8] == 250 && sent[0][9] == 160000);
-    assert(sent[0][10] == 3 && sent[0][11] == 2 && sent[0][16] == 228 && sent[0][17] == 500000);
+    assert(sent[0][4] == 0 && sent[0][5] == UINT32_MAX && sent[0][6] == 0);
+    assert(sent[0][7] == 0x00320201 && sent[0][8] == 0xffffc2ffu && sent[0][9] == 160000);
+    assert(sent[0][10] == 3 && sent[0][11] == 2);
+    assert(sent[0][12] == 0 && sent[0][13] == 0);
+    assert(sent[0][14] == 0x00400202 && sent[0][15] == 500000);
+    assert(sent[0][16] == 0x00800303 && sent[0][17] == 650000);
     assert(ids[1] == 3 && lengths[1] == 159);
     assert(sent[1][0] == BW_COUNT && sent[1][1] == 1 && sent[1][2] == 3 && sent[1][3] == 1 && sent[1][4] == 5);
     assert(sent[1][5] == 0x2000 && sent[1][23] == 0x3000 && sent[1][25] == 0x3008);
@@ -316,10 +338,31 @@ int main(void) {
 }
 '''
 
-for source in (SOURCE, STAGE_SOURCE):
+checks = [("queues", SOURCE, False), ("power tables", STAGE_SOURCE, False)]
+vote_mutations = [
+    ("missing dependency high nibble", "0xffffc000u", "0x0fffc000u"),
+    ("wrong MX dependency field", "(j << 8) | 0xff", "(j << 6) | 0xff"),
+    ("missing no-CX dependency", "(j << 8) | 0xff", "(j << 8) | 0"),
+    ("invalid zero-speed dependency", "*vote = 0xffffffff;", "*vote = 0;"),
+    ("primary ARC index as level", "((uint32_t)pri[pindex] << 16)", "(pindex << 16)"),
+    ("omitted HFI dependency word", "tbl[at++] = adreno8_gx_dep_votes[i];", "tbl[at++] = 0;"),
+    ("incorrect GMU startup rate", "{ 0, 500000000, 650000000 }", "{ 0, 500000000, 500000000 }"),
+    ("incorrect GMU runtime level", "{ 0, 0x40, 0x80 }", "{ 0, 0x10, 0x80 }"),
+]
+for label, before, after in vote_mutations:
+    assert STAGE_SOURCE.count(before) == 1, label
+    checks.append((label, STAGE_SOURCE.replace(before, after, 1), True))
+
+for label, source, rejected in checks:
     with tempfile.TemporaryDirectory(prefix="adreno8-hfi-") as directory:
         src = Path(directory) / "check.c"
         binary = Path(directory) / "check"
         src.write_text(source)
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Wno-unused-parameter", "-fsanitize=address,undefined", "-I", str(HEADER.parent), str(src), "-o", str(binary)], check=True)
-        subprocess.run([str(binary)], check=True)
+        result = subprocess.run([str(binary)], capture_output=True, text=True)
+        if rejected:
+            assert result.returncode != 0, "mutation survived: " + label
+        else:
+            assert result.returncode == 0, result.stdout + result.stderr
+            print(result.stdout, end="")
+print("HFI power encoding mutations rejected:", len(vote_mutations))

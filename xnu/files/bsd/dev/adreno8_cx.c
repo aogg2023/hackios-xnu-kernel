@@ -226,11 +226,9 @@ adreno8_arc_vote(const char *pri_n, const char *sec_n, uint32_t level, uint32_t 
 	return true;
 }
 
-/*
- * The dependency vote of one speed (Linux's dep loop): "while the 3D core runs at this speed the
- * memory rail must not fall below level X", told as a position in mx.lvl's list; 0xffffffff for
- * the idling zero speed.
- */
+/* Gen8 dependency encoding: all 18 bits at 31:14 are set, MX selector at 13:8,
+ * and 0xff at 7:0 for this board's absent CX dependency. The zero-speed row is
+ * 0xffffffff, matching the vendor gen8 RPMh driver. */
 
 bool
 adreno8_dep_vote(uint32_t level, uint32_t *vote)
@@ -255,7 +253,7 @@ adreno8_dep_vote(uint32_t level, uint32_t *vote)
 		printf("adreno8: %u: level %#x is above every level of \"mx.lvl\"\n", adreno8_step, level);
 		return false;
 	}
-	*vote = (0x3fffu << 14) | (j << 8) | 0xff;
+	*vote = 0xffffc000u | (j << 8) | 0xff;
 	return true;
 }
 

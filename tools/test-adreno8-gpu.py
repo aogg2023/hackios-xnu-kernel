@@ -92,9 +92,12 @@ struct adreno8_block { const char *name; uint32_t phys, size; vm_offset_t base; 
 struct adreno8_gpu_space;
 ''' + block_declarations + f"enum {{ GPU_MAPPING_SIZE = {gpu_size} }};\n" + r'''
 bool adreno8_reset_required;
+uint32_t adreno8_pause_ms, adreno8_step, adreno8_newest_step;
 int adreno8_say(const char *fmt, ...) { (void)fmt; return 0; }
 uint32_t adreno8_rd(vm_offset_t);
 void adreno8_wr(vm_offset_t, uint32_t);
+uint32_t adreno8_get(struct adreno8_block *, const char *, uint32_t);
+void adreno8_put(struct adreno8_block *, const char *, uint32_t, uint32_t);
 void adreno8_settle(void) {}
 void adreno8_sleep_us(uint32_t us) { (void)us; }
 const uint8_t *redwood_image_file(const char *, const char *, uint64_t *, int *);
@@ -102,6 +105,8 @@ const uint8_t *redwood_image_file(const char *, const char *, uint64_t *, int *)
 ''' + constants + '\n#include "adreno8_gpu.c"\n#undef printf\n' + reference + r'''
 static uint32_t gpu_regs[8][0x10000], gmu_regs[0x1a000], current_pipe;
 static unsigned gx_reads, gx_writes, raw_calls, allocation_count, publish_count;
+static unsigned diagnostic_reads, diagnostic_writes;
+static uint32_t diagnostic_offset;
 static uint32_t max_gx_offset;
 static bool smmu_ok = true, hfi_ok = true, oob_ok = true, clock_ok = true;
 static bool raw_ok = true, idle_ok = true, memory_on, smmu_after_raw, corrupt_scratch, acquire_ok = true;
@@ -141,6 +146,22 @@ void adreno8_wr(vm_offset_t address, uint32_t value)
     uint32_t reg = (address - adreno8_gpu.base) / 4;
     if (reg == GEN8_CP_APERTURE_CNTL_HOST) { current_pipe = value >> 12; assert(current_pipe < 8); }
     else gpu_regs[current_pipe][reg] = value;
+}
+
+uint32_t adreno8_get(struct adreno8_block *block, const char *name, uint32_t offset)
+{
+    assert(block == &adreno8_gpu && !strcmp(name, "command register"));
+    assert(adreno8_pause_ms && adreno8_step == adreno8_newest_step && offset <= block->size - 4);
+    diagnostic_reads++; diagnostic_offset = offset;
+    return adreno8_rd(block->base + offset);
+}
+
+void adreno8_put(struct adreno8_block *block, const char *name, uint32_t offset, uint32_t value)
+{
+    assert(block == &adreno8_gpu && !strcmp(name, "command register"));
+    assert(adreno8_pause_ms && adreno8_step == adreno8_newest_step && offset <= block->size - 4);
+    diagnostic_writes++; diagnostic_offset = offset;
+    adreno8_wr(block->base + offset, value);
 }
 
 const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk)
@@ -230,6 +251,8 @@ static void reset(void)
     gpu_state = GPU_COLD; sqe = aqe = powerup = scratch = NULL; oob_requested = oob_acked = false;
     gx_reads = gx_writes = raw_calls = allocation_count = publish_count = current_pipe = 0;
     max_gx_offset = 0; adreno8_gpu.size = GPU_MAPPING_SIZE;
+    adreno8_pause_ms = adreno8_step = adreno8_newest_step = 0;
+    diagnostic_reads = diagnostic_writes = diagnostic_offset = 0;
     smmu_ok = hfi_ok = oob_ok = clock_ok = raw_ok = idle_ok = acquire_ok = true;
     smmu_after_raw = corrupt_scratch = memory_on = adreno8_reset_required = false;
     gmu_regs[GMU_PWR_CLK_STATUS / 4] = 3;
@@ -290,6 +313,22 @@ int main(int argc, char **argv)
     assert(gmu_regs[GMU_HOST2GMU_SET / 4] == 1u << 30);
     assert(gpu_regs[0][GEN8_UCHE_CCHE_GC_GMEM_RANGE_MIN_LO] == 0x04000000);
     assert(max_gx_offset == 4 * GEN8_RBBM_SECVID_TSB_CNTL && max_gx_offset == 0x3e00c);
+    assert(!diagnostic_reads && !diagnostic_writes);
+
+    reset(); adreno8_pause_ms = 100; adreno8_step = adreno8_newest_step = 17;
+    gpu_write(GEN8_SP_HLSQ_GC_GMEM_RANGE_MIN_LO, 0x04000000);
+    assert(gpu_read(GEN8_SP_HLSQ_GC_GMEM_RANGE_MIN_LO) == 0x04000000);
+    assert(diagnostic_reads == 1 && diagnostic_writes == 1 && diagnostic_offset == 0x2b840);
+    reset(); adreno8_pause_ms = 100; adreno8_step = 16; adreno8_newest_step = 17;
+    gpu_write(0, 1); assert(gpu_read(0) == 1 && !diagnostic_reads && !diagnostic_writes);
+    reset(); adreno8_step = adreno8_newest_step = 17;
+    gpu_write(0, 1); assert(gpu_read(0) == 1 && !diagnostic_reads && !diagnostic_writes);
+    reset(); adreno8_pause_ms = 100; adreno8_step = adreno8_newest_step = 17;
+    gpu_write(GPU_MAPPING_SIZE / 4, 1);
+    assert(gpu_state == GPU_FAILED && !diagnostic_writes && !gx_writes);
+    reset(); adreno8_pause_ms = 100; adreno8_step = adreno8_newest_step = 17;
+    assert(!gpu_read(GPU_MAPPING_SIZE / 4));
+    assert(gpu_state == GPU_FAILED && !diagnostic_reads && !gx_reads);
 
     reset(); gpu_write(adreno8_gpu.size / 4 - 1, 0x12345678);
     assert(gpu_read(adreno8_gpu.size / 4 - 1) == 0x12345678 && gpu_state != GPU_FAILED);

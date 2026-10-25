@@ -39,6 +39,8 @@ gpu_read(uint32_t reg)
 		gpu_fail("register read outside mapped aperture");
 		return 0;
 	}
+	if (adreno8_pause_ms && adreno8_step == adreno8_newest_step)
+		return adreno8_get(&adreno8_gpu, "command register", 4u * reg);
 	return adreno8_rd(adreno8_gpu.base + 4u * reg);
 }
 
@@ -49,6 +51,10 @@ gpu_write(uint32_t reg, uint32_t value)
 		return;
 	if (!adreno8_gpu.base || reg >= adreno8_gpu.size / sizeof(uint32_t)) {
 		gpu_fail("register write outside mapped aperture");
+		return;
+	}
+	if (adreno8_pause_ms && adreno8_step == adreno8_newest_step) {
+		adreno8_put(&adreno8_gpu, "command register", 4u * reg, value);
 		return;
 	}
 	adreno8_wr(adreno8_gpu.base + 4u * reg, value);

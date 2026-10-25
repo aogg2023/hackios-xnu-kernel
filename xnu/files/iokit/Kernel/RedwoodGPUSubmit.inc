@@ -31,6 +31,17 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		goto out;
 	}
 	IOLockLock(gGPULock);
+	/*
+	 * The A830's queue holds adreno8_context_depth() submissions ahead of the GPU. With that many
+	 * outstanding, the backend would wait for the oldest with this lock held, and every other
+	 * buffer request and the display's driver with it; gpuWait() lets go of the lock meanwhile.
+	 */
+	for (uint32_t depth = a830 ? adreno8_context_depth() : 0, last; depth != 0 && !gGPUReported && redwood_gpu_ready() &&
+	    (last = redwood_gpu_last()) >= depth && !redwood_gpu_done(last - depth + 1);) {
+		if (!gpuWait(last - depth + 1, GPU_PATIENCE_MS)) {
+			break;                                  /* (the backend's own wait says what is wrong) */
+		}
+	}
 	if (gGPUReported || !redwood_gpu_ready()) {
 		IOLockUnlock(gGPULock);
 		ret = kIOReturnNotReady;
@@ -170,14 +181,16 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		absolutetime_to_nanoseconds(gGPUStat.waiting, &waiting);
 		absolutetime_to_nanoseconds(gGPUStat.taking, &taking);
 		redwood_gpu_worked(&worked, &timed, by);
-		uint64_t making, allocating;
+		uint64_t making, allocating, locking;
 
 		absolutetime_to_nanoseconds(gGPUStat.making, &making);
 		absolutetime_to_nanoseconds(gGPUStat.allocating, &allocating);
-		IOLog("RedwoodGPU: buffers: %u made in %llu us each (%llu getting the memory; %u under 64 KB, %u under 1 MB, "
-		    "%u under 8 MB, %u larger), %u kept ones given again (%llu MB kept)\n",
+		absolutetime_to_nanoseconds(gGPUStat.locking, &locking);
+		IOLog("RedwoodGPU: buffers: %u made in %llu us each (%llu getting the memory, %llu waiting for the GPU lock; %u under "
+		    "64 KB, %u under 1 MB, %u under 8 MB, %u larger), %u kept ones given again (%llu MB kept)\n",
 		    gGPUStat.made, gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0,
-		    gGPUStat.made ? allocating / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.made_by_size[0], gGPUStat.made_by_size[1],
+		    gGPUStat.made ? allocating / NSEC_PER_USEC / gGPUStat.made : 0,
+		    gGPUStat.made ? locking / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.made_by_size[0], gGPUStat.made_by_size[1],
 		    gGPUStat.made_by_size[2], gGPUStat.made_by_size[3], gGPUStat.given_again, fKeptBytes >> 20);
 		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "

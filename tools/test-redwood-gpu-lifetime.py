@@ -155,8 +155,11 @@ static bool redwood_gpu_map(uint64_t address, uint64_t phys, bool) {
 }
 static bool redwood_gpu_mapped() { return mapped_ok; }
 static bool redwood_gpu_unmap(uint64_t, uint64_t) { ++unmap_calls; return unmap_ok; }
-static bool redwood_gpu_done(uint32_t) { ++done_calls; return fence_done; }
+static unsigned busy_for;                       /* redwood_gpu_done() says no so many times first */
+static bool redwood_gpu_done(uint32_t) { ++done_calls; return fence_done && done_calls > busy_for; }
 static uint32_t redwood_gpu_last() { return 7; }
+static uint32_t context_depth = 4;
+static uint32_t adreno8_context_depth() { return context_depth; }
 static uint32_t redwood_gpu_submit(const uint64_t *, const uint32_t *, uint32_t count) {
     assert(count); ++submit_calls; return submit_answer;
 }
@@ -178,7 +181,7 @@ static void reset() {
     a830 = false; ready = mapped_ok = unmap_ok = fence_done = true;
     recover_ok = false;
     map_calls = unmap_calls = freed_addresses = done_calls = submit_calls = map_fail_at = 0;
-    wrong_pages = 0;
+    wrong_pages = busy_for = 0; context_depth = 4;
     submit_answer = 17; next_address = 0x40000000; now = 0;
     gGPUReported = gGPUCached = false; gGPUKeep = 0;
     IOBufferMemoryDescriptor::next_segment_limit = UINT64_MAX;
@@ -322,6 +325,26 @@ static void failed_submit() {
         MiniIOSurface surface{}; assert(!MiniIOSurfaceDrawn(&surface, 0)); c.free();
     }
 }
+static void queue_room() {
+    /* A830: with the queue full, submit waits for the oldest through gpuWait() before the backend is called */
+    for (bool a830_queue : {false, true}) {
+        reset(); a830 = a830_queue; auto c = client(); allocate(c);
+        msm_gem_submit_bo bo{0, 1, 0}; msm_gem_submit_cmd cmd{};
+        cmd.type = MSM_SUBMIT_CMD_BUF; cmd.size = 4;
+        msm_gem_submit request{}; request.nr_cmds = request.nr_bos = 1; request.flags = MSM_PIPE_3D0;
+        request.bos = reinterpret_cast<uint64_t>(&bo); request.cmds = reinterpret_cast<uint64_t>(&cmd);
+        busy_for = 3; uint64_t before = now;
+        assert(c.submit(&request) == kIOReturnSuccess && submit_calls == 1);
+        assert(a830_queue ? done_calls >= 4 && now > before && gGPUStat.waits == 1 : done_calls == 0 && now == before);
+        c.free();
+    }
+    reset(); a830 = true; context_depth = 8; auto c = client(); allocate(c);   /* last 7 < depth 8: room, no wait */
+    msm_gem_submit_bo bo{0, 1, 0}; msm_gem_submit_cmd cmd{};
+    cmd.type = MSM_SUBMIT_CMD_BUF; cmd.size = 4;
+    msm_gem_submit request{}; request.nr_cmds = request.nr_bos = 1; request.flags = MSM_PIPE_3D0;
+    request.bos = reinterpret_cast<uint64_t>(&bo); request.cmds = reinterpret_cast<uint64_t>(&cmd);
+    busy_for = 3; assert(c.submit(&request) == kIOReturnSuccess && done_calls == 0); c.free();
+}
 static void display() {
     reset(); MiniIOSurface s{}; s.drawn = 7; ready = false;
     assert(!MiniIOSurfaceDrawn(&s, 0) && done_calls == 0);
@@ -329,8 +352,8 @@ static void display() {
 }
 int main() {
     healthy(); stopped(); failed_reap(); completed_reap(); failed_free(); partial_map(); segments(); kept();
-    failed_surface(); surface_ownership(); full_pending(); failed_submit(); display(); reset();
-    printf("RedwoodGPU production lifecycle: 27 scenarios at %llu-byte pages passed\n", (unsigned long long)PAGE_SIZE);
+    failed_surface(); surface_ownership(); full_pending(); failed_submit(); queue_room(); display(); reset();
+    printf("RedwoodGPU production lifecycle: 30 scenarios at %llu-byte pages passed\n", (unsigned long long)PAGE_SIZE);
 }
 '''
 
@@ -418,7 +441,9 @@ def main():
                 ("ignore_unmap", memory, "!redwood_gpu_unmap(address, size)", "(redwood_gpu_unmap(address, size), false)", False),
                 ("partial_release", memory, "\n\t\t\tmemory->retain();", "\n\t\t\t/* removed retain */", False),
                 ("reuse_failed_kept", memory, "if (!gpuReleaseMapping(k->address, k->size))", "if ((gpuReleaseMapping(k->address, k->size), false))", False),
-                ("short_segment", memory, "length >= 4096 && ", "", False),
+                ("short_segment", memory, " && length >= 4096;", ";", False),
+                ("one_lookup", memory, "phys += 4096, length -= 4096", "length -= 4096", False),
+                ("queue_wait_held", source, "if (!gpuWait(last - depth + 1, GPU_PATIENCE_MS)) {", "if (true) {", True),
                 ("submit_zero", source, "gGPUReported = true;\n\t}\n\tif (gpu_log", "gGPUReported = false;\n\t}\n\tif (gpu_log", True),
                 ("display_stopped", source, "(redwood_gpu_ready() && gpuWait(fence, milliseconds))", "(!redwood_gpu_ready() || gpuWait(fence, milliseconds))", True),
             ]
@@ -429,7 +454,7 @@ def main():
             changed = legacy_functions.replace("return cleared && synced;", "return true;")
             assert changed != legacy_functions
             execute(LEGACY_MODEL + changed + LEGACY_CASES.replace("redwood_gpu_", "legacy_gpu_"), folder, "ignore_tlb", False)
-            print("8 lifecycle mutations detected")
+            print(f"{len(changes) + 1} lifecycle mutations detected")
 
 
 if __name__ == "__main__":

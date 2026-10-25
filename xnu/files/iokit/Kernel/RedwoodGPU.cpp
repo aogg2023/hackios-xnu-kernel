@@ -65,6 +65,7 @@ uint32_t redwood_gpu_submit(const uint64_t * addresses, const uint32_t * words, 
 extern uint32_t gpu_log;
 bool redwood_gpu_done(uint32_t fence);
 uint32_t redwood_gpu_last(void);
+uint32_t adreno8_context_depth(void);
 void redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void redwood_gpu_report(const char * why);
 bool redwood_gpu_recover(void);
@@ -222,6 +223,7 @@ static struct {
 	uint64_t making;                        /* ... and the time it took to make the others */
 	uint64_t allocating;                    /* ... of which getting the memory, before entering it into the GPU's address space */
 	uint32_t made_by_size[4];               /* ... how many of them under 64 KB, 1 MB, 8 MB, and larger */
+	uint64_t locking;                       /* ... and waiting for gGPULock to enter them */
 } gGPUStat;
 
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */

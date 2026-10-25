@@ -171,6 +171,13 @@ context_consumed(void)
 	}
 }
 
+/* How many submissions may be outstanding at once: adreno8_inflight, 1 to CONTEXT_INFLIGHT_MAX. */
+uint32_t
+adreno8_context_depth(void)
+{
+	return adreno8_inflight >= 1 && adreno8_inflight <= CONTEXT_INFLIGHT_MAX ? adreno8_inflight : 1;
+}
+
 /* Waits until the GMU has read enough of the queue for `words` more; returns the write index. */
 static bool
 context_room(uint32_t words, uint32_t *write)
@@ -222,7 +229,7 @@ adreno8_context_submit(const uint64_t *addresses, const uint32_t *words, uint32_
 	}
 	/* Up to `depth` submissions are outstanding: Mesa records and submits the next batch
 	 * while the GPU executes earlier ones. With `depth` outstanding, the oldest retires first. */
-	depth = adreno8_inflight >= 1 && adreno8_inflight <= CONTEXT_INFLIGHT_MAX ? adreno8_inflight : 1;
+	depth = adreno8_context_depth();
 	if (!context_register() || (context_last >= depth && !context_wait(context_last - depth + 1))) return 0;
 	length = 8 + count * 3;
 	aligned = (length + 3) & ~3u;

@@ -339,6 +339,8 @@ bool
 adreno8_step_clocks(void);
 bool
 adreno8_scm_gpu_init(void);
+bool
+adreno8_scm_gpu_aperture(void);
 int32_t
 adreno8_scm_call(uint64_t function, uint64_t arginfo, uint64_t argument0,
     uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *answer);

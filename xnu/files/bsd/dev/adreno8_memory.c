@@ -280,7 +280,7 @@ adreno8_gpu_memory_enable(void)
 	if (adreno8_gpu_space.is_on) {
 		return true;
 	}
-	if (!adreno8_space_on(&adreno8_gpu_space, 0, GPU_MATCH)) {
+	if (!adreno8_space_on(&adreno8_gpu_space, 0, GPU_MATCH) || !adreno8_scm_gpu_aperture()) {
 		adreno8_memory_failed = true;
 		return false;
 	}

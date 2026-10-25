@@ -71,6 +71,8 @@ static int adreno8_say(const char *s, ...) {
 static void adreno8_announce(const char *s, ...) {}
 static void adreno8_settle(void) {}
 static bool adreno8_cx_ready(void) { return true; }
+/* The aperture test executes the production helper and checks its SCM wire arguments. */
+static bool adreno8_scm_gpu_aperture(void) { return true; }
 static uint64_t mach_absolute_time(void) { return 0x1234abcdull; }
 static void absolutetime_to_nanoseconds(uint64_t time, uint64_t *ns) { *ns = time; }
 static void adreno8_space_off(struct adreno8_gpu_space *, uint32_t);

@@ -622,3 +622,13 @@ adreno8_scm_gpu_init(void)
 	status = adreno8_scm_call(0x42002801, 1, 0x9, 0, 0, 0, &answer);
 	return status == 0 || status == -4;
 }
+
+/* kgsl_iommu.c configures the ordinary GPU aperture after default TTBR0.
+ * MiCode f66f8c8 qcom_scm_kgsl_set_smmu_aperture checks only transport status; this port uses CB0. */
+bool
+adreno8_scm_gpu_aperture(void)
+{
+	uint64_t answer = 0;
+
+	return adreno8_scm_call(0x42000c1b, 4, 0xffff0000, 0xffffffff, 0xffffffff, 0xffffffff, &answer) == 0;
+}

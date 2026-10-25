@@ -214,7 +214,7 @@ int main(void)
     busy_now = 1000;
     run(6); assert(now_mhz() == 3072);
     temp_now = 700;
-    run(1); assert(now_mhz() == 1017 && perf_domain[1].hot);
+    run(1); assert(now_mhz() == 1017 && perf_domain[1].hot && perf_domain[1].hot_entries == 1);
     temp_now = 650;
     run(5); assert(now_mhz() == 1017);
     temp_now = 599;

@@ -104,7 +104,7 @@ static struct {
 	uint32_t boot, ceiling, boost, now;                     /* indices into key[] and khz[] */
 	uint64_t low_since;                                     /* since when a slower level would do; 0: not */
 	uint64_t at[MAX_LEVELS], asking;                        /* time at each level and in LEVEL_SET, since the last report */
-	uint32_t changes;
+	uint32_t changes, hot_entries;                          /* (hot_entries: times it reached HOT_TENTHS) */
 	int32_t hottest;
 } perf_domain[PERF_DOMAINS];
 
@@ -349,8 +349,10 @@ perf_want(uint32_t d, uint32_t busy, uint64_t now, uint64_t boost_abs, bool vali
 	__typeof__(perf_domain[0]) *pd = &perf_domain[d];
 	uint32_t want = 0, khz = (uint32_t)((uint64_t)pd->khz[pd->now] * busy / BUSY_TARGET);
 	uint64_t touched = os_atomic_load(&touch_at, relaxed);
+	bool was_hot = pd->hot;
 
 	pd->hot = !valid || t >= HOT_TENTHS || (pd->hot && t >= COOL_TENTHS);
+	pd->hot_entries += pd->hot && !was_hot;
 	if (pd->hot) {
 		return 0;
 	}
@@ -388,7 +390,8 @@ report(uint64_t span)
 			pd->at[i] = 0;
 		}
 		absolutetime_to_nanoseconds(pd->asking, &ns);
-		at += snprintf(line + at, sizeof(line) - at, "; %u changes, %llu us each; ", pd->changes, pd->changes ? ns / 1000 / pd->changes : 0);
+		at += snprintf(line + at, sizeof(line) - at, "; %u changes, %llu us each; %u times at the limit; ", pd->changes,
+		    pd->changes ? ns / 1000 / pd->changes : 0, pd->hot_entries);
 		if (pd->hottest == NO_READING) {
 			snprintf(line + at, sizeof(line) - at, "no reading\n");
 		} else {
@@ -396,6 +399,7 @@ report(uint64_t span)
 		}
 		printf("%s", line);
 		pd->changes = 0;
+		pd->hot_entries = 0;
 		pd->asking = 0;
 		pd->hottest = NO_READING;
 	}

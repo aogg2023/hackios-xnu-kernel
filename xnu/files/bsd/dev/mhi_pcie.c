@@ -126,8 +126,13 @@ wr(vm_offset_t address, uint32_t value)
 #define PCIE_SM_SIZE              0x0007000UL
 #define GCC_PHYS                  0x00100000UL      /* clock-controller@100000 (device tree line 18520) */
 #define GCC_SIZE                  0x006e000UL
-#define TLMM_PHYS                 0x0f000000UL      /* the SM8750's 216 pins, as redwood_goodix.c line 1513 */
-#define TLMM_SIZE                 0x00202000UL
+/*
+ * The pin registers start 0x100000 above the vendor device tree's tlmm reg (0xf000000), as in
+ * mainline sm8750.dtsi and redwood_goodix.c's board_setup(). Reading pin 16 at the vendor base
+ * plus 0x10000 stopped the SoC (kernel 76c1ad6, pcie_pause=8).
+ */
+#define TLMM_PHYS                 0x0f100000UL
+#define TLMM_SIZE                 0x00102000UL
 
 /* inbound memory, mapped without translation: the device tree's ranges, cpu == pci */
 #define PCIE_MEM_BASE             0x40300000UL

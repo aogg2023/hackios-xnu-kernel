@@ -36,7 +36,9 @@
  *
  *   pcie=N   run steps 1 through N, clamped to 3.
  *
- *   step 1  read-only survey: the two PCIe power domains in the clock controller, the six pins
+ *   step 1  read-only survey: the two PCIe power domains and the root complex's clocks in the clock
+ *           controller (nothing past them is read unless both domains are on and the cfg_ahb,
+ *           slv_axi, mstr_axi and aux clocks run), the six pins
  *           the device tree wires to the card (wlan-en 16, sw-ctrl 18 and 19, perst 102,
  *           clkreq 103, wake 104) as Android's firmware left them, the link state machine and
  *           the data link layer's own answer, the phy's power-present bit (device tree
@@ -134,6 +136,20 @@ wr(vm_offset_t address, uint32_t value)
  */
 #define GDSC_PCIE0                0x0006b004UL
 #define GDSC_PCIE0_PHY            0x0006c000UL
+#define GDSC_PWR_ON               (1u << 31)        /* Linux gdsc.c PWR_ON_MASK */
+
+/*
+ * The root complex's clock branches (gcc-sm8750.c halt_reg offsets); bit 31 of each CBCR is
+ * CLK_OFF (clk-branch.h). The parf, phy and DBI windows answer only with the two domains on and
+ * these clocks running: a read of an unclocked block can stall the interconnect and hang the SoC,
+ * which USB cannot recover, so step 1 reads none of them otherwise.
+ */
+#define CBCR_CLK_OFF              (1u << 31)
+static const struct { uint32_t offset; const char *name; } pcie0_clocks[] = {
+	{ 0x6b040, "cfg_ahb" }, { 0x6b020, "slv_axi" }, { 0x6b030, "mstr_axi" }, { 0x6b044, "aux" },
+	{ 0x6b01c, "slv_q2a_axi" }, { 0x6b054, "pipe" },
+};
+#define PCIE0_CLOCKS_NEEDED       4                 /* cfg_ahb, slv_axi, mstr_axi and aux */
 
 /* the state machine and the vendor's status words (pci-msm.c 92, 143-145, 3459, 3504) */
 #define PARF_LTSSM                0x01b0            /* the state is the low 6 bits */
@@ -255,13 +271,25 @@ domain_state(uint32_t value)
 	}
 }
 
-static void
+/* Whether the root complex's registers may be read: both domains on and the needed clocks running. */
+static bool
 show_power(void)
 {
 	uint32_t a = rd(gcc + GDSC_PCIE0), b = rd(gcc + GDSC_PCIE0_PHY);
+	bool readable = (a & GDSC_PWR_ON) && (b & GDSC_PWR_ON);
 
 	printf("pcie: the clock controller's PCIe power domains: root complex %#010x is %s, the phy %#010x is %s\n",
 	    a, domain_state(a), b, domain_state(b));
+	for (unsigned i = 0; i < sizeof(pcie0_clocks) / sizeof(pcie0_clocks[0]); i++) {
+		uint32_t cbcr = rd(gcc + pcie0_clocks[i].offset);
+
+		printf("pcie: clock %s (CBCR %#lx) %#010x: %s\n", pcie0_clocks[i].name,
+		    (unsigned long)(GCC_PHYS + pcie0_clocks[i].offset), cbcr, (cbcr & CBCR_CLK_OFF) ? "off" : "running");
+		if (i < PCIE0_CLOCKS_NEEDED && (cbcr & CBCR_CLK_OFF)) {
+			readable = false;
+		}
+	}
+	return readable;
 }
 
 /*
@@ -550,6 +578,7 @@ static void
 pcie_thread(void *parameter, __unused wait_result_t result)
 {
 	uint32_t steps = (uint32_t)(uintptr_t)parameter;
+	bool readable;
 
 	printf("pcie: step 1: map root complex 0 (%#lx, %#lx, %#lx) and read what the boot loader left\n",
 	    (unsigned long)PARF_PHYS, (unsigned long)DM_CORE_PHYS, (unsigned long)CONF_PHYS);
@@ -557,13 +586,18 @@ pcie_thread(void *parameter, __unused wait_result_t result)
 	if (parf == 0 || phy == 0 || dm_core == 0 || conf == 0 || pcie_sm == 0 || gcc == 0 || tlmm == 0) {
 		goto out;
 	}
-	show_power();
+	readable = show_power();
 	show_pin("the card's power enable", 16, 1, "qup2_se4");           /* the wlan_kiwi node's pins, */
 	show_pin("a control pin", 18, 1, "wcn_sw_ctrl");                  /* device tree line 1005:    */
 	show_pin("a control pin", 19, 1, "wcn_sw");                       /* wlan-en 16, sw-ctrl 18/19 */
 	show_pin("PERST, the card's reset", 102, 1, "phase_flag");        /* perst-gpio <0x27 0x66>, device tree */
 	show_pin("CLKREQ -- mux 1 means the phy owns it", 103, 1, "pcie0_clk_req_n");   /* line 34490 */
 	show_pin("WAKE", 104, 1, "pll_bist_sync");
+	if (!readable) {
+		printf("pcie: root complex 0 is powered down or unclocked, so its registers are left unread;\n"
+		    "pcie: powering it up (domains, clocks, phy, PERST) is the next batch's work\n");
+		goto out;
+	}
 	show_link();
 	show_root_complex();
 	show_iatu();

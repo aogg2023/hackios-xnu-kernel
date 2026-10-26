@@ -53,8 +53,10 @@
  *   step 4  MHI: if the card got a BAR0 inside the inbound memory window (device tree ranges,
  *           cpu 0x40300000 for 0x3d00000, unmapped), it is mapped and the device's state read.
  *
- * No firmware download, no BHI, no doorbells: those are the batches after this one. Nothing
- * persists -- everything written is restored -- so there is no quiesce on the way out.
+ * No firmware download, no BHI, no doorbells: those are the batches after this one. Without
+ * pcie_power=1 nothing persists -- everything written is restored -- so there is no quiesce on the
+ * way out. pcie_power=1 with pcie=2 or more powers root complex 0 and the card up between steps 1
+ * and 2 when step 1 finds them off (mhi_pcie_power.c); that is left on until the reset.
  *
  * The boot-arg is pcie= and not wifi= on purpose: bsd/dev/redwood_wifi.c takes wifi= for the old
  * phone's WCN6750 (there wifi=1 is its production path, its line 4269) and stays as it is -- the
@@ -69,17 +71,17 @@
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 
+#include "mhi_pcie_private.h"
+
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
 
 static bool leaving;
 
-static int say(const char *format, ...) __printflike(1, 2);
-
 /* every line to the loader's log as well (and to the console when that may be written) */
-static int
-say(const char *format, ...)
+int
+mhi_pcie_say(const char *format, ...)
 {
 	char line[300];
 	va_list list;
@@ -97,7 +99,7 @@ say(const char *format, ...)
 	return length;
 }
 
-#define printf say
+#define printf mhi_pcie_say
 
 static inline uint32_t
 rd(vm_offset_t address)
@@ -590,7 +592,7 @@ read_mhi(void)
  * the host's log name the part that stops it. With them (7e54fac) the mapping and the clock
  * controller's reads passed and the stop came with the pin reads.
  */
-static uint32_t pause_s;
+static uint32_t pause_s, power;
 
 /* the wlan_kiwi node's pins (device tree line 1005: wlan-en 16, sw-ctrl 18/19) and pcie0's (line 34490) */
 static const struct { const char *what; unsigned pin; const char *alt1; } card_pins[] = {
@@ -602,8 +604,8 @@ static const struct { const char *what; unsigned pin; const char *alt1; } card_p
 	{ "WAKE", 104, "pll_bist_sync" },
 };
 
-static void
-pause_before(const char *what)
+void
+mhi_pcie_pause(const char *what)
 {
 	if (pause_s == 0) {
 		return;
@@ -619,28 +621,38 @@ pcie_thread(void *parameter, __unused wait_result_t result)
 	uint32_t steps = (uint32_t)(uintptr_t)parameter;
 	bool readable;
 
-	pause_before("map the windows");
+	mhi_pcie_pause("map the windows");
 	printf("pcie: step 1: map root complex 0 (%#lx, %#lx, %#lx) and read what the boot loader left\n",
 	    (unsigned long)PARF_PHYS, (unsigned long)DM_CORE_PHYS, (unsigned long)CONF_PHYS);
 	survey_windows();
 	if (parf == 0 || phy == 0 || dm_core == 0 || conf == 0 || pcie_sm == 0 || gcc == 0 || tlmm == 0) {
 		goto out;
 	}
-	pause_before("read the clock controller");
+	mhi_pcie_pause("read the clock controller");
 	readable = show_power();
 	for (unsigned i = 0; i < sizeof(card_pins) / sizeof(card_pins[0]); i++) {
 		char what[48];
 
 		snprintf(what, sizeof(what), "read GPIO %u in the pin controller", card_pins[i].pin);
-		pause_before(what);
+		mhi_pcie_pause(what);
 		show_pin(card_pins[i].what, card_pins[i].pin, 1, card_pins[i].alt1);
 	}
 	if (steps < 2) {
 		goto out;
 	}
+	if (!readable && power) {
+		struct mhi_pcie_windows windows = { parf, phy, dm_core, gcc, tlmm };
+
+		printf("pcie: root complex 0 is off; pcie_power=1: powering it and the card up (mhi_pcie_power.c)\n");
+		if (!mhi_pcie_power_up(&windows)) {
+			printf("pcie: the power-up stopped; nothing more is read\n");
+			goto out;
+		}
+		readable = show_power();
+	}
 	if (!readable) {
 		printf("pcie: root complex 0 is powered down or unclocked, so its registers are left unread;\n"
-		    "pcie: powering it up (domains, clocks, phy, PERST) is the next batch's work\n");
+		    "pcie: pcie_power=1 powers it up (mhi_pcie_power.c)\n");
 		goto out;
 	}
 	printf("pcie: step 2 in 30 s: the root complex's own registers\n");
@@ -677,6 +689,7 @@ mhi_pcie_init(void)
 		return;
 	}
 	PE_parse_boot_argn("pcie_pause", &pause_s, sizeof(pause_s));
+	PE_parse_boot_argn("pcie_power", &power, sizeof(power));
 	if (steps > 4) {
 		steps = 4;
 	}

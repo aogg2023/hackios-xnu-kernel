@@ -578,19 +578,41 @@ read_mhi(void)
 
 /* ---- the run -------------------------------------------------------------------------------- */
 
+/*
+ * pcie_pause=N: N seconds before each part of step 1 (mapping, the clock controller, the pins), each
+ * announced first. With pcie=1 and pcie=2 the kernel stopped answering USB within 8 s of the boot
+ * (kernels 474d6e9 and 32bbef4) and the log the host had held no line of this file; the pauses let
+ * the host's log name the part that stops it.
+ */
+static uint32_t pause_s;
+
+static void
+pause_before(const char *what)
+{
+	if (pause_s == 0) {
+		return;
+	}
+	printf("pcie: next, in %u s: %s\n", pause_s, what);
+	assert_wait_timeout((event_t)&pause_s, THREAD_UNINT, pause_s * 1000, NSEC_PER_MSEC);
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
 static void
 pcie_thread(void *parameter, __unused wait_result_t result)
 {
 	uint32_t steps = (uint32_t)(uintptr_t)parameter;
 	bool readable;
 
+	pause_before("map the windows");
 	printf("pcie: step 1: map root complex 0 (%#lx, %#lx, %#lx) and read what the boot loader left\n",
 	    (unsigned long)PARF_PHYS, (unsigned long)DM_CORE_PHYS, (unsigned long)CONF_PHYS);
 	survey_windows();
 	if (parf == 0 || phy == 0 || dm_core == 0 || conf == 0 || pcie_sm == 0 || gcc == 0 || tlmm == 0) {
 		goto out;
 	}
+	pause_before("read the clock controller");
 	readable = show_power();
+	pause_before("read the pin controller");
 	show_pin("the card's power enable", 16, 1, "qup2_se4");           /* the wlan_kiwi node's pins, */
 	show_pin("a control pin", 18, 1, "wcn_sw_ctrl");                  /* device tree line 1005:    */
 	show_pin("a control pin", 19, 1, "wcn_sw");                       /* wlan-en 16, sw-ctrl 18/19 */
@@ -638,6 +660,7 @@ mhi_pcie_init(void)
 	if (!PE_parse_boot_argn("pcie", &steps, sizeof(steps)) || steps == 0) {
 		return;
 	}
+	PE_parse_boot_argn("pcie_pause", &pause_s, sizeof(pause_s));
 	if (steps > 4) {
 		steps = 4;
 	}

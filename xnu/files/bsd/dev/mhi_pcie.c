@@ -43,7 +43,7 @@
  *   step 2  read-only, the root complex itself, 30 s after step 1 so that the host has step 1's
  *           report if these reads stall the SoC, and only with both domains on and the cfg_ahb,
  *           slv_axi, mstr_axi and aux clocks running: the link state machine and the data link
- *           layer's own answer, the phy's power-present bit (device tree qcom,phy-status-offset
+ *           layer's own answer, the PHY's PHYSTATUS bit, 0 once ready (device tree qcom,phy-status-offset
  *           0x414 bit 6, lines 34483-34484), the root complex's own header read from the DBI,
  *           and the whole iATU window as the boot loader left it. (The first run of the survey
  *           with these reads in step 1, kernel 474d6e9, stopped answering USB 8 s into the boot.)
@@ -168,7 +168,7 @@ static const struct { uint32_t offset; const char *name; } pcie0_clocks[] = {
 #define PCIE20_LINKCTRLSTATUS     0x0080
 #define LINK_ACTIVE               (1u << 29)        /* the data link layer: pci-msm.c 3459 */
 #define PHY_STATUS                0x0414            /* device tree line 34483... */
-#define PHY_POWER_PRESENT         (1u << 6)         /* ... and its bit 6 */
+#define PHY_NOT_READY             (1u << 6)         /* ... and its bit 6: PHYSTATUS of the QMP PCS, 0 once the PHY is ready */
 
 /* iATU, the vendor's layout (pci-msm.c 173-180); the window holds outbound regions 0 through 7 */
 #define IATU_REGION(n)            (0x200UL * (n))
@@ -203,6 +203,7 @@ static const struct { uint32_t offset; const char *name; } pcie0_clocks[] = {
 static vm_offset_t parf, phy, dm_core, conf, pcie_sm, gcc, tlmm;
 static uint32_t ep_vendor, ep_device, ep_bar0, ep_bar1;
 static bool ep_alive, link_up;
+static uint32_t power;                       /* pcie_power=1: mhi_pcie_power.c, BAR0 assigned */
 
 static const char *
 ltssm_name(uint32_t state)
@@ -332,8 +333,8 @@ show_link(void)
 	printf("pcie: link: state machine is in %s (%#x); data link layer %s (link status %#010x, device status %#010x)\n",
 	    ltssm_name(ltssm), ltssm, link_up ? "is up, the card answered training" : "is down",
 	    status, rd(dm_core + PCIE20_DEVCTRLSTATUS));
-	printf("pcie: the phy says power present is %s (%#010x at %#lx)\n",
-	    (physt & PHY_POWER_PRESENT) ? "there" : "missing", physt, (unsigned long)(PHY_PHYS + PHY_STATUS));
+	printf("pcie: the phy is %s (PCS status %#010x at %#lx)\n",
+	    (physt & PHY_NOT_READY) ? "not ready" : "ready", physt, (unsigned long)(PHY_PHYS + PHY_STATUS));
 	printf("pcie: the state manager's debug registers: %#010x %#010x %#010x (the boot-args watch the first two)\n",
 	    rd(pcie_sm + 0x1040), rd(pcie_sm + 0x1048), rd(pcie_sm + 0x104c));
 }
@@ -346,7 +347,7 @@ show_root_complex(void)
 	unsigned hops = 0;
 
 	printf("pcie: the root complex's own identity: %#06x:%#06x, class %#06x revision %#x, header type %#x\n",
-	    id & 0xffff, id >> 16, rd(dm_core + 0x08) & 0xffffff, rd(dm_core + 0x08) >> 24, (hdr >> 16) & 0x7f);
+	    id & 0xffff, id >> 16, rd(dm_core + 0x08) >> 8, rd(dm_core + 0x08) & 0xff, (hdr >> 16) & 0x7f);
 	printf("pcie: its numbering: bus %u, secondary %u, subordinate %u\n",
 	    rd(dm_core + 0x18) & 0xff, (buses >> 8) & 0xff, (buses >> 16) & 0xff);
 	printf("pcie: its own express capability:\n");
@@ -358,7 +359,7 @@ show_root_complex(void)
 		}
 		lnk = rd(dm_core + cap + 0x10);                /* LNKCTL in the low half, LNKSTA in the high */
 		printf("pcie:   at %#x: link status %#06x -- speed %u, width x%u, link trained %s\n",
-		    cap, lnk >> 16, lnk & 0xf, (lnk >> 20) & 0x3f, (lnk & (1u << 29)) ? "yes" : "no");
+		    cap, lnk >> 16, (lnk >> 16) & 0xf, (lnk >> 20) & 0x3f, (lnk & (1u << 29)) ? "yes" : "no");
 		return;
 	}
 	printf("pcie:   no express capability found\n");
@@ -481,6 +482,28 @@ show_capabilities(void)
 	printf("\n");
 }
 
+/*
+ * pcie_power=1 only: the card's 64-bit BAR0 at the start of the device tree's inbound memory window
+ * (ranges: cpu 0x40300000 = pci 0x40300000), memory decoding and bus mastering on, and the root
+ * port's memory window over it -- what Linux' enumeration would assign. Kept until the reset.
+ */
+#define BAR0_SIZE                 0x200000u         /* sized on the card: 2 MiB */
+
+static void
+assign_bar0(void)
+{
+	uint32_t base = PCIE_MEM_BASE, last = PCIE_MEM_BASE + BAR0_SIZE - 1;
+
+	wr(conf + 0x10, base | (ep_bar0 & 0xf));
+	wr(conf + 0x14, 0);
+	wr(conf + 0x04, rd(conf + 0x04) | 0x6);               /* memory space, bus master */
+	wr(dm_core + 0x20, (last & 0xfff00000u) | ((base >> 16) & 0xfff0u));   /* the root port's memory window */
+	ep_bar0 = ep_conf(0x10);
+	ep_bar1 = ep_conf(0x14);
+	printf("pcie: BAR0 assigned: %#010x %#010x, command %#06x; the root port forwards %#x..%#x\n", ep_bar0,
+	    ep_bar1, ep_conf(0x04) & 0xffff, base, last);
+}
+
 static void
 probe_endpoint(void)
 {
@@ -508,8 +531,8 @@ probe_endpoint(void)
 
 	ep_vendor = ep_conf(0x00) & 0xffff;
 	ep_device = ep_conf(0x00) >> 16;
-	printf("pcie: the endpoint answers %#06x:%#06x, class %#06x revision %#x; the device tree expects %#06x:%#06x\n",
-	    ep_vendor, ep_device, ep_conf(0x08) & 0xffffff, ep_conf(0x08) >> 24, WCN_VENDOR, WCN7850_DEVICE);
+	printf("pcie: the endpoint answers %#06x:%#06x, class %#08x revision %#x; the device tree expects %#06x:%#06x\n",
+	    ep_vendor, ep_device, ep_conf(0x08) >> 8, ep_conf(0x08) & 0xff, WCN_VENDOR, WCN7850_DEVICE);
 	if (ep_vendor == 0xffff || ep_vendor == 0) {
 		printf("pcie: nobody answers on the link -- trained but silent, or the wrong bus numbering\n");
 	} else {
@@ -520,6 +543,9 @@ probe_endpoint(void)
 			    "some other Qualcomm function of this card family");
 		}
 		show_bars();
+		if (power && ep_alive && (ep_bar0 & ~0xfu) == 0 && (ep_bar0 & 0x7) == 4) {
+			assign_bar0();
+		}
 		show_capabilities();
 		printf("pcie: command %#010x, interrupt pin %u line %u\n", ep_conf(0x04),
 		    (ep_conf(0x3c) >> 16) & 0xff, ep_conf(0x3c) >> 24);
@@ -555,6 +581,21 @@ read_mhi(void)
 		    "pcie: reads only what the firmware's ranges map one to one, so the MHI face waits\n", where,
 		    (unsigned long)PCIE_MEM_BASE, (unsigned long)PCIE_MEM_END);
 		return;
+	}
+	if (power) {
+		vm_offset_t iatu = dm_core + IATU_OFF;
+
+		/* outbound region 1, memory: cpu == pci over the BAR (dw_pcie_prog_outbound_atu's layout) */
+		wr(iatu + IATU_CTRL2(1), 0);
+		wr(iatu + IATU_CTRL1(1), 0);
+		wr(iatu + IATU_LBAR(1), where);
+		wr(iatu + IATU_UBAR(1), 0);
+		wr(iatu + IATU_LAR(1), where + BAR0_SIZE - 1);
+		wr(iatu + IATU_LTAR(1), where);
+		wr(iatu + IATU_UTAR(1), 0);
+		wr(iatu + IATU_CTRL2(1), IATU_ENABLE);
+		printf("pcie: outbound region 1 maps %#x..%#x to the same PCI addresses (ctrl2 %#010x)\n", where,
+		    where + BAR0_SIZE - 1, rd(iatu + IATU_CTRL2(1)));
 	}
 	mhi = ml_io_map(where & ~0xfffUL, 0x1000 + (where & 0xfff));
 	if (mhi == 0) {
@@ -592,7 +633,7 @@ read_mhi(void)
  * the host's log name the part that stops it. With them (7e54fac) the mapping and the clock
  * controller's reads passed and the stop came with the pin reads.
  */
-static uint32_t pause_s, power;
+static uint32_t pause_s;
 
 /* the wlan_kiwi node's pins (device tree line 1005: wlan-en 16, sw-ctrl 18/19) and pcie0's (line 34490) */
 static const struct { const char *what; unsigned pin; const char *alt1; } card_pins[] = {
@@ -673,8 +714,9 @@ pcie_thread(void *parameter, __unused wait_result_t result)
 	read_mhi();
 
 out:
-	printf("pcie: the survey is over: %s%s; everything written was given back\n",
-	    link_up ? "the link is up" : "the link is down", ep_alive ? " and the card identified itself" : "");
+	printf("pcie: the survey is over: %s%s; %s\n",
+	    link_up ? "the link is up" : "the link is down", ep_alive ? " and the card identified itself" : "",
+	    power ? "the power-up and BAR0 stay until the reset" : "everything written was given back");
 	thread_terminate(current_thread());
 }
 

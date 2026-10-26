@@ -57,7 +57,8 @@
  *                  registers with context fault interrupts disabled; GMU context 2 is unchanged
  * adreno8_arc_read=1  stage-1 diagnostic: Apps DRV2 cx.lvl then mx.lvl reads; requires explicit
  *                  touchscreen=0 and a host cold reset after any register write
- * adreno8_speed=N     GX operating point; only 1 (160 MHz) is exposed before SKU selection
+ * adreno8_speed=N     fastest GX speed: 1 (160 MHz) stays at 160 MHz; 2 (222 MHz) or 3 (342 MHz)
+ *                  lets the speed follow load and touches from 160 MHz up to it (adreno8_speed_tick)
  * adreno8_inflight=N  submissions the context queue may hold ahead of the GPU, 1 to 8 (default 4);
  *                  1 waits for each submission before the next, as stage 23 first did
  * adreno8_gmuclk=1    retain CX/MX votes, initialize GMU 650/HUB 200 MHz, then GMU 500

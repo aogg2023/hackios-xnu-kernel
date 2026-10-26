@@ -268,6 +268,8 @@ static uint64_t clock_now = 1, hot = 450; static bool hot_read = true;
 static uint64_t mach_absolute_time(void) { return clock_now; }
 static void absolutetime_to_nanoseconds(uint64_t a, uint64_t *n) { *n = a; }
 static bool annibale_gpu_temperature(int32_t *t) { *t = (int32_t)hot; return hot_read; }
+static uint64_t adreno8_retired_total, touched_at;
+static uint64_t annibale_cpufreq_touched(void) { return touched_at; }
 static struct block adreno8_gmu;
 static uint32_t adreno8_step, adreno8_gx_count = 2;
 static uint32_t adreno8_speed_asked;
@@ -284,7 +286,7 @@ static struct adreno8_bcm_db aux[3] = {{4800000, 64, 0, 0}, {4800000, 16, 1, 0},
 static bool adreno8_gmu_runs = true, adreno8_gmu_talks, wait_ok = true, vote_ok = true;
 static vm_offset_t adreno8_hfi_view_table = 1, adreno8_hfi_view_cmd = 1;
 static vm_offset_t adreno8_hfi_view_resp = 1, adreno8_hfi_view_debug = 1;
-static uint32_t version = 0x20070001, mask_written, sent[3][255], ids[3], lengths[3], send_count, fail_id;
+static uint32_t version = 0x20070001, mask_written, sent[8][255], ids[8], lengths[8], send_count, fail_id;
 
 #define BCM_COUNT 3
 #define GMU_GMU2HOST_CLR 0
@@ -332,7 +334,7 @@ static uint32_t adreno8_rpmh_lookup(const char *name, uint16_t *levels, unsigned
     return 0x3000 + i * 4;
 }
 static bool adreno8_hfi_send(uint32_t id, const uint32_t *payload, uint32_t words, const char *what) {
-    assert(send_count < 3 && words <= 255);
+    assert(send_count < 8 && words <= 255);
     if (id == 30) assert(adreno8_reset_required);
     ids[send_count] = id; lengths[send_count] = words;
     if (words) memcpy(sent[send_count], payload, words * 4);
@@ -419,27 +421,45 @@ int main(void) {
     hwsched_ready = true;
     send_count = 0; fail_id = 30; adreno8_reset_required = false;
     assert(!adreno8_step_gx_power() && adreno8_reset_required);
-    /* The speed tick: 342 MHz once cool, back to 160 at 70 C or without a reading, every 100 ms at most. */
+    /*
+     * The speed tick, every 100 ms at most: 342 MHz from 20% of the time busy at 160 MHz or a touch in the last
+     * 300 ms, back to 160 after 500 ms under 10%, and 160 at 70 C or without a reading until below 60 C.
+     * 384000 always-on ticks are 20 ms, 20% of a 100 ms tick at 160 MHz.
+     */
     for (unsigned i = 0; i < 4; i++) { adreno8_gx_hz[i] = i ? adreno8_boot_speeds[i - 1].hz : 0; }
     adreno8_gx_count = 4; adreno8_hfi_tables_sent = true; adreno8_reset_required = true; fail_id = 0;
-    adreno8_speed_asked = 1; send_count = 0; adreno8_speed_tick(); assert(send_count == 0);
+    adreno8_speed_asked = 1; send_count = 0; adreno8_retired_total = 1000000; adreno8_speed_tick(); assert(send_count == 0);
     adreno8_speed_asked = 4; adreno8_speed_tick(); assert(send_count == 0);
     adreno8_speed_asked = 3; adreno8_hfi_tables_sent = false; adreno8_speed_tick(); assert(send_count == 0);
-    adreno8_hfi_tables_sent = true; adreno8_speed_tick();
-    assert(send_count == 1 && ids[0] == 30 && sent[0][0] == 1 && sent[0][1] == 3 && sent[0][2] == 3);
-    clock_now += 50000000; hot = 700; adreno8_speed_tick(); assert(send_count == 1);
+    adreno8_hfi_tables_sent = true; adreno8_speed_tick(); assert(send_count == 0);
+    clock_now += 100000000; adreno8_retired_total += 383999; adreno8_speed_tick(); assert(send_count == 0);
+    clock_now += 50000000; adreno8_retired_total += 384000; adreno8_speed_tick(); assert(send_count == 0);
     clock_now += 50000000; adreno8_speed_tick();
+    assert(send_count == 1 && ids[0] == 30 && sent[0][0] == 1 && sent[0][1] == 3 && sent[0][2] == 3);
+    /* 9 ms of 100 at 342 MHz would be 19 at 160: between the two limits, the speed stays, and light ticks before count no more. */
+    for (unsigned i = 0; i < 3; i++) { clock_now += 100000000; adreno8_retired_total += 76800; adreno8_speed_tick(); }
+    for (unsigned i = 0; i < 8; i++) { clock_now += 100000000; adreno8_retired_total += 172800; adreno8_speed_tick(); }
+    assert(send_count == 1);
+    /* 4 ms of 100 at 342 MHz is 8.6 at 160: down once that lasted 500 ms. */
+    for (unsigned i = 0; i < 5; i++) { clock_now += 100000000; adreno8_retired_total += 76800; adreno8_speed_tick(); }
+    assert(send_count == 1);
+    clock_now += 100000000; adreno8_retired_total += 76800; adreno8_speed_tick();
     assert(send_count == 2 && sent[1][1] == 1 && sent[1][2] == 2);
-    clock_now += 100000000; hot = 650; adreno8_speed_tick(); assert(send_count == 2);
-    clock_now += 100000000; hot = 599; adreno8_speed_tick();
+    clock_now += 100000000; touched_at = clock_now - 300000000; adreno8_speed_tick(); assert(send_count == 2);
+    clock_now += 100000000; touched_at = clock_now - 299999999; adreno8_speed_tick();
     assert(send_count == 3 && sent[2][1] == 3);
+    clock_now += 100000000; hot = 700; adreno8_speed_tick();
+    assert(send_count == 4 && sent[3][1] == 1);
+    clock_now += 100000000; hot = 650; touched_at = clock_now; adreno8_speed_tick(); assert(send_count == 4);
+    clock_now += 100000000; hot = 599; touched_at = clock_now; adreno8_speed_tick();
+    assert(send_count == 5 && sent[4][1] == 3);
     send_count = 0; clock_now += 100000000; hot_read = false; adreno8_speed_tick();
     assert(send_count == 1 && sent[0][1] == 1);
-    send_count = 0; clock_now += 100000000; hot_read = true; hot = 400; fail_id = 30; adreno8_speed_tick();
-    assert(send_count == 1 && adreno8_speed_asked == 1);
+    send_count = 0; clock_now += 100000000; hot_read = true; hot = 400; touched_at = clock_now; fail_id = 30;
+    adreno8_speed_tick(); assert(send_count == 1 && adreno8_speed_asked == 1);
     clock_now += 100000000; fail_id = 0; adreno8_speed_tick(); assert(send_count == 1);
-    { uint32_t mhz, changes; adreno8_speed_state(&mhz, &changes); assert(mhz == 160 && changes == 4); }
-    puts("HFI version, perf/BW payloads, ACV threshold, AB=0, minimum DCVS and the temperature-guarded speed: PASS");
+    { uint32_t mhz, changes; adreno8_speed_state(&mhz, &changes); assert(mhz == 160 && changes == 6); }
+    puts("HFI version, perf/BW payloads, ACV threshold, AB=0, minimum DCVS and the load, touch and temperature speed rules: PASS");
 }
 '''
 
@@ -479,6 +499,12 @@ vote_mutations = [
 ]
 speed_mutations = [
     ("70 C kept at speed", "tenths >= SPEED_HOT_TENTHS", "tenths > SPEED_HOT_TENTHS"),
+    ("cooling below 60 C not needed", "tenths < SPEED_COOL_TENTHS", "tenths < SPEED_HOT_TENTHS"),
+    ("load at the speed it ran, not at the slowest", "* adreno8_gx_hz[adreno8_speed_now] / adreno8_gx_hz[1]", "* 1"),
+    ("20% busy kept slow", "permille >= SPEED_UP_PERMILLE", "permille > SPEED_UP_PERMILLE"),
+    ("down at once when light", "light >= SPEED_DOWN_NS", "light >= 0"),
+    ("medium load counted as light", "\t} else {\n\t\tadreno8_speed_light_since = 0;\n\t}", "\t}"),
+    ("touch ignored", "touch_age < SPEED_TOUCH_NS", "touch_age < 0"),
     ("missing reading kept at speed", "if (!reading || tenths", "if (tenths"),
     ("speed vote without rate limit", "since < SPEED_TICK_NS", "since < 0"),
     ("bus row of the slowest speed", "adreno8_speeds[want - 1].bus", "adreno8_speeds[0].bus"),

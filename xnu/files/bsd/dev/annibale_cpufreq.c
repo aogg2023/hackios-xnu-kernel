@@ -201,6 +201,13 @@ scmi_call(uint32_t message, const uint32_t *in, uint32_t in_words, uint32_t *out
 /* The hottest valid reading of a group, in tenths of a degree; false if none was valid. */
 static bool tsens_hottest(unsigned group, int32_t *tenths);
 
+/* For adreno8_speed_tick(): the last touch, which boosts the GPU as it boosts the processors. */
+uint64_t
+annibale_cpufreq_touched(void)
+{
+	return os_atomic_load(&touch_at, relaxed);
+}
+
 /* For adreno8_speed_tick(): the GPU group, mapped only with cpufreq=N. */
 bool
 annibale_gpu_temperature(int32_t *tenths)

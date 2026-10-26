@@ -140,6 +140,7 @@ adreno8_hfi_health(void)
  * as the work's active time for GMU firmware older than HFI minor 4.
  */
 static uint64_t retired_ticks;
+uint64_t adreno8_retired_total;                 /* never reset: adreno8_speed_tick()'s measure of load */
 static uint32_t retired_count, retired_by[7];
 
 static void
@@ -154,6 +155,7 @@ adreno8_retire_note(const uint32_t *msg)
 	retired_by[bucket]++;
 	retired_count++;
 	retired_ticks += ticks;
+	adreno8_retired_total += ticks;
 }
 
 /* What the notifications said since this was last asked (redwood_gpu_worked's contract). */
@@ -564,18 +566,27 @@ adreno8_step_gx_power(void)
 }
 
 /*
- * adreno8_speed=N above 1: the GPU runs at speed N of adreno8_boot_speeds (1 the slowest) once it
- * draws. Called with each submission under RedwoodGPU's lock, acting at most every 100 ms: at
- * 70 C on any GPU sensor, or without a reading, the GPU goes back to the slowest speed until
- * every sensor is below 60 C (the rule of annibale_cpufreq.c for the processors). A vote the
- * GMU does not acknowledge ends the raising for the run.
+ * adreno8_speed=N above 1: the GPU's speed follows its load between speed 1 and speed N of
+ * adreno8_boot_speeds (1 the slowest). Called with each submission under RedwoodGPU's lock and
+ * acting at most every 100 ms, on the GPU time of the submissions retired since (TS_RETIRE):
+ *  - up to N at once when that time, scaled to speed 1, is 20% of the interval or more, or within
+ *    300 ms of a touch (annibale_cpufreq.c's boost);
+ *  - back to speed 1 once it would have stayed below 10% at speed 1 for 500 ms;
+ *  - speed 1 while any GPU sensor reads 70 C or more, or none reads, until all are below 60 C
+ *    (the rule of annibale_cpufreq.c for the processors).
+ * A vote the GMU does not acknowledge ends the changes for the run.
  */
 #define SPEED_TICK_NS           100000000ull
+#define SPEED_UP_PERMILLE       200
+#define SPEED_DOWN_PERMILLE     100
+#define SPEED_DOWN_NS           500000000ull
+#define SPEED_TOUCH_NS          300000000ull
 #define SPEED_HOT_TENTHS        700
 #define SPEED_COOL_TENTHS       600
 
 static uint32_t adreno8_speed_now = 1, adreno8_speed_changes;
-static uint64_t adreno8_speed_ticked;
+static uint64_t adreno8_speed_ticked, adreno8_speed_busy_seen, adreno8_speed_light_since;
+static bool adreno8_speed_hot;
 
 /* For RedwoodGPU's statistics: the speed voted last (the step 15 vote until a change) and the changes since. */
 void
@@ -588,7 +599,7 @@ adreno8_speed_state(uint32_t *mhz, uint32_t *changes)
 void
 adreno8_speed_tick(void)
 {
-	uint64_t now = mach_absolute_time(), since;
+	uint64_t now = mach_absolute_time(), since, light, touched, touch_age, permille, busy_ns;
 	uint32_t want = adreno8_speed_now, msg[3];
 	int32_t tenths = 0;
 	bool reading;
@@ -600,12 +611,34 @@ adreno8_speed_tick(void)
 	if (adreno8_speed_ticked != 0 && since < SPEED_TICK_NS) {
 		return;
 	}
+	busy_ns = (adreno8_retired_total - adreno8_speed_busy_seen) * 10000 / 192;
+	permille = adreno8_speed_ticked != 0 && since != 0 ?
+	    busy_ns * 1000 / since * adreno8_gx_hz[adreno8_speed_now] / adreno8_gx_hz[1] : 0;
 	adreno8_speed_ticked = now;
+	adreno8_speed_busy_seen = adreno8_retired_total;
+	touched = annibale_cpufreq_touched();
+	absolutetime_to_nanoseconds(now - touched, &touch_age);
 	reading = annibale_gpu_temperature(&tenths);
 	if (!reading || tenths >= SPEED_HOT_TENTHS) {
-		want = 1;
+		adreno8_speed_hot = true;
 	} else if (tenths < SPEED_COOL_TENTHS) {
+		adreno8_speed_hot = false;
+	}
+	if (adreno8_speed_hot) {
+		want = 1;
+	} else if (permille >= SPEED_UP_PERMILLE || (touched != 0 && touched <= now && touch_age < SPEED_TOUCH_NS)) {
 		want = adreno8_speed_asked;
+		adreno8_speed_light_since = 0;
+	} else if (permille < SPEED_DOWN_PERMILLE) {
+		if (adreno8_speed_light_since == 0) {
+			adreno8_speed_light_since = now;
+		}
+		absolutetime_to_nanoseconds(now - adreno8_speed_light_since, &light);
+		if (light >= SPEED_DOWN_NS) {
+			want = 1;
+		}
+	} else {
+		adreno8_speed_light_since = 0;
 	}
 	if (want == adreno8_speed_now) {
 		return;
@@ -619,8 +652,6 @@ adreno8_speed_tick(void)
 		adreno8_speed_asked = 1;
 		return;
 	}
-	printf("adreno8: GPU at %u MHz (hottest GPU sensor %s%d.%d C)\n", adreno8_gx_hz[want] / 1000000,
-	    reading ? "" : "unread, ", tenths / 10, (tenths < 0 ? -tenths : tenths) % 10);
 	adreno8_speed_now = want;
 	adreno8_speed_changes++;
 }

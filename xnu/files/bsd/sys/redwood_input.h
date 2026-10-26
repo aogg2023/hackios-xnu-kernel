@@ -81,6 +81,7 @@ void redwood_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's proce
 void annibale_cpufreq_init(void);       /* ... on annibale: cpufreq=1 a governor, 2 a report, 3 the ceiling (bsd/dev/annibale_cpufreq.c) */
 void annibale_cpufreq_touch(void);      /* a touch: the governor's boost */
 bool annibale_gpu_temperature(int32_t *tenths); /* the hottest GPU sensor; false without cpufreq=N or a valid reading */
+uint64_t annibale_cpufreq_touched(void);        /* mach_absolute_time() of the last touch, 0 for none */
 void redwood_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
 void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void redwood_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */

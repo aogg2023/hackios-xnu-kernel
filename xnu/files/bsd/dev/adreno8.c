@@ -87,7 +87,7 @@
 
 uint32_t adreno8_skip_steps, adreno8_pause_ms = 2200, adreno8_fine, adreno8_watch_seconds = 20;
 
-uint32_t adreno8_speed_asked;                  /* adreno8_speed: 1 lowest (step 15) */
+uint32_t adreno8_speed_asked;                  /* adreno8_speed: the speed once drawing, 1 the slowest (adreno8_speed_tick) */
 
 uint32_t adreno8_inflight = 4;                 /* adreno8_inflight (adreno8_context_submit) */
 

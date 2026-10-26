@@ -3,6 +3,7 @@
 #include "adreno8_hwsched_private.h"
 #include "adreno8_memory_private.h"
 #include "adreno8_clock_private.h"
+#include <sys/redwood_input.h>
 
 #define printf adreno8_say
 
@@ -537,15 +538,15 @@ adreno8_step_tables(void)
 bool
 adreno8_step_gx_power(void)
 {
-	uint32_t msg[3] = {1, 1, 2}; /* Blocking ACK, 160 MHz, DDR index 2; AB=0. */
+	uint32_t msg[3] = {1, 1, 2}; /* Blocking ACK, 160 MHz, DDR index 2; AB=0. adreno8_speed_tick() raises it later. */
 	uint32_t power;
 
 	if (!adreno8_cx_ready() || !adreno8_gmu_talks ||
 	    !(adreno8_direct_ring ? adreno8_ordinary_ready() : adreno8_hwsched_ready())) {
 		return false;
 	}
-	if (!adreno8_gpu8_keep || adreno8_gpu8_return || adreno8_gx_count != 2 ||
-	    adreno8_gx_hz[1] != 160000000 || adreno8_speed_asked > 1) {
+	if (!adreno8_gpu8_keep || adreno8_gpu8_return || adreno8_gx_count < 2 ||
+	    adreno8_gx_hz[1] != 160000000 || adreno8_speed_asked >= adreno8_gx_count) {
 		printf("adreno8: %u: DCVS probe requires keep=1, return=0 and the 160 MHz table; finish with host cold reset\n", adreno8_step);
 		return false;
 	}
@@ -560,6 +561,59 @@ adreno8_step_gx_power(void)
 	printf("adreno8: %u: DCVS acknowledged; GX status %#x (%s); GPU execution remains pending\n",
 	    adreno8_step, power, GMU_PWR_GX_UP(power) ? "power and clock on" : "power or clock off");
 	return true;
+}
+
+/*
+ * adreno8_speed=N above 1: the GPU runs at speed N of adreno8_boot_speeds (1 the slowest) once it
+ * draws. Called with each submission under RedwoodGPU's lock, acting at most every 100 ms: at
+ * 70 C on any GPU sensor, or without a reading, the GPU goes back to the slowest speed until
+ * every sensor is below 60 C (the rule of annibale_cpufreq.c for the processors). A vote the
+ * GMU does not acknowledge ends the raising for the run.
+ */
+#define SPEED_TICK_NS           100000000ull
+#define SPEED_HOT_TENTHS        700
+#define SPEED_COOL_TENTHS       600
+
+static uint32_t adreno8_speed_now = 1;
+static uint64_t adreno8_speed_ticked;
+
+void
+adreno8_speed_tick(void)
+{
+	uint64_t now = mach_absolute_time(), since;
+	uint32_t want = adreno8_speed_now, msg[3];
+	int32_t tenths = 0;
+	bool reading;
+
+	if (adreno8_speed_asked <= 1 || adreno8_speed_asked >= adreno8_gx_count || !adreno8_hfi_tables_sent) {
+		return;
+	}
+	absolutetime_to_nanoseconds(now - adreno8_speed_ticked, &since);
+	if (adreno8_speed_ticked != 0 && since < SPEED_TICK_NS) {
+		return;
+	}
+	adreno8_speed_ticked = now;
+	reading = annibale_gpu_temperature(&tenths);
+	if (!reading || tenths >= SPEED_HOT_TENTHS) {
+		want = 1;
+	} else if (tenths < SPEED_COOL_TENTHS) {
+		want = adreno8_speed_asked;
+	}
+	if (want == adreno8_speed_now) {
+		return;
+	}
+	msg[0] = 1;
+	msg[1] = want;
+	msg[2] = adreno8_speeds[want - 1].bus;
+	if (!adreno8_hfi_send(30, msg, 3, "GPU speed")) {
+		printf("adreno8: the GPU speed vote for %u MHz was not acknowledged; staying at %u MHz\n",
+		    adreno8_gx_hz[want] / 1000000, adreno8_gx_hz[adreno8_speed_now] / 1000000);
+		adreno8_speed_asked = 1;
+		return;
+	}
+	printf("adreno8: GPU at %u MHz (hottest GPU sensor %s%d.%d C)\n", adreno8_gx_hz[want] / 1000000,
+	    reading ? "" : "unread, ", tenths / 10, (tenths < 0 ? -tenths : tenths) % 10);
+	adreno8_speed_now = want;
 }
 
 /* ---- step 16: the last look ------------------------------------------------------------------------------------ */

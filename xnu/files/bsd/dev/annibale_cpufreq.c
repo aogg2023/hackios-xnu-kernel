@@ -90,6 +90,7 @@ static const struct {
 	{ "GPU", 0x0c22a000, 1, 8 },
 };
 #define TSENS_GROUPS            (sizeof(tsens_groups) / sizeof(tsens_groups[0]))
+#define TSENS_GPU               2
 
 static volatile uint32_t *scmi_shmem, *scmi_doorbell;
 static uint32_t scmi_token, mode;
@@ -198,6 +199,16 @@ scmi_call(uint32_t message, const uint32_t *in, uint32_t in_words, uint32_t *out
 }
 
 /* The hottest valid reading of a group, in tenths of a degree; false if none was valid. */
+static bool tsens_hottest(unsigned group, int32_t *tenths);
+
+/* For adreno8_speed_tick(): the GPU group, mapped only with cpufreq=N. */
+bool
+annibale_gpu_temperature(int32_t *tenths)
+{
+	return tsens_base[TSENS_GPU] != 0 && tsens_hottest(TSENS_GPU, tenths);
+}
+
+
 static bool
 tsens_hottest(unsigned group, int32_t *tenths)
 {

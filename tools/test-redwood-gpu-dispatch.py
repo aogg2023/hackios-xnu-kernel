@@ -21,12 +21,13 @@ STUB = r'''
 typedef uintptr_t vm_offset_t;
 static bool annibale, adreno8_gpu8_keep, adreno8_gpu8_return, bo_open, self_test, publish_ok;
 static uint32_t adreno8_gx_hz[17] = {0, 160000000}, gpu_va, gpu_log;
-static unsigned legacy_calls, enable_calls, close_calls, stop_calls, cache_calls, submit_calls, publish_calls, ready_checks;
+static unsigned legacy_calls, enable_calls, close_calls, stop_calls, cache_calls, submit_calls, publish_calls, ready_checks, speed_ticks;
 static bool redwood_platform_is_annibale(void) { return annibale; }
 static int adreno8_say(const char *format, ...) { (void)format; return 0; }
 static bool PE_parse_boot_argn(const char *key, void *value, unsigned size) {
     assert(!strcmp(key, "gpu_log") && size == 4); *(uint32_t *)value = 1; return true;
 }
+void adreno8_speed_tick(void);
 static void adreno8_to_memory(vm_offset_t address, uint64_t size) {
     assert((address == 0x1000 && size == 4096) || (!address && !size)); cache_calls++;
 }
@@ -51,6 +52,7 @@ bool adreno8_context_done(uint32_t fence) { assert(bo_open && fence == 17); retu
 uint32_t adreno8_context_last(void) { return 17; }
 bool adreno8_context_close(void) { assert(bo_open); close_calls++; return true; }
 bool adreno8_gpu_faulted(void) { return !bo_open; }
+void adreno8_speed_tick(void) { assert(bo_open); speed_ticks++; }
 void adreno8_hfi_worked(uint64_t *u, uint32_t *c, uint32_t by[7]) { *u = *c = 3; for (unsigned i=0;i<7;i++) by[i]=3; }
 bool RedwoodGPUStart(void) { assert(bo_open); publish_calls++; return publish_ok; }
 bool legacy_gpu_ready(void) { legacy_calls++; return true; }
@@ -85,7 +87,9 @@ static void exercise(bool platform) {
     assert(used == (platform ? 0u : 7u) && live == used && largest == used && holes == used && most == used && lost == used && refused == used);
     assert(redwood_gpu_map(address, 0x50000000, true) && redwood_gpu_mapped() && redwood_gpu_unmap(address, 4096));
     redwood_gpu_to_memory((void *)0x1000, 4096);
+    speed_ticks = 0;
     assert(redwood_gpu_submit(&address, &words, 1) == 17 && redwood_gpu_done(17) && redwood_gpu_last() == 17);
+    assert(speed_ticks == (platform ? 1u : 0u));
     redwood_gpu_worked(&value, &timed, by);
     assert(value == (platform ? 3u : 7u) && timed == value && by[6] == value);
     assert(redwood_gpu_recover() == !platform);

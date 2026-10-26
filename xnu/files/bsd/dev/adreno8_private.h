@@ -53,7 +53,7 @@ struct adreno8_bcm_db {
 };
 
 struct adreno8_gpu_level {
-	uint32_t hz, level;
+	uint32_t hz, level, bus;        /* bus: the stock table's qcom,bus-freq, a row of adreno8_bw_kb */
 };
 
 struct adreno8_bcm {
@@ -414,6 +414,8 @@ bool
 adreno8_step_tables(void);
 bool
 adreno8_step_gx_power(void);
+void
+adreno8_speed_tick(void);
 bool
 adreno8_step_last_look(void);
 bool

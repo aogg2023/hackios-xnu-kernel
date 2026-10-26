@@ -122,7 +122,9 @@ uint32_t
 redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
 	if (!redwood_platform_is_annibale()) return legacy_gpu_submit(addresses, words, count);
-	return adreno8_bo_ready() ? adreno8_context_submit(addresses, words, count) : 0;
+	if (!adreno8_bo_ready()) return 0;
+	adreno8_speed_tick();
+	return adreno8_context_submit(addresses, words, count);
 }
 
 bool

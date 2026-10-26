@@ -261,8 +261,13 @@ typedef uintptr_t vm_offset_t;
 struct block { vm_offset_t base; };
 struct adreno8_bcm_db { uint32_t unit; uint16_t width; uint8_t vcd, reserved; };
 struct adreno8_bcm { const char *name; uint32_t buswidth; bool fixed; uint32_t perfmode, perfmode_bw; };
-struct adreno8_gpu_level { uint32_t hz, level; };
+struct adreno8_gpu_level { uint32_t hz, level, bus; };
 ''' + BOOT_DATA + r'''
+static const struct adreno8_gpu_level *adreno8_speeds = adreno8_boot_speeds;
+static uint64_t clock_now = 1, hot = 450; static bool hot_read = true;
+static uint64_t mach_absolute_time(void) { return clock_now; }
+static void absolutetime_to_nanoseconds(uint64_t a, uint64_t *n) { *n = a; }
+static bool annibale_gpu_temperature(int32_t *t) { *t = (int32_t)hot; return hot_read; }
 static struct block adreno8_gmu;
 static uint32_t adreno8_step, adreno8_gx_count = 2;
 static uint32_t adreno8_speed_asked;
@@ -342,8 +347,10 @@ int main(void) {
     assert(adreno8_dep_vote(128,&dependency) && dependency==0xffffc3ffu);
     assert(adreno8_dep_vote(448,&dependency) && dependency==0xffffc9ffu);
     assert(!adreno8_dep_vote(480,&dependency));
-    assert(sizeof(adreno8_boot_speeds) / sizeof(adreno8_boot_speeds[0]) == 1);
-    assert(adreno8_boot_speeds[0].hz == 160000000 && adreno8_boot_speeds[0].level == 50);
+    assert(sizeof(adreno8_boot_speeds) / sizeof(adreno8_boot_speeds[0]) == 3);
+    assert(adreno8_boot_speeds[0].hz == 160000000 && adreno8_boot_speeds[0].level == 50 && adreno8_boot_speeds[0].bus == 2);
+    assert(adreno8_boot_speeds[1].hz == 222000000 && adreno8_boot_speeds[1].level == 52 && adreno8_boot_speeds[1].bus == 2);
+    assert(adreno8_boot_speeds[2].hz == 342000000 && adreno8_boot_speeds[2].level == 56 && adreno8_boot_speeds[2].bus == 3);
     adreno8_gx_hz[1] = adreno8_boot_speeds[0].hz;
     adreno8_gx_level[1] = adreno8_boot_speeds[0].level;
     assert(adreno8_step_queues() && adreno8_gmu_talks && mask_written == UINT32_MAX);
@@ -412,7 +419,26 @@ int main(void) {
     hwsched_ready = true;
     send_count = 0; fail_id = 30; adreno8_reset_required = false;
     assert(!adreno8_step_gx_power() && adreno8_reset_required);
-    puts("HFI version, perf/BW payloads, ACV threshold, AB=0 and minimum DCVS: PASS");
+    /* The speed tick: 342 MHz once cool, back to 160 at 70 C or without a reading, every 100 ms at most. */
+    for (unsigned i = 0; i < 4; i++) { adreno8_gx_hz[i] = i ? adreno8_boot_speeds[i - 1].hz : 0; }
+    adreno8_gx_count = 4; adreno8_hfi_tables_sent = true; adreno8_reset_required = true; fail_id = 0;
+    adreno8_speed_asked = 1; send_count = 0; adreno8_speed_tick(); assert(send_count == 0);
+    adreno8_speed_asked = 4; adreno8_speed_tick(); assert(send_count == 0);
+    adreno8_speed_asked = 3; adreno8_hfi_tables_sent = false; adreno8_speed_tick(); assert(send_count == 0);
+    adreno8_hfi_tables_sent = true; adreno8_speed_tick();
+    assert(send_count == 1 && ids[0] == 30 && sent[0][0] == 1 && sent[0][1] == 3 && sent[0][2] == 3);
+    clock_now += 50000000; hot = 700; adreno8_speed_tick(); assert(send_count == 1);
+    clock_now += 50000000; adreno8_speed_tick();
+    assert(send_count == 2 && sent[1][1] == 1 && sent[1][2] == 2);
+    clock_now += 100000000; hot = 650; adreno8_speed_tick(); assert(send_count == 2);
+    clock_now += 100000000; hot = 599; adreno8_speed_tick();
+    assert(send_count == 3 && sent[2][1] == 3);
+    send_count = 0; clock_now += 100000000; hot_read = false; adreno8_speed_tick();
+    assert(send_count == 1 && sent[0][1] == 1);
+    send_count = 0; clock_now += 100000000; hot_read = true; hot = 400; fail_id = 30; adreno8_speed_tick();
+    assert(send_count == 1 && adreno8_speed_asked == 1);
+    clock_now += 100000000; fail_id = 0; adreno8_speed_tick(); assert(send_count == 1);
+    puts("HFI version, perf/BW payloads, ACV threshold, AB=0, minimum DCVS and the temperature-guarded speed: PASS");
 }
 '''
 
@@ -450,7 +476,13 @@ vote_mutations = [
     ("incorrect GMU startup rate", "{ 0, 500000000, 650000000 }", "{ 0, 500000000, 500000000 }"),
     ("incorrect GMU runtime level", "{ 0, 0x40, 0x80 }", "{ 0, 0x10, 0x80 }"),
 ]
-for label, before, after in vote_mutations:
+speed_mutations = [
+    ("70 C kept at speed", "tenths >= SPEED_HOT_TENTHS", "tenths > SPEED_HOT_TENTHS"),
+    ("missing reading kept at speed", "if (!reading || tenths", "if (tenths"),
+    ("speed vote without rate limit", "since < SPEED_TICK_NS", "since < 0"),
+    ("bus row of the slowest speed", "adreno8_speeds[want - 1].bus", "adreno8_speeds[0].bus"),
+]
+for label, before, after in vote_mutations + speed_mutations:
     assert STAGE_SOURCE.count(before) == 1, label
     checks.append((label, STAGE_SOURCE.replace(before, after, 1), True))
 
@@ -466,6 +498,6 @@ for label, source, rejected in checks:
         else:
             assert result.returncode == 0, result.stdout + result.stderr
             print(result.stdout, end="")
-print("HFI power encoding mutations rejected:", len(vote_mutations))
+print("HFI power encoding and speed mutations rejected:", len(vote_mutations) + len(speed_mutations))
 print("HFI FEATURE_CTRL v5 mutations rejected:", len(feature_mutations) + 1)
 print("HFI publication timing mutations rejected: 2")

@@ -579,12 +579,23 @@ read_mhi(void)
 /* ---- the run -------------------------------------------------------------------------------- */
 
 /*
- * pcie_pause=N: N seconds before each part of step 1 (mapping, the clock controller, the pins), each
+ * pcie_pause=N: N seconds before each part of step 1 (mapping, the clock controller, each pin), each
  * announced first. With pcie=1 and pcie=2 the kernel stopped answering USB within 8 s of the boot
  * (kernels 474d6e9 and 32bbef4) and the log the host had held no line of this file; the pauses let
- * the host's log name the part that stops it.
+ * the host's log name the part that stops it. With them (7e54fac) the mapping and the clock
+ * controller's reads passed and the stop came with the pin reads.
  */
 static uint32_t pause_s;
+
+/* the wlan_kiwi node's pins (device tree line 1005: wlan-en 16, sw-ctrl 18/19) and pcie0's (line 34490) */
+static const struct { const char *what; unsigned pin; const char *alt1; } card_pins[] = {
+	{ "the card's power enable", 16, "qup2_se4" },
+	{ "a control pin", 18, "wcn_sw_ctrl" },
+	{ "a control pin", 19, "wcn_sw" },
+	{ "PERST, the card's reset", 102, "phase_flag" },
+	{ "CLKREQ -- mux 1 means the phy owns it", 103, "pcie0_clk_req_n" },
+	{ "WAKE", 104, "pll_bist_sync" },
+};
 
 static void
 pause_before(const char *what)
@@ -612,13 +623,13 @@ pcie_thread(void *parameter, __unused wait_result_t result)
 	}
 	pause_before("read the clock controller");
 	readable = show_power();
-	pause_before("read the pin controller");
-	show_pin("the card's power enable", 16, 1, "qup2_se4");           /* the wlan_kiwi node's pins, */
-	show_pin("a control pin", 18, 1, "wcn_sw_ctrl");                  /* device tree line 1005:    */
-	show_pin("a control pin", 19, 1, "wcn_sw");                       /* wlan-en 16, sw-ctrl 18/19 */
-	show_pin("PERST, the card's reset", 102, 1, "phase_flag");        /* perst-gpio <0x27 0x66>, device tree */
-	show_pin("CLKREQ -- mux 1 means the phy owns it", 103, 1, "pcie0_clk_req_n");   /* line 34490 */
-	show_pin("WAKE", 104, 1, "pll_bist_sync");
+	for (unsigned i = 0; i < sizeof(card_pins) / sizeof(card_pins[0]); i++) {
+		char what[48];
+
+		snprintf(what, sizeof(what), "read GPIO %u in the pin controller", card_pins[i].pin);
+		pause_before(what);
+		show_pin(card_pins[i].what, card_pins[i].pin, 1, card_pins[i].alt1);
+	}
 	if (steps < 2) {
 		goto out;
 	}

@@ -51,6 +51,7 @@ bool adreno8_context_done(uint32_t fence) { assert(bo_open && fence == 17); retu
 uint32_t adreno8_context_last(void) { return 17; }
 bool adreno8_context_close(void) { assert(bo_open); close_calls++; return true; }
 bool adreno8_gpu_faulted(void) { return !bo_open; }
+void adreno8_hfi_worked(uint64_t *u, uint32_t *c, uint32_t by[7]) { *u = *c = 3; for (unsigned i=0;i<7;i++) by[i]=3; }
 bool RedwoodGPUStart(void) { assert(bo_open); publish_calls++; return publish_ok; }
 bool legacy_gpu_ready(void) { legacy_calls++; return true; }
 bool legacy_gpu_parameter(uint32_t p, uint64_t *v) { assert(p == 1); legacy_calls++; *v = 660; return true; }
@@ -86,7 +87,7 @@ static void exercise(bool platform) {
     redwood_gpu_to_memory((void *)0x1000, 4096);
     assert(redwood_gpu_submit(&address, &words, 1) == 17 && redwood_gpu_done(17) && redwood_gpu_last() == 17);
     redwood_gpu_worked(&value, &timed, by);
-    assert(value == (platform ? 0u : 7u) && timed == value && by[6] == value);
+    assert(value == (platform ? 3u : 7u) && timed == value && by[6] == value);
     assert(redwood_gpu_recover() == !platform);
     redwood_gpu_report("failed execution"); redwood_gpu_stop();
     assert(legacy_calls == (platform ? 0u : 16u));
@@ -255,7 +256,7 @@ def main():
         target=Path(folder); (target/"sys").mkdir()
         (target/"adreno8_private.h").write_text(STUB)
         (target/"sys/redwood_input.h").write_text("")
-        for name in ("adreno8_bo_private.h","adreno8_memory_private.h","adreno8_context_private.h","redwood_gpu_private.h"):
+        for name in ("adreno8_bo_private.h","adreno8_memory_private.h","adreno8_context_private.h","adreno8_hwsched_private.h","redwood_gpu_private.h"):
             (target/name).write_text((DEV/name).read_text())
         unit='#include "adreno8_private.h"\n'+dispatch+BACKENDS+DISPATCH_CASES
         run(unit,target,"dispatch",False)
@@ -269,18 +270,23 @@ def main():
         run(boundaries(source,fixture),target,"boundaries")
         queue=source[source.index('\tcase kMsmSubmitQueueNew:'):source.index('\tcase kMsmSubmitQueueQuery:')]
         worked=source[source.index('\tcase kRedwoodGPUWorked:'):source.index('\tcase kRedwoodSurface:')]
+        set_param=source[source.index('\tcase kMsmSetParam:'):source.index('\tcase kMsmGemCpuFini:')]
         queue_unit='''#include <cassert>\n#include <cstdint>\nstatic bool a830; static bool redwood_platform_is_annibale(){return a830;}
-        enum { kMsmSubmitQueueNew, kRedwoodGPUWorked, kIOReturnSuccess, kIOReturnBadArgument, kIOReturnUnsupported };
+        enum { kMsmSubmitQueueNew, kRedwoodGPUWorked, kMsmSetParam, kIOReturnSuccess, kIOReturnBadArgument, kIOReturnUnsupported };
+        #define MSM_PARAM_COMM 0x0c
+        #define MSM_PARAM_CMDLINE 0x0d
         static unsigned depth; static void IOLockLock(void*){depth++;} static void IOLockUnlock(void*){depth--;}
         static void *gGPULock; static void redwood_gpu_worked(uint64_t*,uint32_t*,uint32_t*){assert(!a830);}
         int call(unsigned selector,unsigned flags,unsigned prio) {
-        struct { struct{unsigned flags,prio,id;} queue; struct{uint64_t microseconds;uint32_t submissions,by[7];}worked;}r{};
-        r.queue.flags=flags;r.queue.prio=prio;unsigned fNextQueue=0;int ret=kIOReturnSuccess;
-        switch(selector){'''+queue+worked+'''} return ret; }
+        struct { struct{unsigned flags,prio,id;} queue; struct{uint64_t microseconds;uint32_t submissions,by[7];}worked; struct{unsigned param;} param;}r{};
+        r.param.param=flags;r.queue.flags=flags;r.queue.prio=prio;unsigned fNextQueue=0;int ret=kIOReturnSuccess;
+        switch(selector){'''+queue+worked+set_param+'''} return ret; }
         int main(){for(unsigned platform=0;platform<2;platform++){a830=platform;
         for(unsigned flags=0;flags<4;flags++)for(unsigned prio=0;prio<2;prio++)
         assert(call(kMsmSubmitQueueNew,flags,prio)==((a830&&(flags||prio))?kIOReturnBadArgument:kIOReturnSuccess));
-        assert(call(kRedwoodGPUWorked,0,0)==(a830?kIOReturnUnsupported:kIOReturnSuccess));assert(!depth);}}
+        assert(call(kRedwoodGPUWorked,0,0)==(a830?kIOReturnUnsupported:kIOReturnSuccess));assert(!depth);
+        for(unsigned param=0;param<0x18;param++)
+        assert(call(kMsmSetParam,param,0)==((param==0x0c||param==0x0d)?kIOReturnSuccess:kIOReturnBadArgument));}}
         '''
         run(queue_unit,target,"queues")
         variants=[("publication_state",publisher.replace('return (getState() & (kIOServiceRegisteredState | kIOServiceInactiveState)) == kIOServiceRegisteredState;','return true;',1)),

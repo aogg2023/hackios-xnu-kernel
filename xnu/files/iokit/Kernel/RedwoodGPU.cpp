@@ -188,6 +188,8 @@ struct redwood_worked {
 
 #define kRedwoodDescribe        0xffffffffu
 
+#define MSM_PARAM_COMM          0x0c
+#define MSM_PARAM_CMDLINE       0x0d
 #define MSM_INFO_GET_OFFSET     0
 #define MSM_INFO_GET_IOVA       1
 #define MSM_INFO_SET_NAME       2
@@ -660,7 +662,15 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 		ret = redwood_gpu_parameter(r.param.param, &r.param.value) ? kIOReturnSuccess : kIOReturnBadArgument;
 		IOLockUnlock(gGPULock);
 		break;
-	case kMsmSetParam:                              /* the program's name, for Linux's lists of who uses the GPU */
+	case kMsmSetParam:
+		/*
+		 * Only the program's name and command line, for Linux's lists of who uses the GPU. Turnip
+		 * reads success of any other, MSM_PARAM_EN_VM_BIND above all, as the parameter taking effect.
+		 */
+		if (r.param.param != MSM_PARAM_COMM && r.param.param != MSM_PARAM_CMDLINE) {
+			ret = kIOReturnBadArgument;
+		}
+		break;
 	case kMsmGemCpuFini:
 	case kMsmSubmitQueueClose:
 		break;

@@ -303,7 +303,7 @@ show_power(void)
 
 /*
  * One pin as Android's firmware left it. Layout from the platform's own pin controller driver
- * (pinctrl-sm8750.c): the per-pin blocks are 0x1000 apart; control at +0 holds pull in [2:0],
+ * (pinctrl-sm8750.c): the per-pin blocks are 0x1000 apart; control at +0 holds pull in [1:0] (0 none, 1 down, 2 keeper, 3 up),
  * function in [5:2], drive in [8:6], output enable at bit 9 (its PINGROUP macro, lines 35-43);
  * io at +4 carries the input's value at bit 0 and the output's at bit 1 (in_bit, out_bit,
  * lines 67-68). The function names of the six pins are that driver's lines 1451-1543.
@@ -312,7 +312,7 @@ static void
 show_pin(const char *what, unsigned pin, unsigned alt1, const char *alt1_name)
 {
 	uint32_t ctl = rd(tlmm + 0x1000UL * pin), io = rd(tlmm + 0x1000UL * pin + 0x04);
-	static const char *const pulls[] = { "no pull", "pull-up", "pull-down", "keeper" };
+	static const char *const pulls[] = { "no pull", "pull-down", "keeper", "pull-up" };       /* msm_gpio_set_config */
 	unsigned mux = (ctl >> 2) & 0xf;
 
 	printf("pcie: GPIO %3u (%s): mux %u (%s), %s, output enable %u, driven %u, input reads %u\n",

@@ -483,8 +483,10 @@ show_capabilities(void)
 }
 
 /*
- * pcie_power=1 only: the card's 64-bit BAR0 at the start of the device tree's inbound memory window
- * (ranges: cpu 0x40300000 = pci 0x40300000), memory decoding and bus mastering on, and the root
+ * pcie_power=1 only: the card's 64-bit BAR0 at the first address of the device tree's inbound memory
+ * window (ranges: cpu 0x40300000 = pci 0x40300000) aligned to its size -- 0x40400000; a BAR keeps
+ * only the bits above its size, so 0x40300000 read back as 0x40200000 (kernel 91e559d) -- memory
+ * decoding and bus mastering on, and the root
  * port's memory window over it -- what Linux' enumeration would assign. Kept until the reset.
  */
 #define BAR0_SIZE                 0x200000u         /* sized on the card: 2 MiB */
@@ -492,7 +494,7 @@ show_capabilities(void)
 static void
 assign_bar0(void)
 {
-	uint32_t base = PCIE_MEM_BASE, last = PCIE_MEM_BASE + BAR0_SIZE - 1;
+	uint32_t base = (PCIE_MEM_BASE + BAR0_SIZE - 1) & ~(BAR0_SIZE - 1), last = base + BAR0_SIZE - 1;
 
 	wr(conf + 0x10, base | (ep_bar0 & 0xf));
 	wr(conf + 0x14, 0);

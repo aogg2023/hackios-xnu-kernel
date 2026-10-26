@@ -416,6 +416,8 @@ bool
 adreno8_step_gx_power(void);
 void
 adreno8_speed_tick(void);
+void
+adreno8_speed_state(uint32_t *mhz, uint32_t *changes);
 bool
 adreno8_step_last_look(void);
 bool

@@ -170,6 +170,7 @@ static void redwood_gpu_worked(uint64_t *time, uint32_t *count, uint32_t by[7]) 
     *time = *count = 0; memset(by, 0, 7 * sizeof(*by));
 }
 static void redwood_gpu_space(uint64_t *, uint32_t *, uint64_t *, unsigned *, unsigned *, uint64_t *, uint32_t *) {}
+static void redwood_gpu_speed(uint32_t *mhz, uint32_t *changes) { *mhz = *changes = 0; }
 '''
 
 

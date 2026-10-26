@@ -67,6 +67,7 @@ bool redwood_gpu_done(uint32_t fence);
 uint32_t redwood_gpu_last(void);
 uint32_t adreno8_context_depth(void);
 void redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
+void redwood_gpu_speed(uint32_t * mhz, uint32_t * changes);
 void redwood_gpu_report(const char * why);
 bool redwood_gpu_recover(void);
 void redwood_gpu_stop(void);

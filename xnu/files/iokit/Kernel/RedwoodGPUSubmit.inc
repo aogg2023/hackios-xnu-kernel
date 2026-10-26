@@ -209,6 +209,12 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
 		    fBufferBytes >> 20);
+		uint32_t mhz, changes;
+
+		redwood_gpu_speed(&mhz, &changes);
+		if (mhz != 0) {
+			IOLog("RedwoodGPU: GPU at %u MHz, %u speed changes since it started\n", mhz, changes);
+		}
 		if (gpu_va != 0) {
 			/*
 			 * The address space itself, because nothing else said anything about it: what

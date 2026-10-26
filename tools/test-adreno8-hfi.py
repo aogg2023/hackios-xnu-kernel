@@ -438,6 +438,7 @@ int main(void) {
     send_count = 0; clock_now += 100000000; hot_read = true; hot = 400; fail_id = 30; adreno8_speed_tick();
     assert(send_count == 1 && adreno8_speed_asked == 1);
     clock_now += 100000000; fail_id = 0; adreno8_speed_tick(); assert(send_count == 1);
+    { uint32_t mhz, changes; adreno8_speed_state(&mhz, &changes); assert(mhz == 160 && changes == 4); }
     puts("HFI version, perf/BW payloads, ACV threshold, AB=0, minimum DCVS and the temperature-guarded speed: PASS");
 }
 '''

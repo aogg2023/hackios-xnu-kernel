@@ -574,8 +574,16 @@ adreno8_step_gx_power(void)
 #define SPEED_HOT_TENTHS        700
 #define SPEED_COOL_TENTHS       600
 
-static uint32_t adreno8_speed_now = 1;
+static uint32_t adreno8_speed_now = 1, adreno8_speed_changes;
 static uint64_t adreno8_speed_ticked;
+
+/* For RedwoodGPU's statistics: the speed voted last (the step 15 vote until a change) and the changes since. */
+void
+adreno8_speed_state(uint32_t *mhz, uint32_t *changes)
+{
+	*mhz = adreno8_gx_count > 1 ? adreno8_gx_hz[adreno8_speed_now] / 1000000 : 0;
+	*changes = adreno8_speed_changes;
+}
 
 void
 adreno8_speed_tick(void)
@@ -614,6 +622,7 @@ adreno8_speed_tick(void)
 	printf("adreno8: GPU at %u MHz (hottest GPU sensor %s%d.%d C)\n", adreno8_gx_hz[want] / 1000000,
 	    reading ? "" : "unread, ", tenths / 10, (tenths < 0 ? -tenths : tenths) % 10);
 	adreno8_speed_now = want;
+	adreno8_speed_changes++;
 }
 
 /* ---- step 16: the last look ------------------------------------------------------------------------------------ */

@@ -141,6 +141,15 @@ redwood_gpu_last(void)
 }
 
 void
+redwood_gpu_speed(uint32_t *mhz, uint32_t *changes)
+{
+	*mhz = *changes = 0;
+	if (redwood_platform_is_annibale()) {
+		adreno8_speed_state(mhz, changes);
+	}
+}
+
+void
 redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 {
 	if (!redwood_platform_is_annibale()) {

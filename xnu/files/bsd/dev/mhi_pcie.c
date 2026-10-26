@@ -34,20 +34,23 @@
  * sizing test, written all-ones and restored, every write read back. Nothing happens at all
  * unless a boot-arg asks:
  *
- *   pcie=N   run steps 1 through N, clamped to 3.
+ *   pcie=N   run steps 1 through N, clamped to 4.
  *
- *   step 1  read-only survey: the two PCIe power domains and the root complex's clocks in the clock
- *           controller (nothing past them is read unless both domains are on and the cfg_ahb,
- *           slv_axi, mstr_axi and aux clocks run), the six pins
- *           the device tree wires to the card (wlan-en 16, sw-ctrl 18 and 19, perst 102,
- *           clkreq 103, wake 104) as Android's firmware left them, the link state machine and
- *           the data link layer's own answer, the phy's power-present bit (device tree
- *           qcom,phy-status-offset 0x414 bit 6, lines 34483-34484), the root complex's own
- *           header read from the DBI, and the whole iATU window as the boot loader left it.
- *   step 2  the endpoint itself: with the link up (the vendor's rule), region 0 is remapped to
+ *   step 1  read-only, the clock controller and the pin controller only: the two PCIe power
+ *           domains, the root complex's clocks, and the six pins the device tree wires to the
+ *           card (wlan-en 16, sw-ctrl 18 and 19, perst 102, clkreq 103, wake 104) as the boot
+ *           firmware left them.
+ *   step 2  read-only, the root complex itself, 30 s after step 1 so that the host has step 1's
+ *           report if these reads stall the SoC, and only with both domains on and the cfg_ahb,
+ *           slv_axi, mstr_axi and aux clocks running: the link state machine and the data link
+ *           layer's own answer, the phy's power-present bit (device tree qcom,phy-status-offset
+ *           0x414 bit 6, lines 34483-34484), the root complex's own header read from the DBI,
+ *           and the whole iATU window as the boot loader left it. (The first run of the survey
+ *           with these reads in step 1, kernel 474d6e9, stopped answering USB 8 s into the boot.)
+ *   step 3  the endpoint itself: with the link up (the vendor's rule), region 0 is remapped to
  *           CFG and the card's 64-byte header, capability list and BARs are read, with the
  *           sizing test -- 0x17cb:0x1107 is the WCN7850 the device tree expects.
- *   step 3  MHI: if the card got a BAR0 inside the inbound memory window (device tree ranges,
+ *   step 4  MHI: if the card got a BAR0 inside the inbound memory window (device tree ranges,
  *           cpu 0x40300000 for 0x3d00000, unmapped), it is mapped and the device's state read.
  *
  * No firmware download, no BHI, no doorbells: those are the batches after this one. Nothing
@@ -56,8 +59,9 @@
  * The boot-arg is pcie= and not wifi= on purpose: bsd/dev/redwood_wifi.c takes wifi= for the old
  * phone's WCN6750 (there wifi=1 is its production path, its line 4269) and stays as it is -- the
  * names cannot collide, the two drivers cannot be started by one command line by accident, and
- * this phone's command line carries pcie=3. An SoC guard for the old driver is on the backlog.
+ * this phone's command line carries pcie=N. An SoC guard for the old driver is on the backlog.
  */
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -142,7 +146,7 @@ wr(vm_offset_t address, uint32_t value)
  * The root complex's clock branches (gcc-sm8750.c halt_reg offsets); bit 31 of each CBCR is
  * CLK_OFF (clk-branch.h). The parf, phy and DBI windows answer only with the two domains on and
  * these clocks running: a read of an unclocked block can stall the interconnect and hang the SoC,
- * which USB cannot recover, so step 1 reads none of them otherwise.
+ * which USB cannot recover, so step 2 reads none of them otherwise.
  */
 #define CBCR_CLK_OFF              (1u << 31)
 static const struct { uint32_t offset; const char *name; } pcie0_clocks[] = {
@@ -241,7 +245,7 @@ mhi_state_name(uint32_t state)
 	}
 }
 
-/* ---- step 1: power, pins, link -- every line a read ------------------------------------------------------------------------------------ */
+/* ---- steps 1 and 2: power, pins, link -- every line a read --------------------------------------------------------------------------------- */
 
 static void
 survey_windows(void)
@@ -371,7 +375,7 @@ show_iatu(void)
 	}
 }
 
-/* ---- step 2: the endpoint's config space, through the vendor's own remap scheme ------------- */
+/* ---- step 3: the endpoint's config space, through the vendor's own remap scheme ------------- */
 
 static uint32_t
 ep_conf(unsigned where)
@@ -485,7 +489,7 @@ probe_endpoint(void)
 		return;
 	}
 	region0_read(iatu, save);
-	printf("pcie: step 2: region 0 was type %#x %s cpu %#010x..%#010x -> %#010x; remapped to config for the probe\n",
+	printf("pcie: step 3: region 0 was type %#x %s cpu %#010x..%#010x -> %#010x; remapped to config for the probe\n",
 	    save[0] & 0x1f, (save[1] & IATU_ENABLE) ? "enabled" : "disabled", save[2], save[4], save[5]);
 	__bzero(want, sizeof(want));
 	want[0] = secondary <= 1 ? IATU_TYPE_CFG0 : IATU_TYPE_CFG1;
@@ -517,7 +521,7 @@ probe_endpoint(void)
 	printf("pcie: region 0 is given back to the boot loader as it was\n");
 }
 
-/* ---- step 3: the card's MHI face ------------------------------------------------------------ */
+/* ---- step 4: the card's MHI face ------------------------------------------------------------ */
 
 static void
 read_mhi(void)
@@ -551,7 +555,7 @@ read_mhi(void)
 		return;
 	}
 	mhi += where & 0xfff;
-	printf("pcie: step 3: the card's register block at %#x:\n", where);
+	printf("pcie: step 4: the card's register block at %#x:\n", where);
 	printf("pcie:   register length %#010x, version %#010x (major %u minor %u), config %#010x\n",
 	    rd(mhi + MHI_REGLEN), rd(mhi + MHI_VER), rd(mhi + MHI_VER) & 0xffff, rd(mhi + MHI_VER) >> 16,
 	    rd(mhi + MHI_CFG));
@@ -593,23 +597,29 @@ pcie_thread(void *parameter, __unused wait_result_t result)
 	show_pin("PERST, the card's reset", 102, 1, "phase_flag");        /* perst-gpio <0x27 0x66>, device tree */
 	show_pin("CLKREQ -- mux 1 means the phy owns it", 103, 1, "pcie0_clk_req_n");   /* line 34490 */
 	show_pin("WAKE", 104, 1, "pll_bist_sync");
+	if (steps < 2) {
+		goto out;
+	}
 	if (!readable) {
 		printf("pcie: root complex 0 is powered down or unclocked, so its registers are left unread;\n"
 		    "pcie: powering it up (domains, clocks, phy, PERST) is the next batch's work\n");
 		goto out;
 	}
+	printf("pcie: step 2 in 30 s: the root complex's own registers\n");
+	assert_wait_timeout((event_t)&steps, THREAD_UNINT, 30000, NSEC_PER_MSEC);
+	thread_block(THREAD_CONTINUE_NULL);
 	show_link();
 	show_root_complex();
 	show_iatu();
-	if (steps < 2) {
+	if (steps < 3) {
 		goto out;
 	}
-	printf("pcie: step 2: look at the endpoint through the vendor's config window\n");
+	printf("pcie: step 3: look at the endpoint through the vendor's config window\n");
 	probe_endpoint();
-	if (steps < 3 || !link_up) {
+	if (steps < 4 || !link_up) {
 		goto out;
 	}
-	printf("pcie: step 3: read the MHI face of the card, if it has one yet\n");
+	printf("pcie: step 4: read the MHI face of the card, if it has one yet\n");
 	read_mhi();
 
 out:
@@ -628,8 +638,8 @@ mhi_pcie_init(void)
 	if (!PE_parse_boot_argn("pcie", &steps, sizeof(steps)) || steps == 0) {
 		return;
 	}
-	if (steps > 3) {
-		steps = 3;
+	if (steps > 4) {
+		steps = 4;
 	}
 	if (kernel_thread_start(pcie_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

@@ -45,7 +45,7 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
 	case 0x01: *value = 830; break;                 /* GPU_ID */
 	case 0x02: *value = 0xc00000; break;            /* GMEM_SIZE: vendor gen8_0_1 */
 	case 0x03: *value = 0x44050001; break;          /* CHIP_ID: running Android DT */
-	case 0x04: *value = adreno8_gx_hz[1]; break;    /* MAX_FREQ: sole exposed OPP */
+	case 0x04: *value = adreno8_gx_hz[adreno8_gx_count - 1]; break; /* MAX_FREQ: the fastest speed of the table */
 	case 0x06: *value = 0x04000000; break;          /* GMEM_BASE: GPU setup */
 	case 0x07: *value = 1; break;                   /* PRIORITIES: RB0 only */
 	case 0x08:                                    /* PP_PGTABLE */

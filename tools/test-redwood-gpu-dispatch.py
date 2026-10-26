@@ -20,7 +20,8 @@ STUB = r'''
 #include <string.h>
 typedef uintptr_t vm_offset_t;
 static bool annibale, adreno8_gpu8_keep, adreno8_gpu8_return, bo_open, self_test, publish_ok;
-static uint32_t adreno8_gx_hz[17] = {0, 160000000}, gpu_va, gpu_log;
+static uint32_t adreno8_gx_hz[17] = {0, 160000000, 222000000, 342000000}, gpu_va, gpu_log;
+static unsigned adreno8_gx_count = 4;
 static unsigned legacy_calls, enable_calls, close_calls, stop_calls, cache_calls, submit_calls, publish_calls, ready_checks, speed_ticks;
 static bool redwood_platform_is_annibale(void) { return annibale; }
 static int adreno8_say(const char *format, ...) { (void)format; return 0; }
@@ -109,7 +110,7 @@ int main(void) {
     assert(cache_calls == 2 && ready_checks == checked && !legacy_calls && !bo_open);
     bo_open = true;
     const uint32_t params[] = {1,2,3,4,6,7,8,9,10,16,17,20};
-    const uint64_t expected[] = {830,0xc00000,0x44050001,160000000,0x04000000,1,0,0,0,16,0,0x1fffffffff000ULL};
+    const uint64_t expected[] = {830,0xc00000,0x44050001,342000000,0x04000000,1,0,0,0,16,0,0x1fffffffff000ULL};
     for (unsigned i=0;i<sizeof(params)/sizeof(*params);i++) assert(redwood_gpu_parameter(params[i],&value) && value == expected[i]);
     const uint32_t unsupported[] = {0,5,11,14,15,18,19,21,UINT32_MAX};
     for (unsigned i=0;i<sizeof(unsupported)/sizeof(*unsupported);i++) assert(!redwood_gpu_parameter(unsupported[i],&value));

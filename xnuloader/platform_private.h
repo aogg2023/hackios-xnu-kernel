@@ -2,6 +2,16 @@
 #ifndef XNULOADER_PLATFORM_PRIVATE_H
 #define XNULOADER_PLATFORM_PRIVATE_H
 
+#ifndef PHONE_PLATFORM
+#define PHONE_PLATFORM platform_annibale
+#endif
+#ifndef PHONE_FB_WIDTH
+#define PHONE_FB_WIDTH 1156
+#endif
+#ifndef PHONE_FB_HEIGHT
+#define PHONE_FB_HEIGHT 2510
+#endif
+
 struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
@@ -72,9 +82,25 @@ static const struct platform platform_annibale = {
  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
  * where each value comes from); a display that matches none is QEMU's ramfb.
  */
+/*
+ * songyuan (REDMI K90 PRO MAX, SM8850): GICv3 distributor 0x17000000 and redistributors
+ * 0x17080000 with a 0x40000 stride, CPUs 0..0x500 and 0x10000/0x10100, splash region
+ * 0xFC800000, panel 1200x2608 (stride 4800). Direct phone platform, like annibale.
+ */
+static const struct platform platform_songyuan = {
+	.name = "songyuan", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17000000, .gic_redist = 0x17080000,
+	.gic_redist_size = 0x200000, .gic_redist_stride = 0x40000,
+	.uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_mpidr = {0, 0x100, 0x200, 0x300, 0x400, 0x500, 0x10000, 0x10100},
+	.small_cores = 0x3f,
+	.fb_base = 0xFC800000,
+};
+
 static const struct platform *const platforms[] = {
 	&platform_redwood,
 	&platform_annibale,
+	&platform_songyuan,
 };
 
 static int

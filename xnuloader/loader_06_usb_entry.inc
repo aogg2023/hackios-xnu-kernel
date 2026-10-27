@@ -940,16 +940,17 @@ efi_main(efi_handle image, efi_system_table *st)
 		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
 #ifdef DIRECT_PHONE_PLAT
 		/*
-		 * A phone build must select annibale even without GOP. The device tree reserves
+		 * A phone build must select its platform even without GOP. The device tree reserves
 		 * splash_region at 0xfc800000+0x2b00000, matching MemoryMapLib's Display_Reserved.
-		 * The P11 mode is 1156x2510. BootArgs.video uses that buffer for kernel output;
-		 * visible scanout still depends on the panel state left by LK.
+		 * BootArgs.video uses that buffer for kernel output; visible scanout still depends on
+		 * the panel state left by LK. PHONE_PLATFORM/PHONE_FB_* choose the device; annibale's
+		 * 1156x2510 mode is the default because that is what its LK leaves behind.
 		 */
-		PLAT = &platform_annibale;
-		SCREEN.base = platform_annibale.fb_base;
-		SCREEN.width = 1156;              /* P11 mode from the device tree and Android DRM */
-		SCREEN.height = 2510;
-		SCREEN.stride = 1156 * 4;
+		PLAT = &PHONE_PLATFORM;
+		SCREEN.base = PLAT->fb_base;
+		SCREEN.width = PHONE_FB_WIDTH;
+		SCREEN.height = PHONE_FB_HEIGHT;
+		SCREEN.stride = PHONE_FB_WIDTH * 4;
 		print("display assumed at %x: LK splash region\n", SCREEN.base);
 #endif
 	} else {
@@ -963,7 +964,7 @@ efi_main(efi_handle image, efi_system_table *st)
 #ifdef DIRECT_PHONE_PLAT
 		/* built for one phone: a framebuffer none of the known ones matches is ours */
 		if (PLAT == &platform_qemu_virt)
-			PLAT = &platform_annibale;
+			PLAT = &PHONE_PLATFORM;
 #else
 		if (PLAT == &platform_qemu_virt)
 			ramfb_phone_screen();
@@ -971,7 +972,7 @@ efi_main(efi_handle image, efi_system_table *st)
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
-	skip_ufs_arbitration = (PLAT == &platform_annibale); /* ramdisk kernel, no UFS handover (k90-port) */
+	skip_ufs_arbitration = (PLAT == &PHONE_PLATFORM); /* ramdisk kernel, no UFS handover (k90-port) */
 
 	install_exception_hook();
 	wdt_arm();

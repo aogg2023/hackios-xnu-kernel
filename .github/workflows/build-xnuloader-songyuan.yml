@@ -1,0 +1,30 @@
+name: build-xnuloader-songyuan
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'xnuloader/**'
+      - '.github/workflows/build-xnuloader-songyuan.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+      - name: build the phone loader
+        env:
+          EXTRA_CFLAGS: '-DDIRECT_PHONE_PLAT -DPHONE_PLATFORM=platform_songyuan -DPHONE_FB_WIDTH=1200 -DPHONE_FB_HEIGHT=2608'
+        run: |
+          export BUILD_ID=$(git rev-parse HEAD)
+          bash xnuloader/build.sh
+          ls -l xnuloader/loader-phone.efi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xnuloader-songyuan
+          path: xnuloader/loader-phone.efi
+          if-no-files-found: error

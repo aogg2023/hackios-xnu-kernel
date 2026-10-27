@@ -9,6 +9,7 @@ git clone https://github.com/Project-Silicium/Mu-Silicium.git $MU
 git -C $MU checkout -q "$(cat uefi/BASE)"
 git -C $MU submodule update --init --recursive
 git -C $MU apply --whitespace=nowarn "$PWD/uefi/mu-silicium.patch"
+python3 uefi/songyuan/paint_shim.py "$MU/BootShim/BootShim.S"
 cp -r uefi/files/. $MU/
 cp -r uefi/songyuan/files/. $MU/
 echo "uefi/songyuan/apply.sh: done at $PWD/$MU"

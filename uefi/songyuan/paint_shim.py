@@ -1,3 +1,4 @@
+import re
 import sys
 
 # Diagnostic paint in Mu-Silicium's BootShim.S, applied after uefi/mu-silicium.patch.
@@ -26,10 +27,10 @@ if MARK in src:
     print('paint already inserted')
     sys.exit(0)
 
-needle = '_Entry:\n  br    x5'
-if needle not in src:
+m = re.search(r'_Entry:\s*\n\s*br\s+x5', src)
+if not m:
     sys.exit('BootShim.S: entry block not found')
-src = src.replace(needle, block + '_Entry:\n  br    x5', 1)
+src = src[:m.start()] + block + src[m.start():]
 
 src = src.replace('''  cmp   x4, x5
   beq   _Entry''', '''  cmp   x4, x5

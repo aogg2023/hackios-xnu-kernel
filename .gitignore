@@ -88,3 +88,5 @@ __pycache__/
 # Local diagnostics remain outside source control.
 /docs/progress/evidence/
 /docs/analysis/local/
+
+!/.github/

@@ -40,7 +40,7 @@
  <DSIDSCMajor>1</DSIDSCMajor>
  <DSIDSCMinor>1</DSIDSCMinor>
  <DSIDSCScr>0</DSIDSCScr>
- <DSIDSCProfileID>4</DSIDSCProfileID>
+ <DSIDSCProfileID>7</DSIDSCProfileID>
  <DSIDSCSliceWidth>540</DSIDSCSliceWidth>
  <DSIDSCSliceHeight>20</DSIDSCSliceHeight>
  <DSIDSCSlicePerPacket>2</DSIDSCSlicePerPacket>
@@ -55,6 +55,7 @@
  <DSICmdUsingTrigger>False</DSICmdUsingTrigger>
  <DSIEnableAutoRefresh>True</DSIEnableAutoRefresh>
  <DSIAutoRefreshFrameNumDiv>1</DSIAutoRefreshFrameNumDiv>
+ <DSIDynamicRefreshRates>0x8F0000 0x8E0000 0x900000</DSIDynamicRefreshRates>
  <DSIControllerMapping>
   00
  </DSIControllerMapping>
@@ -90,7 +91,6 @@
  05 11
  ff 78
  05 29
- ff 14
 </DSIInitSequence>
 <DSITermSequence>
  05 28

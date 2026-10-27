@@ -17,7 +17,7 @@ APRIORI DXE {
   INF Binaries/songyuan/QcomPkg/Drivers/HWIODxe/HWIODxe.inf
   INF Binaries/songyuan/QcomPkg/Drivers/ChipInfoDxe/ChipInfoDxe.inf
   INF Binaries/songyuan/QcomPkg/Drivers/PlatformInfoDxe/PlatformInfoDxe.inf
-  INF Binaries/songyuan/QcomPkg/Drivers/ProjectInfoDxe/ProjectInfoDxe.inf
+  # missing in the aston set: INF Binaries/songyuan/QcomPkg/Drivers/ProjectInfoDxe/ProjectInfoDxe.inf
   INF Binaries/songyuan/QcomPkg/Drivers/HALIOMMUDxe/HALIOMMUDxe.inf
   INF Binaries/songyuan/QcomPkg/Drivers/ULogDxe/ULogDxe.inf
   INF Binaries/songyuan/QcomPkg/Drivers/CmdDbDxe/CmdDbDxe.inf
@@ -28,7 +28,7 @@ APRIORI DXE {
   INF Binaries/songyuan/QcomPkg/Drivers/ClockDxe/ClockDxe.inf
   INF Binaries/songyuan/QcomPkg/Drivers/ICBDxe/ICBDxe.inf
   INF Binaries/songyuan/QcomPkg/Drivers/ShmBridgeDxe/ShmBridgeDxeLA.inf
-  INF Binaries/songyuan/QcomPkg/Drivers/TzDxe/ScmDxeLA.inf
+  # missing in the aston set: INF Binaries/songyuan/QcomPkg/Drivers/TzDxe/ScmDxeLA.inf
   INF Binaries/songyuan/QcomPkg/Drivers/TLMMDxe/TLMMDxe.inf
   INF Binaries/songyuan/QcomPkg/Drivers/SPMIDxe/SPMIDxe.inf
   INF Binaries/songyuan/QcomPkg/Drivers/I2CDxe/I2CDxe.inf

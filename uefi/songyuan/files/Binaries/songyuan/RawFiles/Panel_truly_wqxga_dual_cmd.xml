@@ -180,7 +180,6 @@
  05 28
  05 10
 </DSITermSequence>
-<TLMMGPIODefaultLow>0x1A</TLMMGPIODefaultLow>
 <Group id='Backlight Configuration'>
  <BacklightType>1</BacklightType>
  <BacklightPmicControlType>2</BacklightPmicControlType>

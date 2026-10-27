@@ -74,7 +74,6 @@ FF 3C
  05 28
  05 10
 </DSITermSequence>
-<TLMMGPIODefaultHigh>0x1A</TLMMGPIODefaultHigh>
 <Group id='Backlight Configuration'>
  <BacklightType>3</BacklightType>
  <BacklightBitWidth>10</BacklightBitWidth>

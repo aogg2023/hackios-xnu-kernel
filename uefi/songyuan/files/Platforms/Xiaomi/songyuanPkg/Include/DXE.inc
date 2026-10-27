@@ -10,7 +10,7 @@
   INF MdeModulePkg/Universal/SecurityStubDxe/SecurityStubDxe.inf
 
   INF Binaries/songyuan/QcomPkg/Drivers/ShmBridgeDxe/ShmBridgeDxeLA.inf
-  INF Binaries/songyuan/QcomPkg/Drivers/TzDxe/ScmDxeLA.inf
+  # missing in the aston set: INF Binaries/songyuan/QcomPkg/Drivers/TzDxe/ScmDxeLA.inf
   INF Binaries/songyuan/QcomPkg/Drivers/TzDxe/TzDxeLA.inf
 
   INF MdeModulePkg/Universal/WatchdogTimerDxe/WatchdogTimer.inf
@@ -26,7 +26,7 @@
 
   INF Binaries/songyuan/QcomPkg/Drivers/ChipInfoDxe/ChipInfoDxe.inf
   INF Binaries/songyuan/QcomPkg/Drivers/PlatformInfoDxe/PlatformInfoDxe.inf
-  INF Binaries/songyuan/QcomPkg/Drivers/ProjectInfoDxe/ProjectInfoDxe.inf
+  # missing in the aston set: INF Binaries/songyuan/QcomPkg/Drivers/ProjectInfoDxe/ProjectInfoDxe.inf
   INF Binaries/songyuan/QcomPkg/Drivers/DALSYSDxe/DALSYSDxe.inf
   INF Binaries/songyuan/QcomPkg/Drivers/HALIOMMUDxe/HALIOMMUDxe.inf
   INF Binaries/songyuan/QcomPkg/Drivers/HWIODxe/HWIODxe.inf

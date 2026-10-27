@@ -32,6 +32,24 @@ if not m:
     sys.exit('BootShim.S: entry block not found')
 src = src[:m.start()] + block + src[m.start():]
 
+# the strict (PAYLOAD_CAP) branch has its own _Entry: that loads FD_BASE and branches; the paint
+# above lives in the legacy #else branch, so add the same paint inline before the strict entry.
+strict = re.search(r'_Entry:\s*\n\s*ldr\s+x5,\s*=FD_BASE\s*\n\s*br\s+x5', src)
+if strict:
+    inline = '''  /* songyuan diagnostic: paint the LK splash (strict entry) */
+  ldr   x9, =0xFC800000
+  movz  w10, #0xFF00
+  movk  w10, #0xFF00, lsl #16
+  add   x11, x9, #0x100000
+3:
+  str   w10, [x9], #4
+  cmp   x9, x11
+  b.ne  3b
+'''
+    src = src[:strict.start()] + inline + src[strict.start():]
+    print('strict-entry paint inserted')
+src = src[:m.start()] + block + src[m.start():]
+
 src = src.replace('''  cmp   x4, x5
   beq   _Entry''', '''  cmp   x4, x5
   beq   _ShimPaint''', 1)

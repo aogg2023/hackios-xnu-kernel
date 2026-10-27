@@ -26,15 +26,15 @@ jobs:
           USERLAND_URL=https://github.com/iola1999/hackios-xnu-userland.git USERLAND_REF=k90-port bash common/setup.sh
       - name: fetch iOS 16.5
         run: |
-          cd userland/ios165
+          cd ios165
           if ! bash fetch.sh; then
             echo '--- debug ---'
             ls -l rootfs.dmg rootfs.slt system.files 2>&1 | head
             file rootfs.dmg
             echo '--- slt head ---'
-            head -40 rootfs.slt 2>&1
+            head -60 rootfs.slt 2>&1
             echo '--- 7z listing head ---'
-            7z l -slt rootfs.dmg 2>&1 | head -40
+            7z l -slt rootfs.dmg 2>&1 | head -60
             echo '--- 7z version ---'
             7z 2>&1 | head -4
             exit 1

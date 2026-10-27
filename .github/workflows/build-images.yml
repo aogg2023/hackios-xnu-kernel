@@ -17,7 +17,9 @@ jobs:
           sudo apt-get install -y git curl ca-certificates tar xz-utils make clang lld python3 perl flex bison m4 autoconf automake libtool pkg-config zlib1g-dev gawk file unzip zstd libzstd-dev bzip2 zip binutils uuid-dev libssl-dev libxml2-dev libbz2-dev liblzma-dev libncurses-dev python-is-python3 libfuse3-dev
       - name: 7zip 23+
         run: |
-          curl -sL https://www.7-zip.org/a/7z2408-linux-x64.tar.xz | sudo tar -xJ -C /usr/local/bin --strip-components=1
+          curl -sSL https://github.com/ip7z/7zip/releases/download/24.08/7z2408-linux-x64.tar.xz -o /tmp/7z.tar.xz
+          file /tmp/7z.tar.xz
+          sudo tar -xJ -C /usr/local/bin --strip-components=1 -f /tmp/7z.tar.xz
           sudo ln -sf /usr/local/bin/7zz /usr/local/bin/7z
           7z | head -3
       - name: workspace tree

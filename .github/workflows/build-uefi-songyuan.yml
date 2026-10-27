@@ -24,25 +24,25 @@ jobs:
       - name: apply the port
         run: |
           bash uefi/songyuan/apply.sh
-          echo "mu at $(git -C ../Mu-Silicium rev-parse --short HEAD)"
+          echo "mu at $(git -C Mu-Silicium rev-parse --short HEAD)"
       - name: nasm shim and venv
         run: |
-          D=../Mu-Silicium/Mu_Basecore/BaseTools/Bin/mu_nasm_extdep
+          D=Mu-Silicium/Mu_Basecore/BaseTools/Bin/mu_nasm_extdep
           mkdir -p $D/Linux-x86-64
           echo 'version: 20016.1.1' > $D/extdep_state.yaml
           ln -sf /usr/bin/nasm /usr/bin/ndisasm $D/Linux-x86-64/ 2>/dev/null || true
-          python3 -m venv ../venv
-          ../venv/bin/pip install -r ../Mu-Silicium/pip-requirements.txt
+          python3 -m venv venv
+          venv/bin/pip install -r Mu-Silicium/pip-requirements.txt
       - name: build uefi
         run: |
-          cd ../Mu-Silicium
+          cd Mu-Silicium
           source ../venv/bin/activate
           python3 build_uefi.py -d songyuan -r RELEASE
       - name: collect
         run: |
-          find ../Mu-Silicium/Build -name '*.fd' -exec ls -l {} \;
+          find Mu-Silicium/Build -name '*.fd' -exec ls -l {} \;
       - uses: actions/upload-artifact@v4
         with:
           name: uefi-songyuan
-          path: ../Mu-Silicium/Build/**/FV/*.fd
+          path: Mu-Silicium/Build/**/FV/*.fd
           if-no-files-found: error

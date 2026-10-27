@@ -23,40 +23,29 @@ jobs:
           curl -sSL https://github.com/ip7z/7zip/releases/download/25.01/7z2501-linux-x64.tar.xz -o 7z2501.tar.xz
           mkdir -p /opt/7z2501 && tar -xJ -f 7z2501.tar.xz -C /opt/7z2501 --strip-components=1
           sudo ln -sf /opt/7z2408/7zz /usr/local/bin/7z
-          /opt/7z2501/7zz | head -3
+          ls -l /opt/7z2408/7zz /opt/7z2501/7zz
+          /opt/7z2501/7zz | head -2
       - name: workspace tree
         run: |
           USERLAND_URL=https://github.com/iola1999/hackios-xnu-userland.git USERLAND_REF=k90-port bash common/setup.sh
-      - name: fetch iOS 16.5
+      - name: probe APFS
         run: |
+          echo '--- 2408 formats ---'
+          /opt/7z2408/7zz i | grep -i -E 'apfs|hfs|dmg' || true
+          echo '--- 2501 formats ---'
+          /opt/7z2501/7zz i | grep -i -E 'apfs|hfs|dmg' || true
+          echo '--- download rootfs.dmg ---'
           cd ios165
-          if ! bash fetch.sh; then
-            echo '--- debug 2408 listing ---'
-            7z l -slt rootfs.dmg 2>&1 | head -20
-            echo '--- debug 2501 listing ---'
-            /opt/7z2501/7zz l -slt rootfs.dmg 2>&1 | head -20
-            echo '--- extract the APFS partition ---'
-            7z e -y rootfs.dmg "3 - Apple_APFS" -o/tmp/parts 2>&1 | tail -3
-            ls -l /tmp/parts
-            echo '--- list the extracted container ---'
-            /opt/7z2501/7zz l -slt /tmp/parts/* 2>&1 | head -30
-            echo '--- 2408 on the container ---'
-            7z l -slt /tmp/parts/* 2>&1 | head -30
-            exit 1
-          fi
-      - name: build images
-        run: |
-          SKIP="kernel loader boot" bash common/build.sh songyuan
-      - name: package
-        run: |
-          mkdir -p dist
-          ls -l userland/*.apfs
-          for f in userland/system.apfs userland/root.apfs; do
-            [ -f "$f" ] && split -b 1800M "$f" "dist/$(basename $f).part."
-          done
-          ls -l dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: apfs-images
-          path: dist/
-          if-no-files-found: error
+          python3 fetch-from-ipsw.py 096-04088-077.dmg rootfs.dmg.part
+          mv rootfs.dmg.part rootfs.dmg
+          echo '--- 2408 dmg listing ---'
+          /opt/7z2408/7zz l -slt rootfs.dmg 2>&1 | head -12
+          echo '--- 2501 dmg listing ---'
+          /opt/7z2501/7zz l -slt rootfs.dmg 2>&1 | head -12
+          echo '--- extract APFS partition ---'
+          /opt/7z2408/7zz e -y rootfs.dmg "3 - Apple_APFS" -o/tmp/parts 2>&1 | tail -2
+          echo '--- 2408 -tAPFS ---'
+          /opt/7z2408/7zz l -slt -tAPFS "/tmp/parts/3 - Apple_APFS" 2>&1 | head -12
+          echo '--- 2501 -tAPFS ---'
+          /opt/7z2501/7zz l -slt -tAPFS "/tmp/parts/3 - Apple_APFS" 2>&1 | head -12
+          exit 1

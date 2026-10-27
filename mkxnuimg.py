@@ -172,7 +172,11 @@ def main():
                  'dtb': os.path.join(PREBUILT, 'redwood.dtb'), 'ramdisk': os.path.join(PREBUILT, 'ramdisk'),
                  'mkbootimg': os.path.join(PREBUILT, 'mkbootimg.py')}
         if os.environ.get('UEFI_FD'): parts['fd'] = os.environ['UEFI_FD']
+    if os.environ.get('SHIM_BIN'):
+        parts['shim'] = os.environ['SHIM_BIN']
     shim = open(parts['shim'], 'rb').read()
+    paint = bytes.fromhex('0990bfd2') in shim
+    print(f'shim: {parts["shim"]} {len(shim)} bytes, paint={paint}, sha={__import__("hashlib").sha256(shim).hexdigest()[:16]}')
     fd = open(parts['fd'], 'rb').read()
     assert len(fd) == fd_size, hex(len(fd))
 

@@ -47,6 +47,18 @@ jobs:
           bash xnuloader/build.sh
           mkdir -p out
           cp xnuloader/loader-phone.efi out/loader-phone.efi
+      - name: build the boot shim ourselves
+        run: |
+          cd Mu-Silicium/BootShim
+          clang --target=aarch64-linux-gnu -DREQUIRES_KERNEL_HEADER=1 -DFD_BASE=0xA7100000 -DFD_SIZE=0x300000 -DPAYLOAD_BASE=0xF0000000 -c BootShim.S -o BootShim.elf
+          objcopy -O binary BootShim.elf /tmp/BootShim.bin
+          python3 - <<'EOF'
+          import hashlib
+          d = open('/tmp/BootShim.bin','rb').read()
+          paint = bytes.fromhex('0990bfd2') in d
+          print('shim', len(d), 'bytes paint=', paint, 'sha', hashlib.sha256(d).hexdigest()[:16])
+          assert paint, 'the diagnostic paint is missing from BootShim.bin'
+          EOF
       - name: pack the XNUP payload
         run: |
           python3 xnuloader/mkpayload.py -o out/usb-payload.bin loader.efi=out/loader-phone.efi --usb
@@ -59,6 +71,7 @@ jobs:
           FD_SIZE: '0x300000'
           PAYLOAD_BASE: '0xF0000000'
           PAYLOAD_CAP: '0x3700000'
+          SHIM_BIN: /tmp/BootShim.bin
         run: |
           python3 mkxnuimg.py -p out/usb-payload.bin -o out/boot-songyuan.img
           ls -l out/boot-songyuan.img

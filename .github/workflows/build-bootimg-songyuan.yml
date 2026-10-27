@@ -50,7 +50,7 @@ jobs:
       - name: build the boot shim ourselves
         run: |
           cd Mu-Silicium/BootShim
-          clang --target=aarch64-linux-gnu -DREQUIRES_KERNEL_HEADER=1 -DFD_BASE=0xA7100000 -DFD_SIZE=0x300000 -DPAYLOAD_BASE=0xF0000000 -c BootShim.S -o BootShim.elf
+          clang --target=aarch64-linux-gnu -DREQUIRES_KERNEL_HEADER=1 -DFD_BASE=0xA7100000 -DFD_SIZE=0x300000 -DPAYLOAD_BASE=0xF0000000 -DPAYLOAD_CAP=0x3700000 -c BootShim.S -o BootShim.elf
           OBJCOPY=$(command -v llvm-objcopy || command -v llvm-objcopy-18)
           [ -n "$OBJCOPY" ] || { sudo apt-get install -y llvm-tools; OBJCOPY=$(command -v llvm-objcopy || command -v llvm-objcopy-18); }
           "$OBJCOPY" -O binary BootShim.elf /tmp/BootShim.bin

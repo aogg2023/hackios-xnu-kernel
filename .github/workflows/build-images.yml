@@ -27,7 +27,16 @@ jobs:
           USERLAND_URL=https://github.com/iola1999/hackios-xnu-userland.git USERLAND_REF=k90-port bash common/setup.sh
       - name: fetch iOS 16.5
         run: |
-          cd userland && bash ../ios165/fetch.sh
+          cd userland
+          if ! bash ../ios165/fetch.sh; then
+            echo '--- debug: listing ---'
+            ls -l rootfs.dmg rootfs.slt system.files 2>&1 | head
+            echo '--- rootfs.slt head ---'
+            head -40 rootfs.slt 2>&1
+            echo '--- 7z l -slt head ---'
+            7z l -slt rootfs.dmg 2>&1 | head -40
+            exit 1
+          fi
       - name: build images
         run: |
           SKIP="kernel loader boot" bash common/build.sh songyuan

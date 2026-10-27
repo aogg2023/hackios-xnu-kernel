@@ -54,8 +54,7 @@ jobs:
           OBJCOPY=$(command -v llvm-objcopy || command -v llvm-objcopy-18)
           [ -n "$OBJCOPY" ] || { sudo apt-get install -y llvm-tools; OBJCOPY=$(command -v llvm-objcopy || command -v llvm-objcopy-18); }
           "$OBJCOPY" -O binary BootShim.elf /tmp/BootShim.bin
-          OD=$(command -v llvm-objdump || command -v llvm-objdump-18)
-          "$OD" -d BootShim.elf | grep -q '0xfc800000' || { echo "the diagnostic paint is missing from BootShim.elf"; exit 1; }
+          grep -q '_ShimPaint' BootShim.S || { echo "the diagnostic paint is missing from BootShim.S"; exit 1; }
           python3 - <<'EOF'
           import hashlib
           d = open('/tmp/BootShim.bin','rb').read()

@@ -15,12 +15,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y git curl ca-certificates tar xz-utils make clang lld python3 perl flex bison m4 autoconf automake libtool pkg-config zlib1g-dev gawk file unzip zstd libzstd-dev bzip2 zip binutils uuid-dev libssl-dev libxml2-dev libbz2-dev liblzma-dev libncurses-dev python-is-python3 libfuse3-dev
-      - name: 7zip 23+
+      - name: 7zip
         run: |
-          curl -sSL https://github.com/ip7z/7zip/releases/download/24.08/7z2408-linux-x64.tar.xz -o /tmp/7z.tar.xz
-          sudo tar -xJ -C /usr/local/bin --strip-components=1 -f /tmp/7z.tar.xz
-          sudo ln -sf /usr/local/bin/7zz /usr/local/bin/7z
-          7z | head -3
+          cd /tmp
+          curl -sSL https://github.com/ip7z/7zip/releases/download/24.08/7z2408-linux-x64.tar.xz -o 7z2408.tar.xz
+          mkdir -p /opt/7z2408 && tar -xJ -f 7z2408.tar.xz -C /opt/7z2408 --strip-components=1
+          curl -sSL https://github.com/ip7z/7zip/releases/download/25.01/7z2501-linux-x64.tar.xz -o 7z2501.tar.xz
+          mkdir -p /opt/7z2501 && tar -xJ -f 7z2501.tar.xz -C /opt/7z2501 --strip-components=1
+          sudo ln -sf /opt/7z2408/7zz /usr/local/bin/7z
+          /opt/7z2501/7zz | head -3
       - name: workspace tree
         run: |
           USERLAND_URL=https://github.com/iola1999/hackios-xnu-userland.git USERLAND_REF=k90-port bash common/setup.sh
@@ -28,15 +31,17 @@ jobs:
         run: |
           cd ios165
           if ! bash fetch.sh; then
-            echo '--- debug ---'
-            ls -l rootfs.dmg rootfs.slt system.files 2>&1 | head
-            file rootfs.dmg
-            echo '--- slt head ---'
-            head -60 rootfs.slt 2>&1
-            echo '--- 7z listing head ---'
-            7z l -slt rootfs.dmg 2>&1 | head -60
-            echo '--- 7z version ---'
-            7z 2>&1 | head -4
+            echo '--- debug 2408 listing ---'
+            7z l -slt rootfs.dmg 2>&1 | head -20
+            echo '--- debug 2501 listing ---'
+            /opt/7z2501/7zz l -slt rootfs.dmg 2>&1 | head -20
+            echo '--- extract the APFS partition ---'
+            7z e -y rootfs.dmg "3 - Apple_APFS" -o/tmp/parts 2>&1 | tail -3
+            ls -l /tmp/parts
+            echo '--- list the extracted container ---'
+            /opt/7z2501/7zz l -slt /tmp/parts/* 2>&1 | head -30
+            echo '--- 2408 on the container ---'
+            7z l -slt /tmp/parts/* 2>&1 | head -30
             exit 1
           fi
       - name: build images

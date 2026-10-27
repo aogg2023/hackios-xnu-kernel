@@ -51,10 +51,6 @@ jobs:
         run: |
           python3 xnuloader/mkpayload.py -o out/usb-payload.bin loader.efi=out/loader-phone.efi --usb
           ls -l out/
-      - name: repack as header v4
-        run: |
-          python3 tools/pack_v4.py out/boot-songyuan.img out/boot-songyuan-v4.img
-          ls -l out/boot-songyuan-v4.img
       - name: pack the boot image
         env:
           UEFI_FD: Mu-Silicium/Build/songyuanPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd
@@ -66,6 +62,10 @@ jobs:
         run: |
           python3 mkxnuimg.py -p out/usb-payload.bin -o out/boot-songyuan.img
           ls -l out/boot-songyuan.img
+      - name: repack as header v4
+        run: |
+          python3 tools/pack_v4.py out/boot-songyuan.img out/boot-songyuan-v4.img
+          ls -l out/boot-songyuan-v4.img
       - uses: actions/upload-artifact@v4
         with:
           name: bootimg-songyuan

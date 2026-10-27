@@ -1,0 +1,44 @@
+name: linux-images
+on: workflow_dispatch
+jobs:
+  images:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - name: free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl ca-certificates tar xz-utils make clang lld python3 perl flex bison m4 autoconf automake libtool pkg-config zlib1g-dev gawk file unzip zstd libzstd-dev bzip2 zip binutils uuid-dev libssl-dev libxml2-dev libbz2-dev liblzma-dev libncurses-dev python-is-python3 libfuse3-dev
+      - name: 7zip 23+
+        run: |
+          curl -sL https://www.7-zip.org/a/7z2408-linux-x64.tar.xz | sudo tar -xJ -C /usr/local/bin --strip-components=1
+          sudo ln -sf /usr/local/bin/7zz /usr/local/bin/7z
+          7z | head -3
+      - name: workspace tree
+        run: |
+          USERLAND_URL=https://github.com/iola1999/hackios-xnu-userland.git USERLAND_REF=k90-port bash common/setup.sh
+      - name: fetch iOS 16.5
+        run: |
+          cd userland && bash ../ios165/fetch.sh
+      - name: build images
+        run: |
+          SKIP="kernel loader boot" bash common/build.sh songyuan
+      - name: package
+        run: |
+          mkdir -p dist
+          ls -l userland/*.apfs
+          for f in userland/system.apfs userland/root.apfs; do
+            [ -f "$f" ] && split -b 1800M "$f" "dist/$(basename $f).part."
+          done
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apfs-images
+          path: dist/
+          if-no-files-found: error

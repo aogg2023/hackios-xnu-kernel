@@ -1,7 +1,7 @@
 [Defines]
   INF_VERSION                    = 0x00010005
   BASE_NAME                      = MemoryMapLib
-  FILE_GUID                      = D664A3B1-AF81-48F9-9412-A99D81AE96CE
+  FILE_GUID                      = 375C4FF0-1905-4BA7-A5CA-7D40D25F5EF3
   MODULE_TYPE                    = BASE
   VERSION_STRING                 = 1.0
   LIBRARY_CLASS                  = MemoryMapLib

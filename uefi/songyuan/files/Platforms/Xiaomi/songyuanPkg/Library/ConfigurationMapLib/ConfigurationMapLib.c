@@ -4,12 +4,13 @@ STATIC
 EFI_CONFIGURATION_ENTRY_DESCRIPTOR
 gConfigurationDescriptor[] = {
   // Configuration Map
-  {"NumCpusFuseAddr", 0x5C04C},
   {"EnableShell", 0x1},
-  {"InitialPagePoolCount", 0x700},
+  {"SecPagePoolCount", 0x800},
   {"SharedIMEMBaseAddr", 0x146AA000},
-  {"DloadCookieAddr", 0x01FD3000},
+  {"DloadCookieAddr", 0x01FD9000},
   {"DloadCookieValue", 0x10},
+  {"PilSubsysDbgCookieAddr", 0x146AA6DC},
+  {"PilSubsysDbgCookieVal", 0x53444247},
   {"NumCpus", 8},
   {"NumActiveCores", 8},
   {"MaxLogFileSize", 0x400000},
@@ -24,26 +25,27 @@ gConfigurationDescriptor[] = {
   {"EnableSDHCSwitch", 0x1},
   {"EnableUfsIOC", 1},
   {"UfsSmmuConfigForOtherBootDev", 1},
-  {"UEFIExitUfsSSURequired", 1},
   {"SecurityFlag", 0xC4},
   {"DetectRetailUserAttentionHotkey", 0x00},
   {"DetectRetailUserAttentionHotkeyCode", 0x17},
   {"EnableOEMSetupAppInRetail", 0x0},
-  {"EnableLogFsSyncInRetail", 0x1},
+  {"EnableLogFsSyncInRetail", 0x0},
+  {"EnableSecurityHoleForSplashPartition", 0x1},
   {"ShmBridgememSize", 0xA00000},
   {"EnableMultiThreading", 1},
   {"MaxCoreCnt", 8},
-  {"EarlyInitCoreCnt", 2},
+  {"EarlyInitCoreCnt", 1},
   {"EnableUefiSecAppDebugLogDump", 0x0},
   {"AllowNonPersistentVarsInRetail", 0x1},
   {"EnableDisplayThread", 0x0},
-  {"EnableDisplayImageFv", 0x1},
+  {"EnableDisplayImageFv", 0x0},
   {"DDRInfoNotifyFlag", 0x0},
+  {"EnableMultiCoreFvDecompression", 0},
   {"EnableVariablePolicyEngine", 0},
   {"EnableACPIFallback", 0x0},
-  {"EnableMultiCoreFvDecompression", 1},
-  {"EUDEnableAddr", 0x88E2000},
-  {"MinidumpTALoadingCfg", 0x0}
+  {"DRAM_CLK_PERIOD_ADDR", 0x240BA050},
+  {"LoadAutoImageInPILFlag", 0x1},
+  {"OverRideSharedImemBootCfg", 0x8}
 };
 
 VOID

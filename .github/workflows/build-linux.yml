@@ -1,0 +1,37 @@
+name: linux-kernel
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - name: free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          df -h /
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl ca-certificates tar xz-utils make clang lld python3 perl flex bison m4 autoconf automake libtool pkg-config zlib1g-dev gawk file unzip zstd libzstd-dev bzip2 zip binutils uuid-dev libssl-dev libxml2-dev libbz2-dev liblzma-dev libncurses-dev python-is-python3
+      - name: theos
+        run: |
+          git clone --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz | tar -xJ -C "$HOME/theos/toolchain/"
+          "$HOME/theos/bin/install-sdk" iPhoneOS16.5
+      - name: xnu tree
+        run: |
+          bash xnu/apply.sh
+          bash xnu-deps/setup.sh
+      - name: build kernel
+        run: |
+          export THEOS="$HOME/theos"
+          bash xnu-build.sh -j4 BUILD_DSYM=0 KEXT_CREATE_SYMBOL_SET=/bin/true
+      - name: collect
+        run: |
+          find xnu-src -name 'mach.development.*' -type f -exec ls -l {} \;
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mach-kernel
+          path: xnu-src/xnu-8796.121.2/BUILD/obj/*/mach.development.*
+          if-no-files-found: error

@@ -21,7 +21,7 @@ jobs:
       - name: deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y git build-essential uuid-dev nasm acpica-tools python3 python3-venv python3-pip clang lld llvm gcc-aarch64-linux-gnu libfuse3-dev
+          sudo apt-get install -y git build-essential uuid-dev nasm acpica-tools python3 python3-venv python3-pip clang lld llvm llvm-18-tools gcc-aarch64-linux-gnu libfuse3-dev || true
       - name: apply the UEFI port
         run: |
           bash uefi/songyuan/apply.sh
@@ -51,7 +51,9 @@ jobs:
         run: |
           cd Mu-Silicium/BootShim
           clang --target=aarch64-linux-gnu -DREQUIRES_KERNEL_HEADER=1 -DFD_BASE=0xA7100000 -DFD_SIZE=0x300000 -DPAYLOAD_BASE=0xF0000000 -c BootShim.S -o BootShim.elf
-          objcopy -O binary BootShim.elf /tmp/BootShim.bin
+          OBJCOPY=$(command -v llvm-objcopy || command -v llvm-objcopy-18)
+          [ -n "$OBJCOPY" ] || { sudo apt-get install -y llvm-tools; OBJCOPY=$(command -v llvm-objcopy || command -v llvm-objcopy-18); }
+          "$OBJCOPY" -O binary BootShim.elf /tmp/BootShim.bin
           python3 - <<'EOF'
           import hashlib
           d = open('/tmp/BootShim.bin','rb').read()

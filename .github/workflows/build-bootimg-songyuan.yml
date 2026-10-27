@@ -51,6 +51,10 @@ jobs:
         run: |
           python3 xnuloader/mkpayload.py -o out/usb-payload.bin loader.efi=out/loader-phone.efi --usb
           ls -l out/
+      - name: repack as header v4
+        run: |
+          python3 tools/pack_v4.py out/boot-songyuan.img out/boot-songyuan-v4.img
+          ls -l out/boot-songyuan-v4.img
       - name: pack the boot image
         env:
           UEFI_FD: Mu-Silicium/Build/songyuanPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd
@@ -67,5 +71,6 @@ jobs:
           name: bootimg-songyuan
           path: |
             out/boot-songyuan.img
+            out/boot-songyuan-v4.img
             out/loader-phone.efi
           if-no-files-found: error

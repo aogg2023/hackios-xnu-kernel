@@ -1,16 +1,12 @@
-import re
-import sys
+import re, sys
 
-# Bring-up markers inside UEFI itself. The shim paints before the jump; these paint from DXE/BDS so
-# the panel tells how far the firmware got even though it has no console driver for our panel:
-#   magenta  at PlatformBootManagerBeforeConsole (DXE core + BDS reach BootManager)
-#   cyan     at PlatformBootManagerAfterConsole  (the boot manager finished the console phase)
-# The framebuffer is the LK splash at 0xFC800000; DXE identity-maps RAM, so a plain store works.
+# Bring-up markers inside UEFI:
+#   magenta  PlatformBootManagerBeforeConsole, fill 1 MiB of the LK splash and hold it
+#   cyan     PlatformBootManagerAfterConsole, paint the GOP framebuffer (and the splash) and hold it
+# The hold makes each stage readable on the panel without a serial console.
 PATH = sys.argv[1]
 src = open(PATH, encoding='utf-8', errors='replace').read()
-
 MARK = 'songyuan uefi marker'
-
 if MARK in src:
     print('boot manager paint already inserted')
     sys.exit(0)
@@ -23,16 +19,45 @@ def insert_after_open(text, func, body):
     return text[:m.end()] + body + text[m.end():], True
 
 
-body1 = ('\n  /* songyuan uefi marker: BDS reached the boot manager */\n'
-         '  *(volatile UINT32 *)(UINTN)0xFC800000 = 0xFFFF00FF;\n')
-body2 = ('\n  /* songyuan uefi marker: console phase done */\n'
-         '  *(volatile UINT32 *)(UINTN)0xFC800000 = 0xFF00FFFF;\n')
+before = '''
+  /* songyuan uefi marker: BDS reached the boot manager; fill 1 MiB and hold it */
+  {
+    volatile UINT32 *SongyuanBdsFb = (volatile UINT32 *)(UINTN)0xFC800000;
+    for (UINTN SongyuanBdsI = 0; SongyuanBdsI < 0x40000; SongyuanBdsI++) {
+      SongyuanBdsFb[SongyuanBdsI] = 0xFFFF00FF;
+    }
+    for (volatile UINTN SongyuanBdsSpin = 0; SongyuanBdsSpin < 0x06000000; SongyuanBdsSpin++) { }
+  }
+'''
 
-src, ok1 = insert_after_open(src, 'PlatformBootManagerBeforeConsole', body1)
-src, ok2 = insert_after_open(src, 'PlatformBootManagerAfterConsole', body2)
+after = '''
+  /* songyuan uefi marker: console phase done; paint the framebuffer the display driver installed */
+  {
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *SongyuanGop = NULL;
+    volatile UINT32 *SongyuanFb = (volatile UINT32 *)(UINTN)0xFC800000;
+    UINTN SongyuanCount = 0x40000;
+    if (!EFI_ERROR (gBS->LocateProtocol (&gEfiGraphicsOutputProtocolGuid, NULL, (VOID **)&SongyuanGop)) &&
+        SongyuanGop != NULL && SongyuanGop->Mode != NULL) {
+      SongyuanFb = (volatile UINT32 *)(UINTN)SongyuanGop->Mode->FrameBufferBase;
+      SongyuanCount = (UINTN)SongyuanGop->Mode->FrameBufferSize / 4;
+      if (SongyuanCount > 0x40000) {
+        SongyuanCount = 0x40000;
+      }
+    }
+    for (UINTN SongyuanI = 0; SongyuanI < SongyuanCount; SongyuanI++) {
+      SongyuanFb[SongyuanI] = 0xFF00FFFF;
+    }
+    for (volatile UINTN SongyuanSpin = 0; SongyuanSpin < 0x06000000; SongyuanSpin++) { }
+  }
+'''
+
+src, ok1 = insert_after_open(src, 'PlatformBootManagerBeforeConsole', before)
+src, ok2 = insert_after_open(src, 'PlatformBootManagerAfterConsole', after)
 if not ok1:
     sys.exit('BootManager.c: PlatformBootManagerBeforeConsole not found')
 if not ok2:
     print('warning: PlatformBootManagerAfterConsole not found')
+if '#include <Protocol/GraphicsOutput.h>' not in src:
+    src = src.replace('#include <Library/PrintLib.h>', '#include <Library/PrintLib.h>\n#include <Protocol/GraphicsOutput.h>', 1)
 open(PATH, 'w', encoding='utf-8', newline='\n').write(src)
 print('boot manager paint inserted: before=%s after=%s' % (ok1, ok2))

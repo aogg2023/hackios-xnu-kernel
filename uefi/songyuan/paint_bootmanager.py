@@ -1,9 +1,8 @@
 import re, sys
 
-# Bring-up markers inside UEFI:
-#   magenta  PlatformBootManagerBeforeConsole, fill 1 MiB of the LK splash and hold it
-#   cyan     PlatformBootManagerAfterConsole, paint the GOP framebuffer (and the splash) and hold it
-# The hold makes each stage readable on the panel without a serial console.
+# BootManager markers that hold forever:
+#   magenta  PlatformBootManagerBeforeConsole (BDS reached the boot manager)
+#   cyan     PlatformBootManagerAfterConsole  (console phase done; paints the GOP framebuffer too)
 PATH = sys.argv[1]
 src = open(PATH, encoding='utf-8', errors='replace').read()
 MARK = 'songyuan uefi marker'
@@ -20,22 +19,21 @@ def insert_after_open(text, func, body):
 
 
 before = '''
-  /* songyuan uefi marker: BDS reached the boot manager; fill 1 MiB and hold it */
-  {
+  /* songyuan uefi marker: BDS reached the boot manager; hold magenta forever */
+  for (;;) {
     volatile UINT32 *SongyuanBdsFb = (volatile UINT32 *)(UINTN)0xFC800000;
     for (UINTN SongyuanBdsI = 0; SongyuanBdsI < 0x40000; SongyuanBdsI++) {
       SongyuanBdsFb[SongyuanBdsI] = 0xFFFF00FF;
     }
-    for (volatile UINTN SongyuanBdsSpin = 0; SongyuanBdsSpin < 0x06000000; SongyuanBdsSpin++) { }
   }
 '''
 
 after = '''
-  /* songyuan uefi marker: console phase done; paint the framebuffer the display driver installed */
+  /* songyuan uefi marker: console phase done; hold cyan on the GOP framebuffer forever */
   {
-    EFI_GRAPHICS_OUTPUT_PROTOCOL *SongyuanGop = NULL;
     volatile UINT32 *SongyuanFb = (volatile UINT32 *)(UINTN)0xFC800000;
     UINTN SongyuanCount = 0x40000;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *SongyuanGop = NULL;
     if (!EFI_ERROR (gBS->LocateProtocol (&gEfiGraphicsOutputProtocolGuid, NULL, (VOID **)&SongyuanGop)) &&
         SongyuanGop != NULL && SongyuanGop->Mode != NULL) {
       SongyuanFb = (volatile UINT32 *)(UINTN)SongyuanGop->Mode->FrameBufferBase;
@@ -44,10 +42,11 @@ after = '''
         SongyuanCount = 0x40000;
       }
     }
-    for (UINTN SongyuanI = 0; SongyuanI < SongyuanCount; SongyuanI++) {
-      SongyuanFb[SongyuanI] = 0xFF00FFFF;
+    for (;;) {
+      for (UINTN SongyuanI = 0; SongyuanI < SongyuanCount; SongyuanI++) {
+        SongyuanFb[SongyuanI] = 0xFF00FFFF;
+      }
     }
-    for (volatile UINTN SongyuanSpin = 0; SongyuanSpin < 0x06000000; SongyuanSpin++) { }
   }
 '''
 

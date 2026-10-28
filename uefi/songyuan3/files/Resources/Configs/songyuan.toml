@@ -1,0 +1,22 @@
+#
+# Device configuration for songyuan (Redmi K90 Pro Max, SM8850 Canoe)
+# Derived from Resources/Configs/infiniti.toml (OnePlus 15, SM8850); v0 boot image parameters from
+# UniXNU docs/porting/uefi-firmware.md.
+#
+[boot_shim]
+requires_kernel_header = true
+
+[uefi_fd]
+base = 0xC6900000
+size = 0x300000
+
+[boot_image_kernel]
+kernel_compression = "gzip"
+append_dtb         = true
+
+[boot_image]
+header_version = 0
+base = 0x0
+kernel_offset = 0x8000
+tags_offset = 0x1e00000
+pagesize = 4096

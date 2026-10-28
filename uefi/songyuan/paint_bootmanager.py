@@ -1,10 +1,11 @@
 import re
 import sys
 
-# Bring-up markers inside UEFI. The hardcoded LK splash address may stop being the scanout as soon as
-# a display driver configures its own GOP mode, so the after-console marker asks UEFI for the actual
-# framebuffer the display driver installed and paints that; the before-console marker keeps the plain
-# splash write (the display driver may not exist yet at that point).
+# Bring-up markers inside UEFI itself. The shim paints before the jump; these paint from DXE/BDS so
+# the panel tells how far the firmware got even though it has no console driver for our panel:
+#   magenta  at PlatformBootManagerBeforeConsole (DXE core + BDS reach BootManager)
+#   cyan     at PlatformBootManagerAfterConsole  (the boot manager finished the console phase)
+# The framebuffer is the LK splash at 0xFC800000; DXE identity-maps RAM, so a plain store works.
 PATH = sys.argv[1]
 src = open(PATH, encoding='utf-8', errors='replace').read()
 
@@ -22,38 +23,16 @@ def insert_after_open(text, func, body):
     return text[:m.end()] + body + text[m.end():], True
 
 
-before = ('\n  /* songyuan uefi marker: BDS reached the boot manager (splash buffer) */\n'
-          '  *(volatile UINT32 *)(UINTN)0xFC800000 = 0xFFFF00FF;\n')
+body1 = ('\n  /* songyuan uefi marker: BDS reached the boot manager */\n'
+         '  *(volatile UINT32 *)(UINTN)0xFC800000 = 0xFFFF00FF;\n')
+body2 = ('\n  /* songyuan uefi marker: console phase done */\n'
+         '  *(volatile UINT32 *)(UINTN)0xFC800000 = 0xFF00FFFF;\n')
 
-after = '''
-  /* songyuan uefi marker: console phase done, paint the framebuffer the display driver installed */
-  {
-    EFI_GRAPHICS_OUTPUT_PROTOCOL *SongyuanGop = NULL;
-    if (!EFI_ERROR (gBS->LocateProtocol (&gEfiGraphicsOutputProtocolGuid, NULL, (VOID **)&SongyuanGop)) &&
-        SongyuanGop != NULL && SongyuanGop->Mode != NULL) {
-      volatile UINT32 *SongyuanFb = (volatile UINT32 *)(UINTN)SongyuanGop->Mode->FrameBufferBase;
-      UINTN SongyuanCount = (UINTN)SongyuanGop->Mode->FrameBufferSize / 4;
-      if (SongyuanCount > 0x40000) {
-        SongyuanCount = 0x40000;
-      }
-      for (UINTN SongyuanI = 0; SongyuanI < SongyuanCount; SongyuanI++) {
-        SongyuanFb[SongyuanI] = 0xFF00FFFF;
-      }
-    }
-    *(volatile UINT32 *)(UINTN)0xFC800000 = 0xFF00FFFF;
-  }
-'''
-
-src, ok1 = insert_after_open(src, 'PlatformBootManagerBeforeConsole', before)
-src, ok2 = insert_after_open(src, 'PlatformBootManagerAfterConsole', after)
+src, ok1 = insert_after_open(src, 'PlatformBootManagerBeforeConsole', body1)
+src, ok2 = insert_after_open(src, 'PlatformBootManagerAfterConsole', body2)
 if not ok1:
     sys.exit('BootManager.c: PlatformBootManagerBeforeConsole not found')
 if not ok2:
     print('warning: PlatformBootManagerAfterConsole not found')
-
-# the GOP protocol GUID and type
-if '#include <Protocol/GraphicsOutput.h>' not in src:
-    src = src.replace('#include <Library/PrintLib.h>', '#include <Library/PrintLib.h>\n#include <Protocol/GraphicsOutput.h>', 1)
-
 open(PATH, 'w', encoding='utf-8', newline='\n').write(src)
 print('boot manager paint inserted: before=%s after=%s' % (ok1, ok2))

@@ -48,7 +48,6 @@ if strict:
 '''
     src = src[:strict.start()] + inline + src[strict.start():]
     print('strict-entry paint inserted')
-src = src[:m.start()] + block + src[m.start():]
 
 src = src.replace('''  cmp   x4, x5
   beq   _Entry''', '''  cmp   x4, x5

@@ -28,6 +28,10 @@ jobs:
       - name: overlay the songyuan port
         run: |
           cp -r uefi/songyuan2/files/. Mu-Silicium/
+      - name: BDS bring-up markers
+        run: |
+          python3 uefi/songyuan/paint_bootmanager.py Mu-Silicium/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
+          grep -c 'songyuan uefi marker' Mu-Silicium/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
       - name: nasm shim and venv
         run: |
           D=Mu-Silicium/Mu_Basecore/BaseTools/Bin/mu_nasm_extdep
